@@ -56,15 +56,24 @@ pub extern "C" fn derive_shielded_keys(
 
     // Derive keys using Midnight's implementation
     let secret_keys = SecretKeys::from(seed);
+
+    // Debug: Print coin secret key
+    eprintln!("DEBUG coin_secret_key bytes: {:?}", &secret_keys.coin_secret_key.0.0[..]);
+
     let coin_pk = secret_keys.coin_public_key();
     let enc_pk = secret_keys.enc_public_key();
 
-    // Extract bytes from public keys
-    // coin::PublicKey(HashOutput([u8; 32]))
-    let coin_pk_bytes: &[u8; 32] = &coin_pk.0.0;
+    // Debug: Print raw coin public key bytes
+    eprintln!("DEBUG coin_pk HashOutput bytes: {:?}", &coin_pk.0.0[..]);
 
-    // For encryption public key, we need to serialize it
-    // encryption::PublicKey wraps a JubJub point
+    // Serialize both public keys using Serializable trait
+    // This matches what the WASM wrapper does via to_value_hex_ser
+    let mut coin_pk_bytes = Vec::new();
+    if let Err(e) = coin_pk.serialize(&mut coin_pk_bytes) {
+        eprintln!("Error serializing coin public key: {}", e);
+        return std::ptr::null_mut();
+    }
+
     let mut enc_pk_bytes = Vec::new();
     if let Err(e) = enc_pk.serialize(&mut enc_pk_bytes) {
         eprintln!("Error serializing encryption public key: {}", e);
@@ -72,7 +81,7 @@ pub extern "C" fn derive_shielded_keys(
     }
 
     // Convert to hex strings
-    let coin_hex = hex::encode(coin_pk_bytes);
+    let coin_hex = hex::encode(&coin_pk_bytes);
     let enc_hex = hex::encode(&enc_pk_bytes);
 
     // Convert to C strings
