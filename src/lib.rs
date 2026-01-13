@@ -1,0 +1,183 @@
+//! Kuira Crypto FFI - JNI bridge to Midnight's Rust cryptography
+//!
+//! This crate provides a minimal C FFI interface for deriving shielded keys
+//! using Midnight's battle-tested cryptography libraries.
+
+use std::ffi::CString;
+use std::os::raw::c_char;
+use midnight_zswap::keys::{SecretKeys, Seed};
+use midnight_serialize::Serializable;
+
+/// Result struct containing hex-encoded public keys
+#[repr(C)]
+pub struct ShieldedKeys {
+    /// Coin public key (64 hex characters)
+    pub coin_public_key: *mut c_char,
+    /// Encryption public key (64 hex characters)
+    pub encryption_public_key: *mut c_char,
+}
+
+/// Derives shielded public keys from a 32-byte seed.
+///
+/// # Safety
+///
+/// - `seed_ptr` must be a valid pointer to a 32-byte array
+/// - `seed_len` must be exactly 32
+/// - Caller must call `free_shielded_keys` to free the returned pointer
+///
+/// # Returns
+///
+/// Pointer to ShieldedKeys struct, or null on error
+#[no_mangle]
+pub extern "C" fn derive_shielded_keys(
+    seed_ptr: *const u8,
+    seed_len: usize,
+) -> *mut ShieldedKeys {
+    // Safety checks
+    if seed_ptr.is_null() {
+        eprintln!("Error: seed_ptr is null");
+        return std::ptr::null_mut();
+    }
+
+    if seed_len != 32 {
+        eprintln!("Error: seed must be 32 bytes, got {}", seed_len);
+        return std::ptr::null_mut();
+    }
+
+    // Convert to Rust slice (unsafe)
+    let seed_slice = unsafe {
+        std::slice::from_raw_parts(seed_ptr, seed_len)
+    };
+
+    // Convert to fixed-size array
+    let mut seed_array = [0u8; 32];
+    seed_array.copy_from_slice(seed_slice);
+    let seed = Seed::from(seed_array);
+
+    // Derive keys using Midnight's implementation
+    let secret_keys = SecretKeys::from(seed);
+    let coin_pk = secret_keys.coin_public_key();
+    let enc_pk = secret_keys.enc_public_key();
+
+    // Extract bytes from public keys
+    // coin::PublicKey(HashOutput([u8; 32]))
+    let coin_pk_bytes: &[u8; 32] = &coin_pk.0.0;
+
+    // For encryption public key, we need to serialize it
+    // encryption::PublicKey wraps a JubJub point
+    let mut enc_pk_bytes = Vec::new();
+    if let Err(e) = enc_pk.serialize(&mut enc_pk_bytes) {
+        eprintln!("Error serializing encryption public key: {}", e);
+        return std::ptr::null_mut();
+    }
+
+    // Convert to hex strings
+    let coin_hex = hex::encode(coin_pk_bytes);
+    let enc_hex = hex::encode(&enc_pk_bytes);
+
+    // Convert to C strings
+    let coin_cstr = match CString::new(coin_hex) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error creating C string for coin key: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let enc_cstr = match CString::new(enc_hex) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error creating C string for encryption key: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Allocate result and transfer ownership to caller
+    Box::into_raw(Box::new(ShieldedKeys {
+        coin_public_key: coin_cstr.into_raw(),
+        encryption_public_key: enc_cstr.into_raw(),
+    }))
+}
+
+/// Frees memory allocated by derive_shielded_keys
+///
+/// # Safety
+///
+/// - `ptr` must be a pointer returned from `derive_shielded_keys`
+/// - `ptr` must not be used after calling this function
+/// - Must be called exactly once per pointer
+#[no_mangle]
+pub extern "C" fn free_shielded_keys(ptr: *mut ShieldedKeys) {
+    if ptr.is_null() {
+        return;
+    }
+
+    unsafe {
+        // Take ownership back and drop
+        let keys = Box::from_raw(ptr);
+
+        // Free the C strings
+        if !keys.coin_public_key.is_null() {
+            let _ = CString::from_raw(keys.coin_public_key);
+        }
+        if !keys.encryption_public_key.is_null() {
+            let _ = CString::from_raw(keys.encryption_public_key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_shielded_keys_with_test_vector() {
+        // Test vector from "abandon abandon ... art" mnemonic at m/44'/2400'/0'/3/0
+        let seed_hex = "b7637860b12f892ee07c67ad441c7935e37ac2153cefa39ae79083284f6d9180";
+        let seed = hex::decode(seed_hex).unwrap();
+
+        // Call FFI function
+        let keys_ptr = derive_shielded_keys(seed.as_ptr(), seed.len());
+        assert!(!keys_ptr.is_null());
+
+        unsafe {
+            let keys = &*keys_ptr;
+
+            // Convert C strings back to Rust strings
+            let coin_pk = std::ffi::CStr::from_ptr(keys.coin_public_key)
+                .to_str()
+                .unwrap();
+            let enc_pk = std::ffi::CStr::from_ptr(keys.encryption_public_key)
+                .to_str()
+                .unwrap();
+
+            // Expected values from Midnight SDK
+            assert_eq!(
+                coin_pk,
+                "274c79e90fdf0e29468299ff624dc7092423041ba3976b76464feae3a07b994a",
+                "Coin public key mismatch"
+            );
+            assert_eq!(
+                enc_pk,
+                "f3ae706bf28c856a407690b468081a7f5a123e523501b69f4395abcd7e19032b",
+                "Encryption public key mismatch"
+            );
+
+            // Free memory
+            free_shielded_keys(keys_ptr);
+        }
+    }
+
+    #[test]
+    fn test_invalid_seed_length() {
+        let invalid_seed = vec![0u8; 16]; // Wrong size
+        let keys_ptr = derive_shielded_keys(invalid_seed.as_ptr(), invalid_seed.len());
+        assert!(keys_ptr.is_null());
+    }
+
+    #[test]
+    fn test_null_pointer() {
+        let keys_ptr = derive_shielded_keys(std::ptr::null(), 32);
+        assert!(keys_ptr.is_null());
+    }
+}

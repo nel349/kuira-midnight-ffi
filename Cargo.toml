@@ -1,0 +1,21 @@
+[package]
+name = "kuira-crypto-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]  # staticlib for Android, cdylib for testing
+
+[dependencies]
+# Midnight ledger libraries (from local midnight-libraries repo)
+midnight-zswap = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/zswap" }
+midnight-serialize = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/serialize" }
+
+# For hex encoding
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true           # Link-time optimization for smaller binary
+codegen-units = 1    # Better optimization
+strip = true         # Strip symbols for smaller size
