@@ -80,6 +80,10 @@ pub extern "C" fn derive_shielded_keys(
         return std::ptr::null_mut();
     }
 
+    // Debug: Print serialized lengths
+    eprintln!("DEBUG coin_pk serialized length: {} bytes", coin_pk_bytes.len());
+    eprintln!("DEBUG enc_pk serialized length: {} bytes", enc_pk_bytes.len());
+
     // Convert to hex strings
     let coin_hex = hex::encode(&coin_pk_bytes);
     let enc_hex = hex::encode(&enc_pk_bytes);
@@ -138,6 +142,39 @@ pub extern "C" fn free_shielded_keys(ptr: *mut ShieldedKeys) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use midnight_serialize::Serializable;
+
+    #[test]
+    fn test_serialization_lengths() {
+        // Test with known seed to verify serialization format
+        let seed_hex = "b7637860b12f892ee07c67ad441c7935e37ac2153cefa39ae79083284f6d9180";
+        let seed_bytes = hex::decode(seed_hex).unwrap();
+        let mut seed_array = [0u8; 32];
+        seed_array.copy_from_slice(&seed_bytes);
+        let seed = Seed::from(seed_array);
+
+        let secret_keys = SecretKeys::from(seed);
+        let coin_pk = secret_keys.coin_public_key();
+        let enc_pk = secret_keys.enc_public_key();
+
+        // Serialize both keys
+        let mut coin_pk_bytes = Vec::new();
+        coin_pk.serialize(&mut coin_pk_bytes).unwrap();
+
+        let mut enc_pk_bytes = Vec::new();
+        enc_pk.serialize(&mut enc_pk_bytes).unwrap();
+
+        println!("Coin PK serialized: {} bytes", coin_pk_bytes.len());
+        println!("Coin PK hex: {}", hex::encode(&coin_pk_bytes));
+        println!("Enc PK serialized: {} bytes", enc_pk_bytes.len());
+        println!("Enc PK hex: {}", hex::encode(&enc_pk_bytes));
+
+        // Expected from Midnight SDK (verified with TypeScript SDK):
+        // - Coin PK should be 32 bytes
+        // - Enc PK should be 32 bytes (NOT 58 - that was from outdated test vectors)
+        assert_eq!(coin_pk_bytes.len(), 32, "Coin PK should be 32 bytes");
+        assert_eq!(enc_pk_bytes.len(), 32, "Enc PK should be 32 bytes");
+    }
 
     #[test]
     fn test_derive_shielded_keys_with_test_vector() {
