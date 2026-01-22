@@ -230,6 +230,7 @@ pub extern "C" fn free_verifying_key(ptr: *mut u8) {
 /// **CALLER MUST GUARANTEE:**
 /// 1. `signing_key_ptr` was returned from `create_signing_key()` and not yet freed
 /// 2. `data_ptr` points to valid, readable memory of at least `data_len` bytes
+///    OR is NULL when `data_len` is 0 (empty message)
 /// 3. Both pointers remain valid for the duration of this call
 /// 4. Neither pointer is concurrently modified or freed during this call
 /// 5. `data_len` accurately represents the allocated size of data
@@ -254,6 +255,10 @@ pub extern "C" fn free_verifying_key(ptr: *mut u8) {
 /// - Uses random nonce (not deterministic) for each signature
 /// - Same data signed twice produces different signatures (different nonce)
 ///
+/// **EMPTY MESSAGES:**
+/// - Empty messages (data_len=0, data_ptr=NULL) are allowed
+/// - Used in ZKP protocols where signature proves key ownership
+///
 /// # Returns
 ///
 /// - SignatureBytes with non-null data pointer and len=64 on success
@@ -267,10 +272,20 @@ pub extern "C" fn sign_data(
     // Maximum data length to prevent excessive memory allocation
     const MAX_DATA_LEN: usize = 1024 * 1024; // 1 MB
 
-    // Validate pointers
-    if signing_key_ptr.is_null() || data_ptr.is_null() {
-        #[cfg(debug_assertions)]
-        eprintln!("Error: null pointer in sign_data");
+    // Validate signing key pointer
+    if signing_key_ptr.is_null() {
+        eprintln!("[Kuira FFI] sign_data: signing_key_ptr is null");
+        return SignatureBytes {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+    }
+
+    // Handle empty message case (data_ptr can be NULL when data_len is 0)
+    if data_len == 0 && data_ptr.is_null() {
+        // Valid - empty message
+    } else if data_ptr.is_null() {
+        eprintln!("[Kuira FFI] sign_data: data_ptr is null but data_len is {}", data_len);
         return SignatureBytes {
             data: std::ptr::null_mut(),
             len: 0,
@@ -279,8 +294,7 @@ pub extern "C" fn sign_data(
 
     // Validate data length
     if data_len > MAX_DATA_LEN {
-        #[cfg(debug_assertions)]
-        eprintln!("Error: data_len {} exceeds maximum {}", data_len, MAX_DATA_LEN);
+        eprintln!("[Kuira FFI] sign_data: data_len {} exceeds maximum {}", data_len, MAX_DATA_LEN);
         return SignatureBytes {
             data: std::ptr::null_mut(),
             len: 0,
@@ -288,7 +302,13 @@ pub extern "C" fn sign_data(
     }
 
     let signing_key = unsafe { &*signing_key_ptr };
-    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+
+    // Handle empty message (create empty slice)
+    let data = if data_len == 0 {
+        &[] // Empty slice
+    } else {
+        unsafe { std::slice::from_raw_parts(data_ptr, data_len) }
+    };
 
     // Sign with Schnorr (uses OsRng for nonce)
     let mut rng = OsRng;
@@ -312,6 +332,102 @@ pub extern "C" fn sign_data(
     SignatureBytes {
         data: data_ptr,
         len,
+    }
+}
+
+/// Verifies a Schnorr BIP-340 signature
+///
+/// # Safety
+///
+/// **CALLER MUST GUARANTEE:**
+/// 1. `public_key_ptr` points to valid, readable memory of exactly 32 bytes
+/// 2. `message_ptr` points to valid, readable memory of at least `message_len` bytes
+/// 3. `signature_ptr` points to valid, readable memory of exactly 64 bytes
+/// 4. All pointers remain valid for the duration of this call
+/// 5. Memory is not concurrently modified during this call
+///
+/// **FAILURE TO MEET THESE CONDITIONS RESULTS IN UNDEFINED BEHAVIOR:**
+/// - Segmentation fault (crash) if pointers are invalid
+/// - Reading arbitrary memory if pointers are wrong
+/// - Buffer overrun if lengths are incorrect
+/// - Incorrect verification results if memory is modified during verification
+///
+/// **MEMORY OWNERSHIP:**
+/// - All input data is read-only and remains owned by caller
+/// - No memory is allocated or freed by this function
+/// - Caller may free all inputs after this function returns
+///
+/// # Returns
+///
+/// - 1 if signature is valid for the given public key and message
+/// - 0 if signature is invalid, malformed, or inputs are invalid
+#[no_mangle]
+pub extern "C" fn verify_signature(
+    public_key_ptr: *const u8,
+    message_ptr: *const u8,
+    message_len: usize,
+    signature_ptr: *const u8,
+) -> i32 {
+    // Validate pointers (message_ptr can be NULL for empty messages)
+    if public_key_ptr.is_null() || signature_ptr.is_null() {
+        eprintln!("[Kuira FFI] verify_signature: null pointer (pub_key={}, sig={})",
+                 public_key_ptr.is_null(), signature_ptr.is_null());
+        return 0;
+    }
+
+    // Handle empty message case (message_ptr can be NULL when message_len is 0)
+    if message_len == 0 && message_ptr.is_null() {
+        // This is valid - empty message
+    } else if message_ptr.is_null() {
+        eprintln!("[Kuira FFI] verify_signature: message_ptr is null but message_len is {}", message_len);
+        return 0;
+    }
+
+    // Maximum message length for safety
+    const MAX_MESSAGE_LEN: usize = 1024 * 1024; // 1 MB
+    if message_len > MAX_MESSAGE_LEN {
+        eprintln!("[Kuira FFI] verify_signature: message_len {} exceeds maximum {}", message_len, MAX_MESSAGE_LEN);
+        return 0;
+    }
+
+    // Read inputs
+    let pub_key_bytes = unsafe { std::slice::from_raw_parts(public_key_ptr, 32) };
+    let message = if message_len == 0 {
+        &[] // Empty slice for empty message
+    } else {
+        unsafe { std::slice::from_raw_parts(message_ptr, message_len) }
+    };
+    let sig_bytes = unsafe { std::slice::from_raw_parts(signature_ptr, 64) };
+
+    // Deserialize public key
+    // Note: Second parameter (0) is the deserialization context/version for midnight-serialize
+    let verifying_key = match VerifyingKey::deserialize(&mut &pub_key_bytes[..], 0) {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("[Kuira FFI] verify_signature: failed to deserialize public key: {}", e);
+            return 0;
+        }
+    };
+
+    // Deserialize signature
+    // Note: Second parameter (0) is the deserialization context/version for midnight-serialize
+    let signature = match Signature::deserialize(&mut &sig_bytes[..], 0) {
+        Ok(sig) => sig,
+        Err(e) => {
+            eprintln!("[Kuira FFI] verify_signature: failed to deserialize signature: {}", e);
+            return 0;
+        }
+    };
+
+    // Verify signature
+    if verifying_key.verify(message, &signature) {
+        1 // Valid
+    } else {
+        // Note: Logging verification failures could leak information in some scenarios
+        // Only log in debug builds for verification failures (not an error, just invalid)
+        #[cfg(debug_assertions)]
+        eprintln!("[Kuira FFI] verify_signature: signature verification failed (invalid signature)");
+        0 // Invalid
     }
 }
 

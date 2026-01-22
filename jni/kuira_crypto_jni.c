@@ -85,6 +85,7 @@ extern SignatureBytes sign_data(const void* signing_key_ptr, const uint8_t* data
 extern void free_signature(uint8_t* data, size_t len);
 extern uint8_t* get_verifying_key(const void* signing_key_ptr);
 extern void free_verifying_key(uint8_t* ptr);
+extern int32_t verify_signature(const uint8_t* public_key_ptr, const uint8_t* message_ptr, size_t message_len, const uint8_t* signature_ptr);
 
 /* JNI function implementations */
 
@@ -332,41 +333,45 @@ Java_com_midnight_kuira_core_ledger_signer_TransactionSigner_nativeSignData(
      * restrictive for production use cases.) */
     const jsize MAX_DATA_SIZE = 1024 * 1024;  /* 1 MB - matches Rust FFI limit */
 
-    if (data_len <= 0) {
-        LOGE("nativeSignData: data_len is %d (must be positive)", data_len);
+    /* Note: Empty data (length 0) is allowed - Schnorr can sign empty messages */
+    if (data_len < 0 || data_len > MAX_DATA_SIZE) {
+        LOGE("nativeSignData: invalid data_len %d (must be 0..%d)", data_len, MAX_DATA_SIZE);
         return NULL;
     }
 
-    if (data_len > MAX_DATA_SIZE) {
-        LOGE("nativeSignData: data_len %d exceeds limit %d", data_len, MAX_DATA_SIZE);
-        return NULL;
+    /* Handle empty data case (malloc(0) behavior is implementation-defined) */
+    uint8_t* data_buf = NULL;
+    if (data_len > 0) {
+        data_buf = (uint8_t*)malloc(data_len);
+        if (data_buf == NULL) {
+            LOGE("nativeSignData: malloc failed for %d bytes", data_len);
+            return NULL;
+        }
+
+        /* Extract data bytes */
+        (*env)->GetByteArrayRegion(env, data_array, 0, data_len, (jbyte*)data_buf);
     }
 
-    uint8_t* data_buf = (uint8_t*)malloc(data_len);
-    if (data_buf == NULL) {
-        LOGE("nativeSignData: malloc failed for %d bytes", data_len);
-        return NULL;
-    }
-
-    /* Extract data bytes */
-    (*env)->GetByteArrayRegion(env, data_array, 0, data_len, (jbyte*)data_buf);
-
-    /* Check for exceptions */
+    /* Check for exceptions (only relevant if data_len > 0) */
     if ((*env)->ExceptionCheck(env)) {
         LOGE("nativeSignData: exception during GetByteArrayRegion");
         (*env)->ExceptionDescribe(env);
         (*env)->ExceptionClear(env);
-        secure_memzero(data_buf, data_len);  /* SECURITY: Zeroize before free */
-        free(data_buf);
+        if (data_buf != NULL) {
+            secure_memzero(data_buf, data_len);  /* SECURITY: Zeroize before free */
+            free(data_buf);
+        }
         return NULL;
     }
 
-    /* Call Rust FFI */
+    /* Call Rust FFI (data_buf can be NULL for empty data) */
     SignatureBytes sig = sign_data((void*)(uintptr_t)signing_key_ptr, data_buf, data_len);
 
     /* SECURITY: Zeroize data immediately after signing */
-    secure_memzero(data_buf, data_len);
-    free(data_buf);
+    if (data_buf != NULL) {
+        secure_memzero(data_buf, data_len);
+        free(data_buf);
+    }
 
     /* Check for signing failure */
     if (sig.data == NULL || sig.len == 0) {
@@ -470,6 +475,95 @@ Java_com_midnight_kuira_core_ledger_signer_TransactionSigner_nativeGetVerifyingK
     LOGD("nativeGetVerifyingKey: success");
 
     return result;
+}
+
+/**
+ * Verifies a Schnorr BIP-340 signature.
+ *
+ * JNI signature:
+ * (Lcom/midnight/kuira/core/ledger/signer/TransactionSigner;[B[B[B)Z
+ *
+ * @param public_key_array 32-byte BIP-340 public key
+ * @param message_array Message that was signed
+ * @param signature_array 64-byte Schnorr signature
+ * @return true if signature is valid, false otherwise
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_midnight_kuira_core_ledger_signer_TransactionSigner_nativeVerifySignature(
+    JNIEnv* env,
+    jobject thiz,
+    jbyteArray public_key_array,
+    jbyteArray message_array,
+    jbyteArray signature_array)
+{
+    /* Validate inputs */
+    if (public_key_array == NULL || message_array == NULL || signature_array == NULL) {
+        LOGE("nativeVerifySignature: null input array");
+        return JNI_FALSE;
+    }
+
+    /* Check lengths */
+    const jsize pub_key_len = (*env)->GetArrayLength(env, public_key_array);
+    const jsize message_len = (*env)->GetArrayLength(env, message_array);
+    const jsize sig_len = (*env)->GetArrayLength(env, signature_array);
+
+    if (pub_key_len != 32) {
+        LOGE("nativeVerifySignature: public key must be 32 bytes, got %d", pub_key_len);
+        return JNI_FALSE;
+    }
+
+    if (sig_len != 64) {
+        LOGE("nativeVerifySignature: signature must be 64 bytes, got %d", sig_len);
+        return JNI_FALSE;
+    }
+
+    /* Note: Empty messages (length 0) are allowed - Schnorr can sign/verify empty data */
+    if (message_len < 0 || message_len > 1024 * 1024) {
+        LOGE("nativeVerifySignature: invalid message length %d", message_len);
+        return JNI_FALSE;
+    }
+
+    /* Allocate buffers */
+    uint8_t pub_key_buf[32];
+    uint8_t sig_buf[64];
+
+    /* Handle empty message case (malloc(0) behavior is implementation-defined) */
+    uint8_t* message_buf = NULL;
+    if (message_len > 0) {
+        message_buf = (uint8_t*)malloc(message_len);
+        if (message_buf == NULL) {
+            LOGE("nativeVerifySignature: malloc failed for message buffer");
+            return JNI_FALSE;
+        }
+    }
+
+    /* Copy arrays to native buffers */
+    (*env)->GetByteArrayRegion(env, public_key_array, 0, 32, (jbyte*)pub_key_buf);
+    if (message_len > 0) {
+        (*env)->GetByteArrayRegion(env, message_array, 0, message_len, (jbyte*)message_buf);
+    }
+    (*env)->GetByteArrayRegion(env, signature_array, 0, 64, (jbyte*)sig_buf);
+
+    if ((*env)->ExceptionCheck(env)) {
+        LOGE("nativeVerifySignature: exception during GetByteArrayRegion");
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        if (message_buf != NULL) {
+            free(message_buf);
+        }
+        return JNI_FALSE;
+    }
+
+    /* Call Rust FFI to verify (message_buf can be NULL for empty messages) */
+    const int32_t result = verify_signature(pub_key_buf, message_buf, (size_t)message_len, sig_buf);
+
+    /* Clean up */
+    if (message_buf != NULL) {
+        free(message_buf);
+    }
+
+    /* Return result */
+    return (result == 1) ? JNI_TRUE : JNI_FALSE;
 }
 
 /*
