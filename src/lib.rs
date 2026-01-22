@@ -1,12 +1,17 @@
 //! Kuira Crypto FFI - JNI bridge to Midnight's Rust cryptography
 //!
-//! This crate provides a minimal C FFI interface for deriving shielded keys
-//! using Midnight's battle-tested cryptography libraries.
+//! This crate provides C FFI interfaces for:
+//! - Deriving shielded keys (zswap)
+//! - Signing transactions (Schnorr BIP-340)
+//! - Serializing transactions (SCALE codec)
 
 use std::ffi::CString;
 use std::os::raw::c_char;
 use midnight_zswap::keys::{SecretKeys, Seed};
 use midnight_serialize::Serializable;
+
+// Transaction signing and serialization FFI
+pub mod transaction_ffi;
 
 /// Result struct containing hex-encoded public keys
 #[repr(C)]

@@ -10,9 +10,17 @@ crate-type = ["staticlib", "cdylib"]  # staticlib for Android, cdylib for testin
 # Midnight ledger libraries (from local midnight-libraries repo)
 midnight-zswap = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/zswap" }
 midnight-serialize = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/serialize" }
+midnight-ledger = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/ledger" }
+midnight-base-crypto = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/base-crypto" }
 
 # For hex encoding
 hex = "0.4"
+
+# For randomness in signing (nonce generation)
+rand = "0.8"
+
+# For secure memory zeroization
+zeroize = "1.8"
 
 [profile.release]
 opt-level = 3
