@@ -28,6 +28,7 @@ endif()
 
 # Rust library paths
 set(RUST_PROJECT_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+# Using release build with reduced optimizations (opt-level=2, no LTO)
 set(RUST_TARGET_PATH "${RUST_PROJECT_DIR}/target/${RUST_TARGET_DIR}/release")
 
 # Pre-built Rust static library

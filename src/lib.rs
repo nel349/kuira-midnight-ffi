@@ -10,8 +10,39 @@ use std::os::raw::c_char;
 use midnight_zswap::keys::{SecretKeys, Seed};
 use midnight_serialize::Serializable;
 
-// Transaction signing and serialization FFI
+// Initialize Android logging
+#[cfg(target_os = "android")]
+use android_logger::Config;
+
+#[cfg(target_os = "android")]
+fn init_logging() {
+    android_logger::init_once(
+        Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("KuiraCrypto")
+    );
+}
+
+#[cfg(not(target_os = "android"))]
+fn init_logging() {
+    // No-op on non-Android platforms
+}
+
+/// Initialize the library (called from JNI_OnLoad)
+#[no_mangle]
+pub extern "C" fn kuira_crypto_init() {
+    init_logging();
+}
+
+// Transaction signing FFI
 pub mod transaction_ffi;
+
+// Transaction serialization (SCALE codec)
+pub mod serialize;
+
+// Key validity tests
+#[cfg(test)]
+mod test_key_validity;
 
 /// Result struct containing hex-encoded public keys
 #[repr(C)]

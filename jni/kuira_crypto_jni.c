@@ -74,6 +74,9 @@ typedef struct {
 
 /* Rust FFI functions (defined in libkuira_crypto_ffi) */
 
+/* Library initialization */
+extern void kuira_crypto_init(void);
+
 /* Shielded key derivation (Phase 1B) */
 extern ShieldedKeys* derive_shielded_keys(const uint8_t* seed_ptr, size_t seed_len);
 extern void free_shielded_keys(ShieldedKeys* ptr);
@@ -86,6 +89,15 @@ extern void free_signature(uint8_t* data, size_t len);
 extern uint8_t* get_verifying_key(const void* signing_key_ptr);
 extern void free_verifying_key(uint8_t* ptr);
 extern int32_t verify_signature(const uint8_t* public_key_ptr, const uint8_t* message_ptr, size_t message_len, const uint8_t* signature_ptr);
+
+/* Transaction serialization (Phase 2E) */
+extern char* serialize_unshielded_transaction_stub(uint64_t ttl);
+extern char* serialize_unshielded_transaction(const char* inputs_hex, const char* outputs_hex, const char* signatures_hex, uint64_t ttl, const char* binding_commitment_hex);
+extern void free_serialized_transaction(char* ptr);
+
+/* Signing message generation (Phase 2E) */
+extern char* get_signing_message_for_input(const char* inputs_json, const char* outputs_json, uint32_t input_index, uint64_t ttl, const char* binding_commitment_hex);
+extern void free_signing_message(char* ptr);
 
 /* JNI function implementations */
 
@@ -566,6 +578,236 @@ Java_com_midnight_kuira_core_ledger_signer_TransactionSigner_nativeVerifySignatu
     return (result == 1) ? JNI_TRUE : JNI_FALSE;
 }
 
+/**
+ * Serializes a signed unshielded transaction to SCALE codec (Phase 2E STUB).
+ *
+ * **STUB VERSION:** Returns test hex for architecture testing.
+ * Real SCALE serialization will be implemented iteratively.
+ *
+ * JNI signature:
+ * (Lcom/midnight/kuira/core/ledger/signer/TransactionSigner;J)Ljava/lang/String;
+ *
+ * @param ttl Transaction time-to-live (milliseconds since epoch)
+ * @return Hex-encoded SCALE bytes, or null on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_ledger_signer_TransactionSigner_nativeSerializeTransactionStub(
+    JNIEnv* env,
+    jobject thiz,
+    jlong ttl)
+{
+    /* Validate TTL */
+    if (ttl <= 0) {
+        LOGE("nativeSerializeTransactionStub: invalid TTL %lld", (long long)ttl);
+        return NULL;
+    }
+
+    /* Call Rust FFI stub */
+    char* hex_str = serialize_unshielded_transaction_stub((uint64_t)ttl);
+    if (hex_str == NULL) {
+        LOGE("nativeSerializeTransactionStub: Rust FFI returned null");
+        return NULL;
+    }
+
+    /* Convert C string to Java string */
+    jstring result = (*env)->NewStringUTF(env, hex_str);
+
+    /* Free Rust-allocated string */
+    free_serialized_transaction(hex_str);
+
+    if (result == NULL) {
+        LOGE("nativeSerializeTransactionStub: NewStringUTF failed");
+        return NULL;
+    }
+
+    LOGI("Transaction serialized (stub): %zu bytes hex", strlen(hex_str));
+    return result;
+}
+
+/**
+ * Serializes a signed unshielded transaction to SCALE codec (Phase 2E - REAL).
+ *
+ * JNI signature:
+ * (Lcom/midnight/kuira/core/ledger/api/TransactionSerializer;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)Ljava/lang/String;
+ *
+ * @param inputs_json JSON array of UtxoSpend objects
+ * @param outputs_json JSON array of UtxoOutput objects
+ * @param signatures_json JSON array of signature hex strings
+ * @param ttl Transaction time-to-live (milliseconds since epoch)
+ * @param binding_commitment_hex Hex-encoded binding commitment (MUST match the one from nativeGetSigningMessageForInput!)
+ * @return Hex-encoded SCALE bytes, or null on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerializeTransaction(
+    JNIEnv* env,
+    jobject thiz,
+    jstring inputs_json,
+    jstring outputs_json,
+    jstring signatures_json,
+    jlong ttl,
+    jstring binding_commitment_hex)
+{
+    /* Validate inputs */
+    if (inputs_json == NULL || outputs_json == NULL || signatures_json == NULL || binding_commitment_hex == NULL) {
+        LOGE("nativeSerializeTransaction: null parameter");
+        return NULL;
+    }
+
+    if (ttl <= 0) {
+        LOGE("nativeSerializeTransaction: invalid TTL %lld", (long long)ttl);
+        return NULL;
+    }
+
+    /* Convert Java strings to C strings */
+    const char* inputs_c = (*env)->GetStringUTFChars(env, inputs_json, NULL);
+    if (inputs_c == NULL) {
+        LOGE("nativeSerializeTransaction: GetStringUTFChars failed for inputs");
+        return NULL;
+    }
+
+    const char* outputs_c = (*env)->GetStringUTFChars(env, outputs_json, NULL);
+    if (outputs_c == NULL) {
+        LOGE("nativeSerializeTransaction: GetStringUTFChars failed for outputs");
+        (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+        return NULL;
+    }
+
+    const char* signatures_c = (*env)->GetStringUTFChars(env, signatures_json, NULL);
+    if (signatures_c == NULL) {
+        LOGE("nativeSerializeTransaction: GetStringUTFChars failed for signatures");
+        (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+        (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+        return NULL;
+    }
+
+    const char* binding_commitment_c = (*env)->GetStringUTFChars(env, binding_commitment_hex, NULL);
+    if (binding_commitment_c == NULL) {
+        LOGE("nativeSerializeTransaction: GetStringUTFChars failed for binding_commitment");
+        (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+        (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+        (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
+        return NULL;
+    }
+
+    /* Call Rust FFI with binding_commitment */
+    char* hex_str = serialize_unshielded_transaction(inputs_c, outputs_c, signatures_c, (uint64_t)ttl, binding_commitment_c);
+
+    /* Release Java string buffers */
+    (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+    (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+    (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
+    (*env)->ReleaseStringUTFChars(env, binding_commitment_hex, binding_commitment_c);
+
+    if (hex_str == NULL) {
+        LOGE("nativeSerializeTransaction: Rust FFI returned null");
+        return NULL;
+    }
+
+    /* Convert C string to Java string */
+    jstring result = (*env)->NewStringUTF(env, hex_str);
+
+    /* Free Rust-allocated string */
+    free_serialized_transaction(hex_str);
+
+    if (result == NULL) {
+        LOGE("nativeSerializeTransaction: NewStringUTF failed");
+        return NULL;
+    }
+
+    LOGI("Transaction serialized (SCALE): %zu bytes hex", strlen(hex_str));
+    return result;
+}
+
+/**
+ * Generates signing message for a specific UTXO input (Phase 2E - CRITICAL for real transactions).
+ *
+ * This function builds an Intent, binds it, and returns the signature data that must be
+ * signed for the given input index. This is THE key function for real on-chain transactions.
+ *
+ * JNI signature:
+ * (Lcom/midnight/kuira/core/ledger/api/FfiTransactionSerializer;Ljava/lang/String;Ljava/lang/String;IJ)Ljava/lang/String;
+ *
+ * @param inputs_json JSON array of UtxoSpend objects (WITHOUT signatures)
+ * @param outputs_json JSON array of UtxoOutput objects
+ * @param input_index Which input to generate signature data for (0-based)
+ * @param ttl Transaction time-to-live (milliseconds since epoch)
+ * @return Hex-encoded signing message bytes, or null on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeGetSigningMessageForInput(
+    JNIEnv* env,
+    jobject thiz,
+    jstring inputs_json,
+    jstring outputs_json,
+    jint input_index,
+    jlong ttl)
+{
+    /* Validate inputs */
+    if (inputs_json == NULL || outputs_json == NULL) {
+        LOGE("nativeGetSigningMessageForInput: null JSON string");
+        return NULL;
+    }
+
+    if (input_index < 0) {
+        LOGE("nativeGetSigningMessageForInput: invalid input_index %d (must be >= 0)", input_index);
+        return NULL;
+    }
+
+    if (ttl <= 0) {
+        LOGE("nativeGetSigningMessageForInput: invalid TTL %lld", (long long)ttl);
+        return NULL;
+    }
+
+    /* Convert Java strings to C strings */
+    const char* inputs_c = (*env)->GetStringUTFChars(env, inputs_json, NULL);
+    if (inputs_c == NULL) {
+        LOGE("nativeGetSigningMessageForInput: GetStringUTFChars failed for inputs");
+        return NULL;
+    }
+
+    const char* outputs_c = (*env)->GetStringUTFChars(env, outputs_json, NULL);
+    if (outputs_c == NULL) {
+        LOGE("nativeGetSigningMessageForInput: GetStringUTFChars failed for outputs");
+        (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+        return NULL;
+    }
+
+    LOGI("Getting signing message for input %d", input_index);
+
+    /* Call Rust FFI to generate signing message (pass NULL to generate random binding_commitment) */
+    char* json_response = get_signing_message_for_input(
+        inputs_c,
+        outputs_c,
+        (uint32_t)input_index,
+        (uint64_t)ttl,
+        NULL  /* Generate random binding_commitment */
+    );
+
+    /* Release Java string buffers */
+    (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+    (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+
+    if (json_response == NULL) {
+        LOGE("nativeGetSigningMessageForInput: Rust FFI returned null");
+        return NULL;
+    }
+
+    LOGI("Generated signing message JSON: %s", json_response);
+
+    /* Convert C string to Java string (returns JSON: {"signing_message": "hex", "binding_commitment": "hex"}) */
+    jstring result = (*env)->NewStringUTF(env, json_response);
+
+    /* Free Rust-allocated string */
+    free_signing_message(json_response);
+
+    if (result == NULL) {
+        LOGE("nativeGetSigningMessageForInput: NewStringUTF failed");
+        return NULL;
+    }
+
+    return result;
+}
+
 /*
  * JNI_OnLoad - Called when library is loaded
  *
@@ -583,6 +825,10 @@ JNI_OnLoad(JavaVM* vm, void* reserved) {
 
     LOGI("Kuira Crypto JNI library loaded successfully (JNI 1.6)");
     LOGI("Security features: secure zeroization, overflow checks, validation");
+
+    /* Initialize Rust library (sets up Android logging) */
+    kuira_crypto_init();
+    LOGI("Rust library initialized with Android logging");
 
     return JNI_VERSION_1_6;
 }
