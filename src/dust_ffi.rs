@@ -7,7 +7,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 
 // Import midnight-ledger dust types
-use midnight_ledger::dust::{DustSecretKey, DustPublicKey};
+use midnight_ledger::dust::{DustSecretKey, DustPublicKey, Seed};
 use midnight_serialize::Serializable;
 
 /// Derives dust public key from a 32-byte seed.
@@ -42,21 +42,15 @@ pub extern "C" fn derive_dust_public_key(
         std::slice::from_raw_parts(seed_ptr, seed_len)
     };
 
-    // Convert to fixed-size array
-    let mut seed_array = [0u8; 32];
+    // Convert to fixed-size array (Seed is just [u8; 32])
+    let mut seed_array: Seed = [0u8; 32];
     seed_array.copy_from_slice(seed_slice);
 
     // Create DustSecretKey from seed
-    let dust_secret_key = match DustSecretKey::from_seed(&seed_array) {
-        Ok(sk) => sk,
-        Err(e) => {
-            eprintln!("Error creating DustSecretKey from seed: {:?}", e);
-            return std::ptr::null_mut();
-        }
-    };
+    let dust_secret_key = DustSecretKey::derive_secret_key(&seed_array);
 
-    // Derive public key
-    let dust_public_key: DustPublicKey = dust_secret_key.to_public_key();
+    // Derive public key using From trait
+    let dust_public_key = DustPublicKey::from(dust_secret_key);
 
     // Serialize public key
     let mut pk_bytes = Vec::new();
@@ -120,8 +114,8 @@ mod tests {
                 .to_str()
                 .unwrap();
 
-            // Should be 64 hex characters (32 bytes)
-            assert_eq!(pk_str.len(), 64, "Public key should be 64 hex chars");
+            // Should be 66 hex characters (33 bytes: 1-byte tag + 32 bytes data)
+            assert_eq!(pk_str.len(), 66, "Public key should be 66 hex chars (with tag)");
 
             // Free memory
             free_c_string(pk_ptr);

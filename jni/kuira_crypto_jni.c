@@ -877,9 +877,9 @@ Java_com_midnight_kuira_core_crypto_dust_DustKeyDeriver_nativeDeriveDustPublicKe
     /* Validate string length (prevent buffer overflow) */
     size_t pk_len = strlen(dust_pk);
 
-    /* Expected: 64 hex characters */
-    if (pk_len != 64) {
-        LOGE("nativeDeriveDustPublicKey: invalid key length %zu (expected 64)", pk_len);
+    /* Expected: 66 hex characters (33 bytes: 1-byte tag + 32 bytes data) */
+    if (pk_len != 66) {
+        LOGE("nativeDeriveDustPublicKey: invalid key length %zu (expected 66)", pk_len);
         free_c_string(dust_pk);
         return NULL;
     }
