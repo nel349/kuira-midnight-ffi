@@ -85,6 +85,20 @@ extern void free_shielded_keys(ShieldedKeys* ptr);
 extern char* derive_dust_public_key(const uint8_t* seed_ptr, size_t seed_len);
 extern void free_c_string(char* ptr);
 
+/* Dust state management (Phase 2D-2) */
+extern void* create_dust_local_state(void);
+extern char* dust_wallet_balance(const void* state_ptr, int64_t time_millis);
+extern uint8_t* serialize_dust_state(const void* state_ptr);
+extern void free_dust_local_state(void* ptr);
+extern void free_byte_array(uint8_t* ptr);
+
+/* Dust UTXO iteration (Phase 2D-3) */
+extern size_t dust_utxo_count(const void* state_ptr);
+extern char* dust_get_utxo_at(const void* state_ptr, size_t index);
+
+/* Dust event replay (Phase 2D-4) */
+extern void* dust_replay_events(const void* state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* events_hex);
+
 /* Transaction signing (Phase 2D-FFI) */
 extern void* create_signing_key(const uint8_t* private_key_ptr, size_t private_key_len);
 extern void free_signing_key(void* ptr);
@@ -878,8 +892,9 @@ Java_com_midnight_kuira_core_crypto_dust_DustKeyDeriver_nativeDeriveDustPublicKe
     size_t pk_len = strlen(dust_pk);
 
     /* Expected: 66 hex characters (33 bytes: 1-byte tag + 32 bytes data) */
-    if (pk_len != 66) {
-        LOGE("nativeDeriveDustPublicKey: invalid key length %zu (expected 66)", pk_len);
+    /* Use <= for forward compatibility with potential shorter encodings */
+    if (pk_len > 66 || pk_len < 64) {
+        LOGE("nativeDeriveDustPublicKey: invalid key length %zu (expected 64-66 chars)", pk_len);
         free_c_string(dust_pk);
         return NULL;
     }
@@ -894,6 +909,395 @@ Java_com_midnight_kuira_core_crypto_dust_DustKeyDeriver_nativeDeriveDustPublicKe
     free_c_string(dust_pk);
 
     return jresult;
+}
+
+/**
+ * Creates a new DustLocalState instance (Phase 2D-2 - Dust State)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.crypto.dust
+ *   class DustLocalState {
+ *       companion object {
+ *           private external fun nativeCreateDustLocalState(): Long
+ *       }
+ *   }
+ *
+ * Note: Companion object methods have "$Companion" in their JNI signature
+ *
+ * @param env JNI environment
+ * @param obj DustLocalState$Companion object
+ * @return Native pointer to DustLocalState as jlong, or 0 on error
+ */
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_00024Companion_nativeCreateDustLocalState(
+    JNIEnv* env,
+    jobject obj
+) {
+    /* Call Rust FFI to create state */
+    void* state_ptr = create_dust_local_state();
+
+    if (state_ptr == NULL) {
+        LOGE("nativeCreateDustLocalState: Rust FFI returned NULL");
+        return 0;
+    }
+
+    LOGD("nativeCreateDustLocalState: created state at %p", state_ptr);
+
+    /* Return pointer as jlong */
+    return (jlong)(uintptr_t)state_ptr;
+}
+
+/**
+ * Gets wallet balance at a specific time (Phase 2D-2 - Dust State)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.crypto.dust
+ *   object DustLocalState {
+ *       external fun nativeDustWalletBalance(statePtr: Long, timeMillis: Long): String?
+ *   }
+ *
+ * @param env JNI environment
+ * @param obj DustLocalState object (unused, static method)
+ * @param state_ptr Native pointer to DustLocalState
+ * @param time_millis Unix timestamp in milliseconds
+ * @return Balance as decimal string, or NULL on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustWalletBalance(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr,
+    jlong time_millis
+) {
+    /* Validate pointer */
+    if (state_ptr == 0) {
+        LOGE("nativeDustWalletBalance: state_ptr is 0 (null)");
+        return NULL;
+    }
+
+    /* Call Rust FFI */
+    void* state = (void*)(uintptr_t)state_ptr;
+    char* balance_str = dust_wallet_balance(state, (int64_t)time_millis);
+
+    if (balance_str == NULL) {
+        LOGE("nativeDustWalletBalance: Rust FFI returned NULL");
+        return NULL;
+    }
+
+    /* Convert C string to Java string */
+    jstring jresult = (*env)->NewStringUTF(env, balance_str);
+    if (jresult == NULL) {
+        LOGE("nativeDustWalletBalance: NewStringUTF failed");
+    }
+
+    /* Free native memory */
+    free_c_string(balance_str);
+
+    return jresult;
+}
+
+/**
+ * Serializes DustLocalState to bytes (Phase 2D-2 - Dust State)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.crypto.dust
+ *   object DustLocalState {
+ *       external fun nativeSerializeDustState(statePtr: Long): ByteArray?
+ *   }
+ *
+ * @param env JNI environment
+ * @param obj DustLocalState object (unused, static method)
+ * @param state_ptr Native pointer to DustLocalState
+ * @return Serialized bytes, or NULL on error
+ */
+JNIEXPORT jbyteArray JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeSerializeDustState(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr
+) {
+    /* Validate pointer */
+    if (state_ptr == 0) {
+        LOGE("nativeSerializeDustState: state_ptr is 0 (null)");
+        return NULL;
+    }
+
+    /* Call Rust FFI */
+    void* state = (void*)(uintptr_t)state_ptr;
+    uint8_t* bytes_ptr = serialize_dust_state(state);
+
+    if (bytes_ptr == NULL) {
+        LOGE("nativeSerializeDustState: Rust FFI returned NULL");
+        return NULL;
+    }
+
+    /* Read length from first 8 bytes (little-endian u64) */
+    /* Safe bounds: bytes_ptr guaranteed to have at least 8 bytes from Rust */
+    uint64_t data_len =
+        ((uint64_t)bytes_ptr[0])       |
+        ((uint64_t)bytes_ptr[1] << 8)  |
+        ((uint64_t)bytes_ptr[2] << 16) |
+        ((uint64_t)bytes_ptr[3] << 24) |
+        ((uint64_t)bytes_ptr[4] << 32) |
+        ((uint64_t)bytes_ptr[5] << 40) |
+        ((uint64_t)bytes_ptr[6] << 48) |
+        ((uint64_t)bytes_ptr[7] << 56);
+
+    LOGD("nativeSerializeDustState: serialized %llu bytes", (unsigned long long)data_len);
+
+    /* Check for JNI array size limit (max 2GB = INT_MAX) */
+    if (data_len > (uint64_t)INT_MAX) {
+        LOGE("nativeSerializeDustState: data too large (%llu bytes, max %d)",
+             (unsigned long long)data_len, INT_MAX);
+        free_byte_array(bytes_ptr);
+        return NULL;
+    }
+
+    /* Create Java byte array (skip the 8-byte length prefix) */
+    jbyteArray jresult = (*env)->NewByteArray(env, (jsize)data_len);
+    if (jresult == NULL) {
+        LOGE("nativeSerializeDustState: NewByteArray failed");
+        free_byte_array(bytes_ptr);
+        return NULL;
+    }
+
+    /* Copy data to Java array (starting after the 8-byte length) */
+    (*env)->SetByteArrayRegion(env, jresult, 0, (jsize)data_len, (jbyte*)(bytes_ptr + 8));
+
+    /* Check for exceptions */
+    if ((*env)->ExceptionCheck(env)) {
+        LOGE("nativeSerializeDustState: exception during SetByteArrayRegion");
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        free_byte_array(bytes_ptr);
+        return NULL;
+    }
+
+    /* Free native memory */
+    free_byte_array(bytes_ptr);
+
+    return jresult;
+}
+
+/**
+ * Frees a DustLocalState instance (Phase 2D-2 - Dust State)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.crypto.dust
+ *   object DustLocalState {
+ *       external fun nativeFreeDustLocalState(statePtr: Long)
+ *   }
+ *
+ * @param env JNI environment
+ * @param obj DustLocalState object (unused, static method)
+ * @param state_ptr Native pointer to DustLocalState
+ */
+JNIEXPORT void JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeFreeDustLocalState(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr
+) {
+    /* Validate pointer */
+    if (state_ptr == 0) {
+        LOGW("nativeFreeDustLocalState: state_ptr is 0 (null), ignoring");
+        return;
+    }
+
+    LOGD("nativeFreeDustLocalState: freeing state at %p", (void*)(uintptr_t)state_ptr);
+
+    /* Call Rust FFI to free */
+    void* state = (void*)(uintptr_t)state_ptr;
+    free_dust_local_state(state);
+}
+
+/**
+ * Gets the count of dust UTXOs in the wallet (Phase 2D-3 - UTXO Iteration)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.crypto.dust
+ *   object DustLocalState {
+ *       external fun nativeDustUtxoCount(statePtr: Long): Int
+ *   }
+ *
+ * @param env JNI environment
+ * @param obj DustLocalState object (unused, static method)
+ * @param state_ptr Native pointer to DustLocalState
+ * @return Number of UTXOs, or 0 on error
+ */
+JNIEXPORT jint JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustUtxoCount(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr
+) {
+    /* Validate pointer */
+    if (state_ptr == 0) {
+        LOGE("nativeDustUtxoCount: state_ptr is 0 (null)");
+        return 0;
+    }
+
+    /* Call Rust FFI */
+    void* state = (void*)(uintptr_t)state_ptr;
+    size_t count = dust_utxo_count(state);
+
+    /* Check for overflow (size_t → jint) */
+    if (count > (size_t)INT_MAX) {
+        LOGE("nativeDustUtxoCount: count too large (%zu)", count);
+        return INT_MAX;
+    }
+
+    return (jint)count;
+}
+
+/**
+ * Gets a dust UTXO at a specific index (Phase 2D-3 - UTXO Iteration)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.crypto.dust
+ *   object DustLocalState {
+ *       external fun nativeDustGetUtxoAt(statePtr: Long, index: Int): String?
+ *   }
+ *
+ * @param env JNI environment
+ * @param obj DustLocalState object (unused, static method)
+ * @param state_ptr Native pointer to DustLocalState
+ * @param index Index of UTXO to retrieve
+ * @return Hex-encoded serialized UTXO, or NULL if out of bounds
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustGetUtxoAt(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr,
+    jint index
+) {
+    /* Validate pointer */
+    if (state_ptr == 0) {
+        LOGE("nativeDustGetUtxoAt: state_ptr is 0 (null)");
+        return NULL;
+    }
+
+    /* Validate index */
+    if (index < 0) {
+        LOGE("nativeDustGetUtxoAt: negative index %d", index);
+        return NULL;
+    }
+
+    /* Call Rust FFI */
+    void* state = (void*)(uintptr_t)state_ptr;
+    char* utxo_hex = dust_get_utxo_at(state, (size_t)index);
+
+    if (utxo_hex == NULL) {
+        LOGD("nativeDustGetUtxoAt: index %d out of bounds or error", index);
+        return NULL;
+    }
+
+    /* Convert C string to Java string */
+    jstring jresult = (*env)->NewStringUTF(env, utxo_hex);
+    if (jresult == NULL) {
+        LOGE("nativeDustGetUtxoAt: NewStringUTF failed");
+    }
+
+    /* Free native memory */
+    free_c_string(utxo_hex);
+
+    return jresult;
+}
+
+/**
+ * Replays blockchain events into DustLocalState to sync wallet (Phase 2D-4 - Event Replay)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.crypto.dust
+ *   class DustLocalState {
+ *       private external fun nativeDustReplayEvents(
+ *           statePtr: Long,
+ *           seed: ByteArray,
+ *           eventsHex: String
+ *       ): Long
+ *   }
+ *
+ * @param env JNI environment
+ * @param obj DustLocalState object
+ * @param state_ptr Native pointer to DustLocalState
+ * @param seed_array 32-byte seed for deriving DustSecretKey
+ * @param events_hex Hex-encoded SCALE-serialized events
+ * @return Pointer to new DustLocalState with events applied, or 0 on error
+ */
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustReplayEvents(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr,
+    jbyteArray seed_array,
+    jstring events_hex
+) {
+    /* Validate inputs */
+    if (state_ptr == 0) {
+        LOGE("nativeDustReplayEvents: state_ptr is 0 (null)");
+        return 0;
+    }
+
+    if (seed_array == NULL) {
+        LOGE("nativeDustReplayEvents: seed_array is NULL");
+        return 0;
+    }
+
+    if (events_hex == NULL) {
+        LOGE("nativeDustReplayEvents: events_hex is NULL");
+        return 0;
+    }
+
+    /* Get seed length */
+    jsize seed_len = (*env)->GetArrayLength(env, seed_array);
+    if (seed_len != 32) {
+        LOGE("nativeDustReplayEvents: invalid seed length %d (expected 32)", seed_len);
+        return 0;
+    }
+
+    /* Extract seed bytes */
+    uint8_t seed_buf[32];
+    (*env)->GetByteArrayRegion(env, seed_array, 0, 32, (jbyte*)seed_buf);
+
+    /* Check for exceptions */
+    if ((*env)->ExceptionCheck(env)) {
+        LOGE("nativeDustReplayEvents: exception during GetByteArrayRegion");
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        secure_memzero(seed_buf, 32);
+        return 0;
+    }
+
+    /* Convert events hex string to C string */
+    const char* events_hex_c = (*env)->GetStringUTFChars(env, events_hex, NULL);
+    if (events_hex_c == NULL) {
+        LOGE("nativeDustReplayEvents: GetStringUTFChars failed for events_hex");
+        secure_memzero(seed_buf, 32);
+        return 0;
+    }
+
+    LOGD("nativeDustReplayEvents: replaying events hex (length=%zu)", strlen(events_hex_c));
+
+    /* Call Rust FFI */
+    void* state = (void*)(uintptr_t)state_ptr;
+    void* new_state = dust_replay_events(state, seed_buf, 32, events_hex_c);
+
+    /* SECURITY: Zeroize seed after use */
+    secure_memzero(seed_buf, 32);
+
+    /* Release Java string */
+    (*env)->ReleaseStringUTFChars(env, events_hex, events_hex_c);
+
+    if (new_state == NULL) {
+        LOGE("nativeDustReplayEvents: Rust FFI returned NULL");
+        return 0;
+    }
+
+    LOGD("nativeDustReplayEvents: success, new_state=%p", new_state);
+
+    /* Return new state pointer as jlong */
+    return (jlong)(uintptr_t)new_state;
 }
 
 JNIEXPORT jint JNICALL
