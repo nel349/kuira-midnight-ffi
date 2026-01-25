@@ -25,7 +25,7 @@ macro_rules! log_info {
     }
 }
 
-use midnight_ledger::structure::{Intent, UnshieldedOffer, UtxoSpend, UtxoOutput, IntentHash};
+use midnight_ledger::structure::{Intent, UnshieldedOffer, UtxoSpend, UtxoOutput, IntentHash, ProofPreimageMarker};
 use midnight_coin_structure::coin::{UnshieldedTokenType, UserAddress};
 use midnight_storage::DefaultDB;
 use midnight_serialize::tagged_serialize;  // CRITICAL: Use tagged serialization
@@ -332,31 +332,36 @@ pub fn build_and_serialize_intent(
     log_info!("  Bytes length: {}", randomness_bytes.len());
 
     // Deserialize as PedersenRandomness (scalar)
+    // We'll use this for both the Intent binding_commitment AND StandardTransaction binding_randomness
     let binding_randomness: PedersenRandomness = <PedersenRandomness as Deserializable>::deserialize(&mut &randomness_bytes[..], 32)
         .map_err(|e| format!("Invalid PedersenRandomness: {:?}", e))?;
 
-    // Convert to Pedersen commitment (curve point) for the Intent
-    let binding_commitment: Pedersen = Pedersen::from(binding_randomness);
-
     log_info!("  TTL: {} ms ({} secs)", ttl_ms, ttl_ms / 1000);
 
-    // Build Intent structure with Pedersen (NOT PedersenRandomness!)
-    // Intent uses Pedersen (curve point), StandardTransaction uses PedersenRandomness (scalar)
+    // Build Intent structure with PedersenRandomness (NOT Pedersen!)
+    // We'll seal it later to convert to PureGeneratorPedersen
     log_info!("[Kuira FFI] 📋 Building Intent structure:");
     log_info!("  guaranteed_unshielded_offer: Some(UnshieldedOffer)");
     log_info!("  fallible_unshielded_offer: None");
     log_info!("  actions: empty");
     log_info!("  dust_actions: None");
     log_info!("  ttl: {} (Timestamp)", ttl_ms / 1000);
-    log_info!("  binding_commitment: Pedersen (curve point)");
+    log_info!("  binding_commitment: PedersenRandomness (will be sealed to PureGeneratorPedersen)");
 
-    let intent = Intent::<Signature, (), Pedersen, DefaultDB> {
+    // CRITICAL: Use ProofPreimageMarker (not ()) to match TypeScript SDK wire format
+    // This affects the tagged type in the serialization:
+    // - () = proof-erased (wrong)
+    // - ProofPreimageMarker = proof-preimage (correct for unproven transactions)
+    //
+    // CRITICAL: Use PedersenRandomness for binding type (will be sealed to PureGeneratorPedersen)
+    // This matches TypeScript SDK flow: PreBinding -> seal() -> Binding
+    let intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
         guaranteed_unshielded_offer: Some(Sp::new(unshielded_offer)),
         fallible_unshielded_offer: None,
         actions: std::iter::empty().collect(),
         dust_actions: None,
         ttl: Timestamp::from_secs(ttl_ms / 1000),
-        binding_commitment,  // Pedersen curve point
+        binding_commitment: binding_randomness,  // PedersenRandomness
     };
 
     log_info!("  ✅ Intent created successfully");
@@ -397,18 +402,28 @@ pub fn build_and_serialize_intent(
     });
 
     log_info!("  ✅ Transaction::Standard created with network_id='undeployed'");
+    log_info!("  Type: Transaction<Signature, ProofPreimageMarker, PedersenRandomness, D>");
+
+    // CRITICAL: Seal the transaction to convert from PedersenRandomness to PureGeneratorPedersen
+    // This matches TypeScript SDK's .bind() call
+    log_info!("\n[Kuira FFI] 🔐 Sealing transaction (PedersenRandomness -> PureGeneratorPedersen):");
+    use rand::rngs::OsRng;
+    let sealed_transaction = transaction.seal(OsRng);
+    log_info!("  ✅ Transaction sealed!");
+    log_info!("  Type: Transaction<Signature, ProofPreimageMarker, PureGeneratorPedersen, D>");
+    log_info!("  Tag should now be: midnight:transaction[v6](signature[v1],proof-preimage,embedded-fr[v1])");
 
     // DEBUG: First serialize WITHOUT tag to see raw SCALE
-    log_info!("\n[Kuira FFI] 🔍 DEBUG: Serializing Transaction:");
+    log_info!("\n[Kuira FFI] 🔍 DEBUG: Serializing Sealed Transaction:");
     let mut raw_bytes = Vec::new();
-    Serializable::serialize(&transaction, &mut raw_bytes)
+    Serializable::serialize(&sealed_transaction, &mut raw_bytes)
         .map_err(|e| format!("Raw SCALE serialization failed: {:?}", e))?;
     log_info!("  - Raw SCALE (no tag): {} bytes", raw_bytes.len());
     log_info!("  - Raw hex: {}", hex::encode(&raw_bytes));
 
     // Now serialize WITH tag
     let mut bytes = Vec::new();
-    tagged_serialize(&transaction, &mut bytes)
+    tagged_serialize(&sealed_transaction, &mut bytes)
         .map_err(|e| format!("Tagged SCALE serialization failed: {:?}", e))?;
 
     log_info!("[Kuira FFI] Serialized Transaction (with tag):");
@@ -421,6 +436,34 @@ pub fn build_and_serialize_intent(
         log_info!("  - Tag prefix: '{}' ✅", tag_str);
     } else {
         log_info!("  - Tag prefix (hex): {}", hex::encode(tag_prefix));
+    }
+
+    // CRITICAL: Extract and display FULL tag to verify binding type
+    let tag_end = bytes.iter().position(|&b| b == b':').unwrap_or(100);
+    if tag_end < bytes.len() {
+        let full_tag = &bytes[0..=tag_end];
+        if let Ok(tag_str) = std::str::from_utf8(full_tag) {
+            log_info!("\n[Kuira FFI] 🔍 FULL TRANSACTION TAG:");
+            log_info!("  {}", tag_str);
+
+            // Check binding type
+            if tag_str.contains("pedersen-schnorr[v1]") {
+                log_info!("  ✅ Binding type: pedersen-schnorr[v1] (PureGeneratorPedersen - SEALED!)");
+            } else if tag_str.contains("embedded-fr[v1]") {
+                log_info!("  ✅ Binding type: embedded-fr[v1] (PureGeneratorPedersen - SEALED!)");
+            } else if tag_str.contains("pedersen[v1]") {
+                log_info!("  ❌ Binding type: pedersen[v1] (Pedersen - NOT SEALED!)");
+            } else {
+                log_info!("  ⚠️  Binding type: UNKNOWN");
+            }
+
+            // Check proof type
+            if tag_str.contains("proof-preimage") {
+                log_info!("  ✅ Proof type: proof-preimage (ProofPreimageMarker - CORRECT!)");
+            } else if tag_str.contains("()") {
+                log_info!("  ❌ Proof type: () (ProofErased - WRONG!)");
+            }
+        }
     }
 
     log_info!("  - First 100 bytes: {}", hex::encode(&bytes[..bytes.len().min(100)]));
@@ -671,7 +714,8 @@ fn build_intent_and_get_signature_data(
         rng.gen()
     };
 
-    let intent = Intent::<Signature, (), PedersenRandomness, DefaultDB> {
+    // CRITICAL: Use ProofPreimageMarker to match TypeScript SDK wire format
+    let intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
         guaranteed_unshielded_offer: Some(Sp::new(unshielded_offer)),
         fallible_unshielded_offer: None,
         actions: std::iter::empty().collect(),
@@ -682,7 +726,7 @@ fn build_intent_and_get_signature_data(
 
     // CRITICAL: Downgrade to Pedersen, then erase signatures and proofs to get the data to sign
     // Step 1: PedersenRandomness -> Pedersen (required for data_to_sign)
-    let intent_pedersen = Intent::<Signature, (), Pedersen, DefaultDB> {
+    let intent_pedersen = Intent::<Signature, ProofPreimageMarker, Pedersen, DefaultDB> {
         guaranteed_unshielded_offer: intent.guaranteed_unshielded_offer.clone(),
         fallible_unshielded_offer: intent.fallible_unshielded_offer.clone(),
         actions: intent.actions.clone(),
@@ -691,11 +735,14 @@ fn build_intent_and_get_signature_data(
         binding_commitment: Pedersen::from(binding_randomness),
     };
 
-    // Step 2: Erase signatures and proofs -> Intent<(), (), Pedersen, D>
-    let erased = intent_pedersen.erase_signatures();
+    // Step 2: Erase signatures -> Intent<(), ProofPreimageMarker, Pedersen, D>
+    let sig_erased = intent_pedersen.erase_signatures();
 
-    // Step 3: Get the data to sign for segment ID 1 (standard for unshielded transactions)
-    let signature_data = erased.data_to_sign(1);
+    // Step 3: Erase proofs -> Intent<(), (), Pedersen, D>
+    let fully_erased = sig_erased.erase_proofs();
+
+    // Step 4: Get the data to sign for segment ID 1 (standard for unshielded transactions)
+    let signature_data = fully_erased.data_to_sign(1);
 
     // The signature_data includes ALL the intent data that needs to be signed
     // For multi-input transactions, the SAME data is signed by each input owner

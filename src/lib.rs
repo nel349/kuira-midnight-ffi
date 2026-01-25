@@ -40,6 +40,9 @@ pub mod transaction_ffi;
 // Transaction serialization (SCALE codec)
 pub mod serialize;
 
+// Dust key derivation FFI
+pub mod dust_ffi;
+
 // Key validity tests
 #[cfg(test)]
 mod test_key_validity;

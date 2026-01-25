@@ -81,6 +81,10 @@ extern void kuira_crypto_init(void);
 extern ShieldedKeys* derive_shielded_keys(const uint8_t* seed_ptr, size_t seed_len);
 extern void free_shielded_keys(ShieldedKeys* ptr);
 
+/* Dust key derivation (Phase 2D-1) */
+extern char* derive_dust_public_key(const uint8_t* seed_ptr, size_t seed_len);
+extern void free_c_string(char* ptr);
+
 /* Transaction signing (Phase 2D-FFI) */
 extern void* create_signing_key(const uint8_t* private_key_ptr, size_t private_key_len);
 extern void free_signing_key(void* ptr);
@@ -813,6 +817,85 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeGetSignin
  *
  * Validates JVM version and initializes library.
  */
+/**
+ * Derives dust public key from seed (Phase 2D-1 - Dust Keys)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.crypto.dust
+ *   object DustKeyDeriver {
+ *       external fun nativeDeriveDustPublicKey(seed: ByteArray): String?
+ *   }
+ *
+ * @param env JNI environment
+ * @param obj DustKeyDeriver object (unused, static method)
+ * @param seed_array Java byte array (32 bytes expected)
+ * @return Java string with 64 hex characters (dust public key), or NULL on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustKeyDeriver_nativeDeriveDustPublicKey(
+    JNIEnv* env,
+    jobject obj,
+    jbyteArray seed_array
+) {
+    /* Validate input */
+    if (seed_array == NULL) {
+        LOGE("nativeDeriveDustPublicKey: seed_array is NULL");
+        return NULL;
+    }
+
+    /* Get array length */
+    jsize seed_len = (*env)->GetArrayLength(env, seed_array);
+    if (seed_len != 32) {
+        LOGE("nativeDeriveDustPublicKey: invalid seed length %d (expected 32)", seed_len);
+        return NULL;
+    }
+
+    /* Extract bytes from Java array (copy, not pin - safer) */
+    uint8_t seed_buf[32];
+    (*env)->GetByteArrayRegion(env, seed_array, 0, 32, (jbyte*)seed_buf);
+
+    /* Check for exceptions during byte extraction */
+    if ((*env)->ExceptionCheck(env)) {
+        LOGE("nativeDeriveDustPublicKey: exception during GetByteArrayRegion");
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        secure_memzero(seed_buf, 32);  /* SECURITY: Zeroize on error */
+        return NULL;
+    }
+
+    /* Call Rust FFI */
+    char* dust_pk = derive_dust_public_key(seed_buf, 32);
+
+    /* SECURITY: Zeroize seed immediately after use */
+    secure_memzero(seed_buf, 32);
+
+    if (dust_pk == NULL) {
+        LOGE("nativeDeriveDustPublicKey: Rust FFI returned NULL");
+        return NULL;
+    }
+
+    /* Validate string length (prevent buffer overflow) */
+    size_t pk_len = strlen(dust_pk);
+
+    /* Expected: 64 hex characters */
+    if (pk_len != 64) {
+        LOGE("nativeDeriveDustPublicKey: invalid key length %zu (expected 64)", pk_len);
+        free_c_string(dust_pk);
+        return NULL;
+    }
+
+    /* Convert C string to Java string */
+    jstring jresult = (*env)->NewStringUTF(env, dust_pk);
+    if (jresult == NULL) {
+        LOGE("nativeDeriveDustPublicKey: NewStringUTF failed");
+    }
+
+    /* Free native memory */
+    free_c_string(dust_pk);
+
+    return jresult;
+}
+
 JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* reserved) {
     JNIEnv* env;
