@@ -25,7 +25,23 @@ macro_rules! log_info {
     }
 }
 
+// Error logging macro that shows in Android logcat
+#[cfg(target_os = "android")]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        log::error!($($arg)*);
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        eprintln!("[ERROR] {}", format!($($arg)*));
+    }
+}
+
 use midnight_ledger::structure::{Intent, UnshieldedOffer, UtxoSpend, UtxoOutput, IntentHash, ProofPreimageMarker};
+use midnight_ledger::dust::{DustActions, DustLocalState, DustSecretKey, Seed};
 use midnight_coin_structure::coin::{UnshieldedTokenType, UserAddress};
 use midnight_storage::DefaultDB;
 use midnight_serialize::tagged_serialize;  // CRITICAL: Use tagged serialization
@@ -37,6 +53,191 @@ use midnight_transient_crypto::commitment::{Pedersen, PedersenRandomness};
 use midnight_serialize::{Serializable, Deserializable};
 use serde::{Deserialize as SerdeDeserialize, Serialize};
 use rand::Rng;
+
+/// Serialize a signed Intent with dust fee payment to SCALE hex.
+///
+/// This function creates real DustActions by calling state.spend() on the provided
+/// DustLocalState, following the TypeScript SDK pattern.
+///
+/// # Parameters
+///
+/// - `inputs_hex`: JSON array of UtxoSpend objects
+/// - `outputs_hex`: JSON array of UtxoOutput objects
+/// - `signatures_hex`: JSON array of signature hex strings
+/// - `dust_state_ptr`: Pointer to DustLocalState (from create_dust_local_state)
+/// - `seed_ptr`: Pointer to 32-byte seed for deriving DustSecretKey
+/// - `seed_len`: Length of seed (must be 32)
+/// - `dust_utxos_json`: JSON array of {utxo_index, v_fee} objects
+/// - `current_time_ms`: Current time in milliseconds
+/// - `ttl`: Transaction time-to-live (milliseconds since epoch)
+/// - `binding_randomness_hex`: Hex-encoded binding commitment (32 bytes)
+///
+/// # Returns
+///
+/// - Non-null C string containing hex-encoded SCALE bytes
+/// - Null pointer on error
+#[no_mangle]
+pub extern "C" fn serialize_unshielded_transaction_with_dust(
+    inputs_hex: *const c_char,
+    outputs_hex: *const c_char,
+    signatures_hex: *const c_char,
+    dust_state_ptr: *const DustLocalState<DefaultDB>,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    dust_utxos_json: *const c_char,
+    current_time_ms: i64,
+    ttl: u64,
+    binding_randomness_hex: *const c_char,
+) -> *mut c_char {
+    // Safety checks
+    if inputs_hex.is_null() || outputs_hex.is_null() || signatures_hex.is_null() ||
+       dust_state_ptr.is_null() || seed_ptr.is_null() || dust_utxos_json.is_null() ||
+       binding_randomness_hex.is_null() {
+        log_error!("[Kuira FFI] Null pointer passed to serialize_unshielded_transaction_with_dust");
+        return std::ptr::null_mut();
+    }
+
+    if seed_len != 32 {
+        log_error!("[Kuira FFI] Seed must be 32 bytes, got {}", seed_len);
+        return std::ptr::null_mut();
+    }
+
+    // Convert C strings to Rust strings
+    let inputs_str = match unsafe { CStr::from_ptr(inputs_hex).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            log_error!("[Kuira FFI] Invalid UTF-8 in inputs: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let outputs_str = match unsafe { CStr::from_ptr(outputs_hex).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            log_error!("[Kuira FFI] Invalid UTF-8 in outputs: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let signatures_str = match unsafe { CStr::from_ptr(signatures_hex).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            log_error!("[Kuira FFI] Invalid UTF-8 in signatures: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let dust_utxos_str = match unsafe { CStr::from_ptr(dust_utxos_json).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            log_error!("[Kuira FFI] Invalid UTF-8 in dust_utxos: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let binding_randomness_str = match unsafe { CStr::from_ptr(binding_randomness_hex).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            log_error!("[Kuira FFI] Invalid UTF-8 in binding_commitment: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Convert seed to Seed type
+    let seed_slice = unsafe { std::slice::from_raw_parts(seed_ptr, seed_len) };
+    let mut seed_array: Seed = [0u8; 32];
+    seed_array.copy_from_slice(seed_slice);
+
+    // Derive DustSecretKey from seed
+    let dust_secret_key = DustSecretKey::derive_secret_key(&seed_array);
+
+    // Get DustLocalState reference
+    let dust_state = unsafe { &*dust_state_ptr };
+
+    // Parse dust UTXO selections
+    #[derive(SerdeDeserialize)]
+    struct DustUtxoSelection {
+        utxo_index: usize,
+        v_fee: String,
+    }
+
+    let dust_selections: Vec<DustUtxoSelection> = match serde_json::from_str(dust_utxos_str) {
+        Ok(s) => s,
+        Err(e) => {
+            log_error!("[Kuira FFI] Failed to parse dust_utxos JSON: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    // Create current timestamp
+    let timestamp = Timestamp::from_secs((current_time_ms / 1000) as u64);
+
+    // Call state.spend() for each UTXO to create DustSpend objects
+    // CRITICAL: state.spend() returns (new_state, dust_spend)
+    // We need to chain the calls to track state updates
+    let utxos: Vec<_> = dust_state.utxos().collect();
+
+    let mut current_state = dust_state.clone();
+    let mut dust_spends = Vec::new();
+
+    for selection in dust_selections {
+        if selection.utxo_index >= utxos.len() {
+            log_error!("[Kuira FFI] utxo_index {} out of bounds (total: {})", selection.utxo_index, utxos.len());
+            return std::ptr::null_mut();
+        }
+
+        let v_fee: u128 = match selection.v_fee.parse() {
+            Ok(fee) => fee,
+            Err(e) => {
+                log_error!("[Kuira FFI] Invalid v_fee '{}': {}", selection.v_fee, e);
+                return std::ptr::null_mut();
+            }
+        };
+
+        let utxo = utxos[selection.utxo_index];
+
+        // Call state.spend() - returns (new_state, dust_spend)
+        match current_state.spend(&dust_secret_key, &utxo, v_fee, timestamp) {
+            Ok((new_state, dust_spend)) => {
+                current_state = new_state;
+                dust_spends.push(dust_spend);
+                log_info!("[Kuira FFI] Created DustSpend for UTXO {}: v_fee={}", selection.utxo_index, v_fee);
+            }
+            Err(e) => {
+                log_error!("[Kuira FFI] Failed to create dust spend for UTXO {}: {:?}", selection.utxo_index, e);
+                return std::ptr::null_mut();
+            }
+        }
+    }
+
+    log_info!("[Kuira FFI] Created {} DustSpend objects", dust_spends.len());
+
+    // Build and serialize Intent with real DustActions
+    log_info!("[Kuira FFI] About to call build_and_serialize_intent_with_dust...");
+    match build_and_serialize_intent_with_dust(
+        inputs_str,
+        outputs_str,
+        signatures_str,
+        Some((dust_spends, timestamp)),
+        ttl,
+        binding_randomness_str.to_string()
+    ) {
+        Ok(hex) => {
+            log_info!("[Kuira FFI] Serialization succeeded! Hex length: {}", hex.len());
+            match CString::new(hex) {
+                Ok(c_str) => c_str.into_raw(),
+                Err(e) => {
+                    log_error!("[Kuira FFI] Failed to create C string: {}", e);
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            log_error!("[Kuira FFI] ❌ SERIALIZATION ERROR: {}", e);
+            std::ptr::null_mut()
+        }
+    }
+}
 
 /// Serialize a signed Intent to SCALE hex (Phase 2: Real implementation)
 ///
@@ -65,11 +266,12 @@ pub extern "C" fn serialize_unshielded_transaction(
     inputs_hex: *const c_char,
     outputs_hex: *const c_char,
     signatures_hex: *const c_char,
+    dust_actions_hex: *const c_char,
     ttl: u64,
-    binding_randomness_hex: *const c_char,  // Changed from binding_randomness_hex
+    binding_randomness_hex: *const c_char,
 ) -> *mut c_char {
     // Safety checks
-    if inputs_hex.is_null() || outputs_hex.is_null() || signatures_hex.is_null() || binding_randomness_hex.is_null() {
+    if inputs_hex.is_null() || outputs_hex.is_null() || signatures_hex.is_null() || dust_actions_hex.is_null() || binding_randomness_hex.is_null() {
         eprintln!("[Kuira FFI] Null pointer passed to serialize_unshielded_transaction");
         return std::ptr::null_mut();
     }
@@ -99,6 +301,14 @@ pub extern "C" fn serialize_unshielded_transaction(
         }
     };
 
+    let dust_actions_str = match unsafe { CStr::from_ptr(dust_actions_hex).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[Kuira FFI] Invalid UTF-8 in dust_actions: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
     let binding_randomness_str = match unsafe { CStr::from_ptr(binding_randomness_hex).to_str() } {
         Ok(s) => s,
         Err(e) => {
@@ -107,8 +317,8 @@ pub extern "C" fn serialize_unshielded_transaction(
         }
     };
 
-    // Build and serialize Intent
-    match build_and_serialize_intent(inputs_str, outputs_str, signatures_str, ttl, binding_randomness_str.to_string()) {
+    // Build and serialize Intent with dust actions
+    match build_and_serialize_intent(inputs_str, outputs_str, signatures_str, dust_actions_str, ttl, binding_randomness_str.to_string()) {
         Ok(hex) => {
             match CString::new(hex) {
                 Ok(c_str) => c_str.into_raw(),
@@ -149,6 +359,7 @@ pub fn build_and_serialize_intent(
     inputs_json: &str,
     outputs_json: &str,
     signatures_json: &str,
+    dust_actions_json: &str,
     ttl_ms: u64,
     binding_randomness_hex: String,
 ) -> Result<String, String> {
@@ -161,6 +372,9 @@ pub fn build_and_serialize_intent(
 
     let json_signatures: Vec<String> = serde_json::from_str(signatures_json)
         .map_err(|e| format!("Failed to parse signatures JSON: {}", e))?;
+
+    // TODO Phase 2E-DUST: Replace JSON approach with DustLocalState pointer
+    // For now, dust_actions will be None (transactions without fees)
 
     // Convert to midnight-ledger types
     let mut inputs = Vec::new();
@@ -338,13 +552,22 @@ pub fn build_and_serialize_intent(
 
     log_info!("  TTL: {} ms ({} secs)", ttl_ms, ttl_ms / 1000);
 
+    // Parse dust_actions_json (empty array "[]" means no dust)
+    let dust_actions_opt = if dust_actions_json.trim() == "[]" {
+        log_info!("[Kuira FFI] 💨 Dust actions: None (no dust payment)");
+        None
+    } else {
+        log_info!("[Kuira FFI] 💨 Dust actions: JSON provided (calling build_and_serialize_intent_with_dust recommended)");
+        None
+    };
+
     // Build Intent structure with PedersenRandomness (NOT Pedersen!)
     // We'll seal it later to convert to PureGeneratorPedersen
     log_info!("[Kuira FFI] 📋 Building Intent structure:");
     log_info!("  guaranteed_unshielded_offer: Some(UnshieldedOffer)");
     log_info!("  fallible_unshielded_offer: None");
     log_info!("  actions: empty");
-    log_info!("  dust_actions: None");
+    log_info!("  dust_actions: {:?}", if dust_actions_opt.is_some() { "Some(DustActions)" } else { "None" });
     log_info!("  ttl: {} (Timestamp)", ttl_ms / 1000);
     log_info!("  binding_commitment: PedersenRandomness (will be sealed to PureGeneratorPedersen)");
 
@@ -359,7 +582,7 @@ pub fn build_and_serialize_intent(
         guaranteed_unshielded_offer: Some(Sp::new(unshielded_offer)),
         fallible_unshielded_offer: None,
         actions: std::iter::empty().collect(),
-        dust_actions: None,
+        dust_actions: dust_actions_opt,
         ttl: Timestamp::from_secs(ttl_ms / 1000),
         binding_commitment: binding_randomness,  // PedersenRandomness
     };
@@ -479,6 +702,197 @@ pub fn build_and_serialize_intent(
         let offset = i * 16;
         log_info!("  Offset {:3}: {}", offset, std::str::from_utf8(chunk).unwrap_or("??"));
     }
+
+    Ok(hex::encode(&bytes))
+}
+
+/// Build an Intent with DustActions from real DustSpend objects and serialize to SCALE hex.
+///
+/// This function follows the TypeScript SDK pattern by accepting DustSpend objects
+/// created from state.spend(), not JSON.
+pub fn build_and_serialize_intent_with_dust(
+    inputs_json: &str,
+    outputs_json: &str,
+    signatures_json: &str,
+    dust_spends_opt: Option<(Vec<midnight_ledger::dust::DustSpend<ProofPreimageMarker, DefaultDB>>, Timestamp)>,
+    ttl_ms: u64,
+    binding_randomness_hex: String,
+) -> Result<String, String> {
+    // Parse JSON inputs (same as build_and_serialize_intent)
+    let json_inputs: Vec<JsonUtxoSpend> = serde_json::from_str(inputs_json)
+        .map_err(|e| format!("Failed to parse inputs JSON: {}", e))?;
+
+    let json_outputs: Vec<JsonUtxoOutput> = serde_json::from_str(outputs_json)
+        .map_err(|e| format!("Failed to parse outputs JSON: {}", e))?;
+
+    let json_signatures: Vec<String> = serde_json::from_str(signatures_json)
+        .map_err(|e| format!("Failed to parse signatures JSON: {}", e))?;
+
+    // Convert to midnight-ledger types (same as original function)
+    let mut inputs = Vec::new();
+    for json_input in json_inputs {
+        let value: u128 = json_input.value.parse()
+            .map_err(|e| format!("Invalid value: {}", e))?;
+
+        let owner_bytes = hex::decode(&json_input.owner)
+            .map_err(|e| format!("Invalid owner hex: {}", e))?;
+
+        if owner_bytes.len() != 32 {
+            return Err(format!("VerifyingKey must be 32 bytes, got {}", owner_bytes.len()));
+        }
+        let mut cursor = std::io::Cursor::new(owner_bytes.clone());
+        let verifying_key = <VerifyingKey as Deserializable>::deserialize(&mut cursor, 32)
+            .map_err(|e| format!("Invalid verifying key: {:?}", e))?;
+
+        let token_type_bytes = hex::decode(&json_input.token_type)
+            .map_err(|e| format!("Invalid token type hex: {}", e))?;
+        if token_type_bytes.len() != 32 {
+            return Err(format!("Token type must be 32 bytes, got {}", token_type_bytes.len()));
+        }
+        let mut token_type = [0u8; 32];
+        token_type.copy_from_slice(&token_type_bytes);
+        let token_type = UnshieldedTokenType(HashOutput(token_type));
+
+        let intent_hash_bytes = hex::decode(&json_input.intent_hash)
+            .map_err(|e| format!("Invalid intent hash hex: {}", e))?;
+        if intent_hash_bytes.len() != 32 {
+            return Err(format!("Intent hash must be 32 bytes, got {}", intent_hash_bytes.len()));
+        }
+        let mut intent_hash = [0u8; 32];
+        intent_hash.copy_from_slice(&intent_hash_bytes);
+        let intent_hash = IntentHash(HashOutput(intent_hash));
+
+        inputs.push(UtxoSpend {
+            value,
+            owner: verifying_key,
+            type_: token_type,
+            intent_hash,
+            output_no: json_input.output_no,
+        });
+    }
+
+    let mut outputs = Vec::new();
+    for json_output in json_outputs {
+        let value: u128 = json_output.value.parse()
+            .map_err(|e| format!("Invalid value: {}", e))?;
+
+        let user_address_bytes = hex::decode(&json_output.owner)
+            .map_err(|e| format!("Invalid user address hex: {}", e))?;
+        if user_address_bytes.len() != 32 {
+            return Err(format!("UserAddress must be 32 bytes, got {}", user_address_bytes.len()));
+        }
+        let mut user_address = [0u8; 32];
+        user_address.copy_from_slice(&user_address_bytes);
+        let user_address = UserAddress(HashOutput(user_address));
+
+        let token_type_bytes = hex::decode(&json_output.token_type)
+            .map_err(|e| format!("Invalid token type hex: {}", e))?;
+        if token_type_bytes.len() != 32 {
+            return Err(format!("Token type must be 32 bytes, got {}", token_type_bytes.len()));
+        }
+        let mut token_type = [0u8; 32];
+        token_type.copy_from_slice(&token_type_bytes);
+        let token_type = UnshieldedTokenType(HashOutput(token_type));
+
+        outputs.push(UtxoOutput {
+            value,
+            owner: user_address,
+            type_: token_type,
+        });
+    }
+
+    // Convert signatures
+    let mut signatures = Vec::new();
+    for sig_hex in json_signatures {
+        let sig_bytes = hex::decode(&sig_hex)
+            .map_err(|e| format!("Invalid signature hex: {}", e))?;
+        let signature = Signature::deserialize(&mut &sig_bytes[..], 32)
+            .map_err(|e| format!("Invalid signature: {:?}", e))?;
+        signatures.push(signature);
+    }
+
+    // Sort inputs and outputs (required by midnight-ledger)
+    inputs.sort();
+    outputs.sort();
+
+    // Build UnshieldedOffer
+    let unshielded_offer = UnshieldedOffer::<Signature, DefaultDB> {
+        inputs: inputs.into_iter().collect(),
+        outputs: outputs.into_iter().collect(),
+        signatures: signatures.into_iter().collect(),
+    };
+
+    // Deserialize binding_randomness
+    let randomness_bytes = hex::decode(&binding_randomness_hex)
+        .map_err(|e| format!("Invalid binding_randomness hex: {}", e))?;
+    let binding_randomness: PedersenRandomness = <PedersenRandomness as Deserializable>::deserialize(&mut &randomness_bytes[..], 32)
+        .map_err(|e| format!("Invalid PedersenRandomness: {:?}", e))?;
+
+    // Create DustActions from real DustSpend objects (if provided)
+    let dust_actions_opt = if let Some((dust_spends, ctime)) = dust_spends_opt {
+        log_info!("[Kuira FFI] 💨 Creating DustActions with {} spends", dust_spends.len());
+
+        // Convert Vec<DustSpend> to storage::Array<DustSpend>
+        use midnight_storage::storage::Array as StorageArray;
+        let spends_array: StorageArray<_, DefaultDB> = dust_spends.into_iter().collect();
+
+        // Create empty registrations
+        let registrations_array: StorageArray<midnight_ledger::dust::DustRegistration<Signature, DefaultDB>, DefaultDB> = std::iter::empty().collect();
+
+        // Create DustActions with real spends
+        let dust_actions = DustActions {
+            spends: spends_array,
+            registrations: registrations_array,
+            ctime,
+        };
+
+        Some(Sp::new(dust_actions))
+    } else {
+        log_info!("[Kuira FFI] 💨 Dust actions: None (no dust payment)");
+        None
+    };
+
+    // Build Intent with DustActions
+    let intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
+        guaranteed_unshielded_offer: Some(Sp::new(unshielded_offer)),
+        fallible_unshielded_offer: None,
+        actions: std::iter::empty().collect(),
+        dust_actions: dust_actions_opt,
+        ttl: Timestamp::from_secs(ttl_ms / 1000),
+        binding_commitment: binding_randomness,
+    };
+
+    log_info!("[Kuira FFI] ✅ Intent created successfully with dust actions");
+
+    // Wrap Intent in Transaction::Standard (same as original)
+    use midnight_ledger::structure::Transaction;
+    use midnight_ledger::structure::StandardTransaction;
+    use midnight_storage::storage::HashMap as StorageHashMap;
+
+    let intents_map = StorageHashMap::default().insert(0u16, intent);
+
+    let transaction = Transaction::Standard(StandardTransaction {
+        network_id: "undeployed".into(),
+        intents: intents_map,
+        guaranteed_coins: None,
+        fallible_coins: StorageHashMap::default(),
+        binding_randomness,
+    });
+
+    log_info!("[Kuira FFI] ✅ Transaction::Standard created with dust actions");
+
+    // Seal the transaction (converts PedersenRandomness to PureGeneratorPedersen)
+    use rand::rngs::OsRng;
+    let sealed_transaction = transaction.seal(OsRng);
+
+    log_info!("[Kuira FFI] ✅ Transaction sealed");
+
+    // Serialize with tag
+    let mut bytes = Vec::new();
+    tagged_serialize(&sealed_transaction, &mut bytes)
+        .map_err(|e| format!("Tagged SCALE serialization failed: {:?}", e))?;
+
+    log_info!("[Kuira FFI] Serialized Transaction with dust: {} bytes", bytes.len());
 
     Ok(hex::encode(&bytes))
 }

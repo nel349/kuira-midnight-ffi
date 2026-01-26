@@ -21,6 +21,34 @@ use midnight_base_crypto::time::Timestamp;
 use midnight_storage::db::InMemoryDB;
 use midnight_serialize::{Serializable, Deserializable};
 
+// Android logging macro
+#[cfg(target_os = "android")]
+macro_rules! android_log {
+    ($level:expr, $tag:expr, $($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        let c_tag = std::ffi::CString::new($tag).unwrap();
+        let c_msg = std::ffi::CString::new(msg).unwrap();
+        unsafe {
+            __android_log_write($level, c_tag.as_ptr(), c_msg.as_ptr());
+        }
+    }};
+}
+
+#[cfg(target_os = "android")]
+extern "C" {
+    fn __android_log_write(prio: std::os::raw::c_int, tag: *const std::os::raw::c_char, text: *const std::os::raw::c_char) -> std::os::raw::c_int;
+}
+
+#[cfg(target_os = "android")]
+const ANDROID_LOG_ERROR: std::os::raw::c_int = 6;
+
+#[cfg(not(target_os = "android"))]
+macro_rules! android_log {
+    ($level:expr, $tag:expr, $($arg:tt)*) => {{
+        eprintln!("[{}] {}", $tag, format!($($arg)*));
+    }};
+}
+
 /// Derives dust public key from a 32-byte seed.
 ///
 /// # Safety
@@ -455,23 +483,43 @@ pub extern "C" fn dust_replay_events(
             }
         };
 
-        // Decode hex to bytes
-        let events_bytes = match hex::decode(events_hex_str) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("Error decoding events hex: {}", e);
-                return ptr::null_mut();
-            }
-        };
+        // Split events by "midnight:event[v5]:" prefix
+        // Each event from GraphQL has this prefix + SCALE-encoded Event
+        const EVENT_PREFIX: &str = "6d69646e696768743a6576656e745b76355d3a"; // "midnight:event[v5]:"
 
-        // Deserialize events (recursion_depth=0 for top-level)
-        let events: Vec<Event<InMemoryDB>> = match <Vec<Event<InMemoryDB>> as Deserializable>::deserialize(&mut &events_bytes[..], 0) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("Error deserializing events: {}", e);
-                return ptr::null_mut();
-            }
-        };
+        let event_hex_strings: Vec<&str> = events_hex_str
+            .split(EVENT_PREFIX)
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Split into {} event hex strings", event_hex_strings.len());
+
+        // Deserialize each event individually
+        let mut events: Vec<Event<InMemoryDB>> = Vec::new();
+        for (i, event_hex) in event_hex_strings.iter().enumerate() {
+            // Decode hex to bytes
+            let event_bytes = match hex::decode(event_hex) {
+                Ok(b) => b,
+                Err(e) => {
+                    android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Error decoding event {} hex: {}", i, e);
+                    return ptr::null_mut();
+                }
+            };
+
+            // Deserialize single Event
+            let event: Event<InMemoryDB> = match <Event<InMemoryDB> as Deserializable>::deserialize(&mut &event_bytes[..], 0) {
+                Ok(e) => e,
+                Err(e) => {
+                    android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Error deserializing event {}: {} (bytes_len={})", i, e, event_bytes.len());
+                    android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Event {} first 50 bytes: {:02x?}", i, &event_bytes[..std::cmp::min(50, event_bytes.len())]);
+                    return ptr::null_mut();
+                }
+            };
+
+            events.push(event);
+        }
+
+        android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Successfully deserialized {} events", events.len());
 
         // Get current state
         let state = &*state_ptr;
@@ -480,13 +528,180 @@ pub extern "C" fn dust_replay_events(
         let new_state = match state.replay_events(&sk, events.iter()) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Error replaying events: {:?}", e);
+                android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Error replaying events: {:?}", e);
                 return ptr::null_mut();
             }
         };
 
+        android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Successfully replayed events!");
+
         // Return new state (boxed)
         Box::into_raw(Box::new(new_state))
+    }
+}
+
+/// Creates a DustSpend action for fee payment (Phase 2E).
+///
+/// # Safety
+///
+/// - `state_ptr` must be a valid DustLocalState pointer
+/// - `seed_ptr` must be a valid 32-byte array
+/// - `v_fee_str` must be a valid null-terminated UTF-8 string containing a decimal number
+/// - Caller must call `free_c_string()` on the returned pointer
+///
+/// # Parameters
+///
+/// - `state_ptr`: DustLocalState pointer (from deserialize_dust_state or create_dust_local_state)
+/// - `seed_ptr`: 32-byte seed for deriving DustSecretKey
+/// - `seed_len`: Must be 32
+/// - `utxo_index`: Index of UTXO to spend (from dust_get_utxo_at)
+/// - `v_fee_str`: Fee amount in Specks as decimal string (e.g., "1000000000000")
+/// - `current_time_ms`: Current time in milliseconds since epoch
+///
+/// # Returns
+///
+/// JSON string containing DustSpend object:
+/// ```json
+/// {
+///   "v_fee": "1000000000000",
+///   "old_nullifier": "0x...",
+///   "new_commitment": "0x...",
+///   "proof": "proof-preimage"
+/// }
+/// ```
+///
+/// Returns null on error.
+///
+/// # DustSpend Creation
+///
+/// ```text
+/// 1. Derive DustSecretKey from seed
+/// 2. Get UTXO at index from DustLocalState
+/// 3. Call state.spend(sk, utxo, v_fee, time)
+/// 4. Serialize DustSpend to JSON
+/// 5. Update state (caller should save new state)
+/// ```
+#[no_mangle]
+pub extern "C" fn create_dust_spend(
+    state_ptr: *const DustState,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    utxo_index: usize,
+    v_fee_str: *const c_char,
+    current_time_ms: i64,
+) -> *mut c_char {
+    // Validate inputs
+    if state_ptr.is_null() {
+        eprintln!("Error: state_ptr is null");
+        return ptr::null_mut();
+    }
+
+    if seed_ptr.is_null() {
+        eprintln!("Error: seed_ptr is null");
+        return ptr::null_mut();
+    }
+
+    if seed_len != 32 {
+        eprintln!("Error: seed must be 32 bytes, got {}", seed_len);
+        return ptr::null_mut();
+    }
+
+    if v_fee_str.is_null() {
+        eprintln!("Error: v_fee_str is null");
+        return ptr::null_mut();
+    }
+
+    unsafe {
+        // Convert seed to array
+        let seed_slice = std::slice::from_raw_parts(seed_ptr, seed_len);
+        let mut seed_array: Seed = [0u8; 32];
+        seed_array.copy_from_slice(seed_slice);
+
+        // Derive DustSecretKey
+        let sk = DustSecretKey::derive_secret_key(&seed_array);
+
+        // Parse v_fee from string
+        let v_fee_cstr = match std::ffi::CStr::from_ptr(v_fee_str).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error converting v_fee_str to string: {}", e);
+                return ptr::null_mut();
+            }
+        };
+
+        let v_fee: u128 = match v_fee_cstr.parse() {
+            Ok(fee) => fee,
+            Err(e) => {
+                eprintln!("Error parsing v_fee '{}': {}", v_fee_cstr, e);
+                return ptr::null_mut();
+            }
+        };
+
+        // Convert milliseconds to Timestamp (seconds)
+        let timestamp = Timestamp::from_secs((current_time_ms / 1000) as u64);
+
+        // Get state reference
+        let state = &*state_ptr;
+
+        // Get UTXO at index
+        let utxos: Vec<_> = state.utxos().collect();
+        if utxo_index >= utxos.len() {
+            eprintln!("Error: utxo_index {} out of bounds (total: {})", utxo_index, utxos.len());
+            return ptr::null_mut();
+        }
+
+        let utxo = utxos[utxo_index];
+
+        // Create DustSpend
+        let (_new_state, dust_spend) = match state.spend(&sk, &utxo, v_fee, timestamp) {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("Error creating dust spend: {:?}", e);
+                return ptr::null_mut();
+            }
+        };
+
+        // Serialize DustSpend fields to JSON
+        // Note: DustNullifier and DustCommitment are newtype wrappers around Fr
+        // We need to use Serializable trait to convert Fr to bytes
+
+        // Serialize nullifier
+        let mut nullifier_bytes = Vec::new();
+        if let Err(e) = dust_spend.old_nullifier.0.serialize(&mut nullifier_bytes) {
+            eprintln!("Error serializing nullifier: {}", e);
+            return ptr::null_mut();
+        }
+
+        // Serialize commitment
+        let mut commitment_bytes = Vec::new();
+        if let Err(e) = dust_spend.new_commitment.0.serialize(&mut commitment_bytes) {
+            eprintln!("Error serializing commitment: {}", e);
+            return ptr::null_mut();
+        }
+
+        let spend_json = serde_json::json!({
+            "v_fee": dust_spend.v_fee.to_string(),
+            "old_nullifier": hex::encode(&nullifier_bytes),
+            "new_commitment": hex::encode(&commitment_bytes),
+            "proof": "proof-preimage" // ProofPreimageMarker for unproven transactions
+        });
+
+        let json_string = match serde_json::to_string(&spend_json) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error serializing dust spend to JSON: {}", e);
+                return ptr::null_mut();
+            }
+        };
+
+        // Convert to C string
+        match CString::new(json_string) {
+            Ok(c_str) => c_str.into_raw(),
+            Err(e) => {
+                eprintln!("Error creating C string: {}", e);
+                ptr::null_mut()
+            }
+        }
     }
 }
 

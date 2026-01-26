@@ -43,6 +43,9 @@ pub mod serialize;
 // Dust key derivation FFI
 pub mod dust_ffi;
 
+// Fee calculation FFI (Phase 2E)
+pub mod fee_ffi;
+
 // Key validity tests
 #[cfg(test)]
 mod test_key_validity;

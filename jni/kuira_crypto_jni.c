@@ -100,6 +100,9 @@ extern char* dust_get_utxo_at(const void* state_ptr, size_t index);
 /* Dust event replay (Phase 2D-4) */
 extern void* dust_replay_events(const void* state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* events_hex);
 
+/* Dust spend creation (Phase 2E) */
+extern char* create_dust_spend(const void* state_ptr, const uint8_t* seed_ptr, size_t seed_len, size_t utxo_index, const char* v_fee_str, int64_t current_time_ms);
+
 /* Transaction signing (Phase 2D-FFI) */
 extern void* create_signing_key(const uint8_t* private_key_ptr, size_t private_key_len);
 extern void free_signing_key(void* ptr);
@@ -111,12 +114,16 @@ extern int32_t verify_signature(const uint8_t* public_key_ptr, const uint8_t* me
 
 /* Transaction serialization (Phase 2E) */
 extern char* serialize_unshielded_transaction_stub(uint64_t ttl);
-extern char* serialize_unshielded_transaction(const char* inputs_hex, const char* outputs_hex, const char* signatures_hex, uint64_t ttl, const char* binding_commitment_hex);
+extern char* serialize_unshielded_transaction(const char* inputs_hex, const char* outputs_hex, const char* signatures_hex, const char* dust_actions_hex, uint64_t ttl, const char* binding_commitment_hex);
+extern char* serialize_unshielded_transaction_with_dust(const char* inputs_hex, const char* outputs_hex, const char* signatures_hex, const void* dust_state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* dust_utxos_json, int64_t current_time_ms, uint64_t ttl, const char* binding_commitment_hex);
 extern void free_serialized_transaction(char* ptr);
 
 /* Signing message generation (Phase 2E) */
 extern char* get_signing_message_for_input(const char* inputs_json, const char* outputs_json, uint32_t input_index, uint64_t ttl, const char* binding_commitment_hex);
 extern void free_signing_message(char* ptr);
+
+/* Fee calculation (Phase 2E) */
+extern char* calculate_transaction_fee(const char* tx_hex, const char* params_hex, uint32_t fee_blocks_margin);
 
 /* JNI function implementations */
 
@@ -644,14 +651,15 @@ Java_com_midnight_kuira_core_ledger_signer_TransactionSigner_nativeSerializeTran
 }
 
 /**
- * Serializes a signed unshielded transaction to SCALE codec (Phase 2E - REAL).
+ * Serializes a signed unshielded transaction to SCALE codec (Phase 2E - REAL with DUST).
  *
  * JNI signature:
- * (Lcom/midnight/kuira/core/ledger/api/TransactionSerializer;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)Ljava/lang/String;
+ * (Lcom/midnight/kuira/core/ledger/api/TransactionSerializer;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;JLjava/lang/String;)Ljava/lang/String;
  *
  * @param inputs_json JSON array of UtxoSpend objects
  * @param outputs_json JSON array of UtxoOutput objects
  * @param signatures_json JSON array of signature hex strings
+ * @param dust_actions_json JSON array of DustSpend objects (empty array if no dust)
  * @param ttl Transaction time-to-live (milliseconds since epoch)
  * @param binding_commitment_hex Hex-encoded binding commitment (MUST match the one from nativeGetSigningMessageForInput!)
  * @return Hex-encoded SCALE bytes, or null on error
@@ -663,11 +671,12 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerialize
     jstring inputs_json,
     jstring outputs_json,
     jstring signatures_json,
+    jstring dust_actions_json,
     jlong ttl,
     jstring binding_commitment_hex)
 {
     /* Validate inputs */
-    if (inputs_json == NULL || outputs_json == NULL || signatures_json == NULL || binding_commitment_hex == NULL) {
+    if (inputs_json == NULL || outputs_json == NULL || signatures_json == NULL || dust_actions_json == NULL || binding_commitment_hex == NULL) {
         LOGE("nativeSerializeTransaction: null parameter");
         return NULL;
     }
@@ -699,22 +708,33 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerialize
         return NULL;
     }
 
-    const char* binding_commitment_c = (*env)->GetStringUTFChars(env, binding_commitment_hex, NULL);
-    if (binding_commitment_c == NULL) {
-        LOGE("nativeSerializeTransaction: GetStringUTFChars failed for binding_commitment");
+    const char* dust_actions_c = (*env)->GetStringUTFChars(env, dust_actions_json, NULL);
+    if (dust_actions_c == NULL) {
+        LOGE("nativeSerializeTransaction: GetStringUTFChars failed for dust_actions");
         (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
         (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
         (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
         return NULL;
     }
 
-    /* Call Rust FFI with binding_commitment */
-    char* hex_str = serialize_unshielded_transaction(inputs_c, outputs_c, signatures_c, (uint64_t)ttl, binding_commitment_c);
+    const char* binding_commitment_c = (*env)->GetStringUTFChars(env, binding_commitment_hex, NULL);
+    if (binding_commitment_c == NULL) {
+        LOGE("nativeSerializeTransaction: GetStringUTFChars failed for binding_commitment");
+        (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+        (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+        (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
+        (*env)->ReleaseStringUTFChars(env, dust_actions_json, dust_actions_c);
+        return NULL;
+    }
+
+    /* Call Rust FFI with dust actions */
+    char* hex_str = serialize_unshielded_transaction(inputs_c, outputs_c, signatures_c, dust_actions_c, (uint64_t)ttl, binding_commitment_c);
 
     /* Release Java string buffers */
     (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
     (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
     (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
+    (*env)->ReleaseStringUTFChars(env, dust_actions_json, dust_actions_c);
     (*env)->ReleaseStringUTFChars(env, binding_commitment_hex, binding_commitment_c);
 
     if (hex_str == NULL) {
@@ -733,7 +753,158 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerialize
         return NULL;
     }
 
-    LOGI("Transaction serialized (SCALE): %zu bytes hex", strlen(hex_str));
+    LOGI("Transaction serialized (SCALE) with dust: %zu bytes hex", strlen(hex_str));
+    return result;
+}
+
+/**
+ * Serializes a signed unshielded transaction with REAL dust fee payment to SCALE codec.
+ *
+ * This function creates real DustActions by calling state.spend() on the DustLocalState,
+ * following the TypeScript SDK pattern. This is the CORRECT way to add dust fees.
+ *
+ * JNI signature:
+ * (Lcom/midnight/kuira/core/ledger/api/TransactionSerializer;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;JJ[BLjava/lang/String;JJLjava/lang/String;)Ljava/lang/String;
+ *
+ * @param inputs_json JSON array of UtxoSpend objects
+ * @param outputs_json JSON array of UtxoOutput objects
+ * @param signatures_json JSON array of signature hex strings
+ * @param dust_state_ptr Pointer to DustLocalState (long from Kotlin)
+ * @param seed ByteArray (32 bytes)
+ * @param dust_utxos_json JSON array of {utxo_index, v_fee} objects
+ * @param current_time_ms Current time in milliseconds
+ * @param ttl Transaction time-to-live (milliseconds since epoch)
+ * @param binding_commitment_hex Hex-encoded binding commitment
+ * @return Hex-encoded SCALE bytes, or null on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerializeTransactionWithDust(
+    JNIEnv* env,
+    jobject thiz,
+    jstring inputs_json,
+    jstring outputs_json,
+    jstring signatures_json,
+    jlong dust_state_ptr,
+    jbyteArray seed,
+    jstring dust_utxos_json,
+    jlong current_time_ms,
+    jlong ttl,
+    jstring binding_commitment_hex)
+{
+    /* Validate inputs */
+    if (inputs_json == NULL || outputs_json == NULL || signatures_json == NULL ||
+        dust_state_ptr == 0 || seed == NULL || dust_utxos_json == NULL ||
+        binding_commitment_hex == NULL) {
+        LOGE("nativeSerializeTransactionWithDust: null parameter");
+        return NULL;
+    }
+
+    if (ttl <= 0) {
+        LOGE("nativeSerializeTransactionWithDust: invalid TTL %lld", (long long)ttl);
+        return NULL;
+    }
+
+    /* Get seed bytes */
+    jsize seed_len = (*env)->GetArrayLength(env, seed);
+    if (seed_len != 32) {
+        LOGE("nativeSerializeTransactionWithDust: seed must be 32 bytes, got %d", (int)seed_len);
+        return NULL;
+    }
+
+    jbyte* seed_bytes = (*env)->GetByteArrayElements(env, seed, NULL);
+    if (seed_bytes == NULL) {
+        LOGE("nativeSerializeTransactionWithDust: GetByteArrayElements failed for seed");
+        return NULL;
+    }
+
+    /* Convert Java strings to C strings */
+    const char* inputs_c = (*env)->GetStringUTFChars(env, inputs_json, NULL);
+    if (inputs_c == NULL) {
+        LOGE("nativeSerializeTransactionWithDust: GetStringUTFChars failed for inputs");
+        (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+        return NULL;
+    }
+
+    const char* outputs_c = (*env)->GetStringUTFChars(env, outputs_json, NULL);
+    if (outputs_c == NULL) {
+        LOGE("nativeSerializeTransactionWithDust: GetStringUTFChars failed for outputs");
+        (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+        (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+        return NULL;
+    }
+
+    const char* signatures_c = (*env)->GetStringUTFChars(env, signatures_json, NULL);
+    if (signatures_c == NULL) {
+        LOGE("nativeSerializeTransactionWithDust: GetStringUTFChars failed for signatures");
+        (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+        (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+        (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+        return NULL;
+    }
+
+    const char* dust_utxos_c = (*env)->GetStringUTFChars(env, dust_utxos_json, NULL);
+    if (dust_utxos_c == NULL) {
+        LOGE("nativeSerializeTransactionWithDust: GetStringUTFChars failed for dust_utxos");
+        (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+        (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+        (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
+        (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+        return NULL;
+    }
+
+    const char* binding_commitment_c = (*env)->GetStringUTFChars(env, binding_commitment_hex, NULL);
+    if (binding_commitment_c == NULL) {
+        LOGE("nativeSerializeTransactionWithDust: GetStringUTFChars failed for binding_commitment");
+        (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+        (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+        (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
+        (*env)->ReleaseStringUTFChars(env, dust_utxos_json, dust_utxos_c);
+        (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+        return NULL;
+    }
+
+    /* Call Rust FFI with real dust state */
+    char* hex_str = serialize_unshielded_transaction_with_dust(
+        inputs_c,
+        outputs_c,
+        signatures_c,
+        (const void*)dust_state_ptr,
+        (const uint8_t*)seed_bytes,
+        (size_t)seed_len,
+        dust_utxos_c,
+        current_time_ms,
+        (uint64_t)ttl,
+        binding_commitment_c
+    );
+
+    /* Zeroize sensitive data */
+    secure_memzero(seed_bytes, seed_len);
+
+    /* Release Java string buffers */
+    (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+    (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+    (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
+    (*env)->ReleaseStringUTFChars(env, dust_utxos_json, dust_utxos_c);
+    (*env)->ReleaseStringUTFChars(env, binding_commitment_hex, binding_commitment_c);
+    (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+
+    if (hex_str == NULL) {
+        LOGE("nativeSerializeTransactionWithDust: Rust FFI returned null");
+        return NULL;
+    }
+
+    /* Convert C string to Java string */
+    jstring result = (*env)->NewStringUTF(env, hex_str);
+
+    /* Free Rust-allocated string */
+    free_serialized_transaction(hex_str);
+
+    if (result == NULL) {
+        LOGE("nativeSerializeTransactionWithDust: NewStringUTF failed");
+        return NULL;
+    }
+
+    LOGI("Transaction serialized (SCALE) with REAL dust: %zu bytes hex", strlen(hex_str));
     return result;
 }
 
@@ -1359,6 +1530,198 @@ Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustReplayEvents(
 
     /* Return new state pointer as jlong */
     return (jlong)(uintptr_t)new_state;
+}
+
+/**
+ * Calculates transaction fee using midnight-ledger (Phase 2E)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.ledger.fee
+ *   object FeeCalculator {
+ *       external fun nativeCalculateFee(
+ *           txHex: String,
+ *           paramsHex: String,
+ *           margin: Int
+ *       ): String?
+ *   }
+ *
+ * @param env JNI environment
+ * @param obj FeeCalculator object (unused, static method)
+ * @param tx_hex SCALE-serialized transaction (hex string)
+ * @param params_hex SCALE-serialized ledger parameters (hex string)
+ * @param margin Fee blocks margin (typically 5)
+ * @return Fee in Specks as decimal string, or NULL on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_ledger_fee_FeeCalculator_nativeCalculateFee(
+    JNIEnv* env,
+    jobject obj,
+    jstring tx_hex,
+    jstring params_hex,
+    jint margin
+) {
+    /* Validate inputs */
+    if (tx_hex == NULL) {
+        LOGE("nativeCalculateFee: tx_hex is NULL");
+        return NULL;
+    }
+
+    if (params_hex == NULL) {
+        LOGE("nativeCalculateFee: params_hex is NULL");
+        return NULL;
+    }
+
+    /* Extract Java strings to C strings */
+    const char* tx_hex_c = (*env)->GetStringUTFChars(env, tx_hex, NULL);
+    if (tx_hex_c == NULL) {
+        LOGE("nativeCalculateFee: GetStringUTFChars failed for tx_hex");
+        return NULL;
+    }
+
+    const char* params_hex_c = (*env)->GetStringUTFChars(env, params_hex, NULL);
+    if (params_hex_c == NULL) {
+        LOGE("nativeCalculateFee: GetStringUTFChars failed for params_hex");
+        (*env)->ReleaseStringUTFChars(env, tx_hex, tx_hex_c);
+        return NULL;
+    }
+
+    /* Call Rust FFI */
+    char* fee_str = calculate_transaction_fee(tx_hex_c, params_hex_c, (uint32_t)margin);
+
+    /* Release Java strings */
+    (*env)->ReleaseStringUTFChars(env, tx_hex, tx_hex_c);
+    (*env)->ReleaseStringUTFChars(env, params_hex, params_hex_c);
+
+    if (fee_str == NULL) {
+        LOGE("nativeCalculateFee: Rust FFI returned NULL");
+        return NULL;
+    }
+
+    /* Convert C string to Java string */
+    jstring result = (*env)->NewStringUTF(env, fee_str);
+
+    /* Free Rust-allocated string */
+    free_c_string(fee_str);
+
+    if (result == NULL) {
+        LOGE("nativeCalculateFee: NewStringUTF failed");
+        return NULL;
+    }
+
+    LOGD("nativeCalculateFee: success");
+    return result;
+}
+
+/**
+ * Creates DustSpend action for fee payment (Phase 2E)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.ledger.fee
+ *   object DustSpendCreator {
+ *       external fun nativeCreateDustSpend(
+ *           statePtr: Long,
+ *           seed: ByteArray,
+ *           utxoIndex: Int,
+ *           vFee: String,
+ *           currentTimeMs: Long
+ *       ): String?
+ *   }
+ *
+ * @param env JNI environment
+ * @param obj DustSpendCreator object (unused, static method)
+ * @param state_ptr Pointer to DustLocalState (from deserialize_dust_state)
+ * @param seed Java byte array (32 bytes)
+ * @param utxo_index Index of UTXO to spend
+ * @param v_fee Fee amount as decimal string (Specks)
+ * @param current_time_ms Current time in milliseconds
+ * @return JSON string containing DustSpend object, or NULL on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_ledger_fee_DustSpendCreator_nativeCreateDustSpend(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr,
+    jbyteArray seed,
+    jint utxo_index,
+    jstring v_fee,
+    jlong current_time_ms
+) {
+    /* Validate inputs */
+    if (state_ptr == 0) {
+        LOGE("nativeCreateDustSpend: state_ptr is null");
+        return NULL;
+    }
+
+    if (seed == NULL) {
+        LOGE("nativeCreateDustSpend: seed is null");
+        return NULL;
+    }
+
+    if (v_fee == NULL) {
+        LOGE("nativeCreateDustSpend: v_fee is null");
+        return NULL;
+    }
+
+    /* Validate seed length */
+    jsize seed_len = (*env)->GetArrayLength(env, seed);
+    if (seed_len != 32) {
+        LOGE("nativeCreateDustSpend: invalid seed length %d (expected 32)", seed_len);
+        return NULL;
+    }
+
+    /* Extract seed bytes */
+    uint8_t seed_buf[32];
+    (*env)->GetByteArrayRegion(env, seed, 0, 32, (jbyte*)seed_buf);
+    if ((*env)->ExceptionCheck(env)) {
+        LOGE("nativeCreateDustSpend: exception during GetByteArrayRegion");
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        secure_memzero(seed_buf, 32);
+        return NULL;
+    }
+
+    /* Extract v_fee string */
+    const char* v_fee_c = (*env)->GetStringUTFChars(env, v_fee, NULL);
+    if (v_fee_c == NULL) {
+        LOGE("nativeCreateDustSpend: GetStringUTFChars failed for v_fee");
+        secure_memzero(seed_buf, 32);
+        return NULL;
+    }
+
+    /* Call Rust FFI */
+    char* spend_json = create_dust_spend(
+        (void*)(uintptr_t)state_ptr,
+        seed_buf,
+        32,
+        (size_t)utxo_index,
+        v_fee_c,
+        (int64_t)current_time_ms
+    );
+
+    /* SECURITY: Zeroize seed after use */
+    secure_memzero(seed_buf, 32);
+
+    /* Release Java string */
+    (*env)->ReleaseStringUTFChars(env, v_fee, v_fee_c);
+
+    if (spend_json == NULL) {
+        LOGE("nativeCreateDustSpend: Rust FFI returned NULL");
+        return NULL;
+    }
+
+    /* Convert C string to Java string */
+    jstring result = (*env)->NewStringUTF(env, spend_json);
+
+    /* Free Rust-allocated string */
+    free_c_string(spend_json);
+
+    if (result == NULL) {
+        LOGE("nativeCreateDustSpend: NewStringUTF failed");
+        return NULL;
+    }
+
+    LOGD("nativeCreateDustSpend: success");
+    return result;
 }
 
 JNIEXPORT jint JNICALL
