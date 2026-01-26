@@ -89,6 +89,7 @@ extern void free_c_string(char* ptr);
 extern void* create_dust_local_state(void);
 extern char* dust_wallet_balance(const void* state_ptr, int64_t time_millis);
 extern uint8_t* serialize_dust_state(const void* state_ptr);
+extern void* deserialize_dust_state(const uint8_t* data_ptr, size_t data_len);
 extern void free_dust_local_state(void* ptr);
 extern void free_byte_array(uint8_t* ptr);
 
@@ -1077,6 +1078,66 @@ Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeSerializeDustState
     free_byte_array(bytes_ptr);
 
     return jresult;
+}
+
+/**
+ * Deserializes DustLocalState from bytes (Phase 2D-4 - State Persistence)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.crypto.dust
+ *   class DustLocalState {
+ *       companion object {
+ *           private external fun nativeDeserializeDustState(data: ByteArray): Long
+ *       }
+ *   }
+ *
+ * @param env JNI environment
+ * @param clazz DustLocalState$Companion class (static companion object)
+ * @param data_array Serialized DustLocalState bytes
+ * @return Native pointer to DustLocalState, or 0 on error
+ */
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_00024Companion_nativeDeserializeDustState(
+    JNIEnv* env,
+    jclass clazz,
+    jbyteArray data_array
+) {
+    /* Validate input */
+    if (data_array == NULL) {
+        LOGE("nativeDeserializeDustState: data_array is NULL");
+        return 0;
+    }
+
+    /* Get array length */
+    jsize data_len = (*env)->GetArrayLength(env, data_array);
+    if (data_len == 0) {
+        LOGE("nativeDeserializeDustState: data_array is empty");
+        return 0;
+    }
+
+    LOGD("nativeDeserializeDustState: deserializing %d bytes", data_len);
+
+    /* Get array data (pinned - guaranteed not to move) */
+    jbyte* data_bytes = (*env)->GetByteArrayElements(env, data_array, NULL);
+    if (data_bytes == NULL) {
+        LOGE("nativeDeserializeDustState: GetByteArrayElements failed");
+        return 0;
+    }
+
+    /* Call Rust FFI to deserialize */
+    void* state_ptr = deserialize_dust_state((const uint8_t*)data_bytes, (size_t)data_len);
+
+    /* Release array (no copy back needed - JNI_ABORT) */
+    (*env)->ReleaseByteArrayElements(env, data_array, data_bytes, JNI_ABORT);
+
+    if (state_ptr == NULL) {
+        LOGE("nativeDeserializeDustState: Rust FFI returned NULL (deserialization failed)");
+        return 0;
+    }
+
+    LOGD("nativeDeserializeDustState: successfully deserialized state at %p", state_ptr);
+
+    return (jlong)(uintptr_t)state_ptr;
 }
 
 /**

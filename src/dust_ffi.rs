@@ -216,11 +216,55 @@ pub extern "C" fn serialize_dust_state(
     }
 }
 
+/// Deserializes DustLocalState from bytes.
+///
+/// # Safety
+///
+/// - `data_ptr` must point to valid serialized DustLocalState bytes
+/// - `data_len` must be the exact length of the serialized data
+/// - Caller must call `free_dust_local_state` to free the returned pointer
+///
+/// # Returns
+///
+/// Pointer to DustLocalState, or null on error (invalid data, deserialization failure)
+#[no_mangle]
+pub extern "C" fn deserialize_dust_state(
+    data_ptr: *const u8,
+    data_len: usize,
+) -> *mut DustState {
+    if data_ptr.is_null() {
+        eprintln!("Error: data_ptr is null");
+        return ptr::null_mut();
+    }
+
+    if data_len == 0 {
+        eprintln!("Error: data_len is 0");
+        return ptr::null_mut();
+    }
+
+    unsafe {
+        // Get slice of serialized data
+        let data_slice = std::slice::from_raw_parts(data_ptr, data_len);
+
+        // Deserialize using SCALE codec (recursion_depth=0 for top-level)
+        match <DustState as Deserializable>::deserialize(&mut &data_slice[..], 0) {
+            Ok(state) => {
+                // Box and return pointer
+                Box::into_raw(Box::new(state))
+            }
+            Err(e) => {
+                eprintln!("Error deserializing dust state: {}", e);
+                ptr::null_mut()
+            }
+        }
+    }
+}
+
 /// Frees a DustLocalState pointer.
 ///
 /// # Safety
 ///
-/// - `ptr` must be a pointer returned from `create_dust_local_state`
+/// - `ptr` must be a pointer returned from `create_dust_local_state` or `deserialize_dust_state`
 /// - `ptr` must not be used after calling this function
 /// - Must be called exactly once per pointer
 #[no_mangle]
@@ -566,6 +610,83 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_dust_state_round_trip() {
+        // Create state
+        let state_ptr = create_dust_local_state();
+        assert!(!state_ptr.is_null());
+
+        // Serialize
+        let bytes_ptr = serialize_dust_state(state_ptr);
+        assert!(!bytes_ptr.is_null(), "Serialization should succeed");
+
+        unsafe {
+            // Read length and data
+            let len_bytes = std::slice::from_raw_parts(bytes_ptr, 8);
+            let len = u64::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+
+            // Get data pointer (skip first 8 bytes which contain length)
+            let data_ptr = bytes_ptr.add(8);
+
+            // Deserialize
+            let deserialized_ptr = deserialize_dust_state(data_ptr, len);
+            assert!(!deserialized_ptr.is_null(), "Deserialization should succeed");
+
+            // Verify both states have same balance
+            let time_millis = 1000000000i64;
+
+            let balance1_cstr = dust_wallet_balance(state_ptr, time_millis);
+            let balance2_cstr = dust_wallet_balance(deserialized_ptr, time_millis);
+
+            assert!(!balance1_cstr.is_null());
+            assert!(!balance2_cstr.is_null());
+
+            let balance1 = std::ffi::CStr::from_ptr(balance1_cstr).to_str().unwrap();
+            let balance2 = std::ffi::CStr::from_ptr(balance2_cstr).to_str().unwrap();
+
+            assert_eq!(balance1, balance2, "Deserialized state should have same balance");
+
+            // Verify both have same UTXO count
+            let count1 = dust_utxo_count(state_ptr);
+            let count2 = dust_utxo_count(deserialized_ptr);
+            assert_eq!(count1, count2, "Deserialized state should have same UTXO count");
+
+            println!("✅ Round-trip serialization successful!");
+            println!("   Balance: {} Specks", balance1);
+            println!("   UTXO count: {}", count1);
+
+            // Free everything
+            free_c_string(balance1_cstr);
+            free_c_string(balance2_cstr);
+            free_byte_array(bytes_ptr);
+            free_dust_local_state(deserialized_ptr);
+        }
+
+        // Free original state
+        free_dust_local_state(state_ptr);
+    }
+
+    #[test]
+    fn test_deserialize_dust_state_null_ptr() {
+        let state_ptr = deserialize_dust_state(std::ptr::null(), 100);
+        assert!(state_ptr.is_null(), "Should return null for null pointer");
+    }
+
+    #[test]
+    fn test_deserialize_dust_state_zero_length() {
+        let dummy_data = [0u8; 10];
+        let state_ptr = deserialize_dust_state(dummy_data.as_ptr(), 0);
+        assert!(state_ptr.is_null(), "Should return null for zero length");
+    }
+
+    #[test]
+    fn test_deserialize_dust_state_invalid_data() {
+        // Invalid SCALE-encoded data
+        let invalid_data = [0xFF, 0xFF, 0xFF, 0xFF];
+        let state_ptr = deserialize_dust_state(invalid_data.as_ptr(), invalid_data.len());
+        assert!(state_ptr.is_null(), "Should return null for invalid data");
+    }
+
+    #[test]
     fn test_dust_utxo_count_empty() {
         // Create new state (should have zero UTXOs)
         let state_ptr = create_dust_local_state();
@@ -705,11 +826,16 @@ mod tests {
 
         // Create mock DustInitialUtxo event
         // Simulates: 1 NIGHT token (1,000,000 Stars) registered for dust generation
-        let night_value_stars: u128 = 1_000_000; // 1 NIGHT = 1,000,000 Stars
+
+        // IMPORTANT: Two different value fields with different units:
+        // 1. DustGenerationInfo.value = backing Night UTXO value in STARS
+        // 2. QualifiedDustOutput.initial_value = initial dust value in SPECKS
+
+        let night_value_stars: u128 = 1_000_000; // DustGenerationInfo.value (Stars - backing Night)
         let generation_rate_per_star: u128 = 8_267; // Specks per Star per second
         let dust_capacity_per_star: u128 = 5_000_000; // 5 Dust per Star = 5M Specks per Star
 
-        let initial_value: u128 = 0; // Dust starts at zero
+        let initial_value: u128 = 0; // QualifiedDustOutput.initial_value (Specks - dust starts at zero)
         let total_rate = night_value_stars * generation_rate_per_star; // 8,267,000,000 Specks/sec
         let _total_capacity = night_value_stars * dust_capacity_per_star; // 5 trillion Specks
 
