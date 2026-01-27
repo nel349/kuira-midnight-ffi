@@ -49,7 +49,8 @@ use midnight_storage::arena::Sp;
 use midnight_base_crypto::signatures::{Signature, VerifyingKey};
 use midnight_base_crypto::time::Timestamp;
 use midnight_base_crypto::hash::HashOutput;
-use midnight_transient_crypto::commitment::{Pedersen, PedersenRandomness};
+use midnight_transient_crypto::commitment::{Pedersen, PedersenRandomness, PureGeneratorPedersen};
+use midnight_transient_crypto::curve::EmbeddedFr;
 use midnight_serialize::{Serializable, Deserializable};
 use serde::{Deserialize as SerdeDeserialize, Serialize};
 use rand::Rng;
@@ -537,7 +538,7 @@ pub fn build_and_serialize_intent(
     log_info!("   First 64 bytes: {}", hex::encode(&offer_bytes[..offer_bytes.len().min(64)]));
 
     // Build Intent with PROVIDED binding_randomness
-    // CRITICAL: Deserialize the scalar randomness and convert to Pedersen commitment (curve point)
+    // CRITICAL: Construct EmbeddedFr from raw 32 bytes, NOT SCALE deserialization!
     let randomness_bytes = hex::decode(&binding_randomness_hex)
         .map_err(|e| format!("Invalid binding_randomness hex: {}", e))?;
 
@@ -545,10 +546,14 @@ pub fn build_and_serialize_intent(
     log_info!("  Hex: {}", binding_randomness_hex);
     log_info!("  Bytes length: {}", randomness_bytes.len());
 
-    // Deserialize as PedersenRandomness (scalar)
-    // We'll use this for both the Intent binding_commitment AND StandardTransaction binding_randomness
-    let binding_randomness: PedersenRandomness = <PedersenRandomness as Deserializable>::deserialize(&mut &randomness_bytes[..], 32)
-        .map_err(|e| format!("Invalid PedersenRandomness: {:?}", e))?;
+    // CRITICAL: Use from_le_bytes() to construct from raw field element bytes.
+    // SCALE deserialization expects a compact length prefix, but we have raw bytes from .0.to_bytes()
+    let binding_randomness: PedersenRandomness = EmbeddedFr::from_le_bytes(&randomness_bytes)
+        .ok_or_else(|| "Failed to parse binding_randomness as EmbeddedFr".to_string())?;
+
+    // CRITICAL: Convert randomness (scalar r) to commitment (curve point g^r) for Intent
+    // Intent::binding_commitment type is Pedersen (commitment), not PedersenRandomness (randomness)!
+    let binding_commitment: Pedersen = Pedersen::from(binding_randomness);
 
     log_info!("  TTL: {} ms ({} secs)", ttl_ms, ttl_ms / 1000);
 
@@ -561,30 +566,29 @@ pub fn build_and_serialize_intent(
         None
     };
 
-    // Build Intent structure with PedersenRandomness (NOT Pedersen!)
-    // We'll seal it later to convert to PureGeneratorPedersen
+    // Build Intent structure with Pedersen commitment (NOT PedersenRandomness!)
     log_info!("[Kuira FFI] 📋 Building Intent structure:");
     log_info!("  guaranteed_unshielded_offer: Some(UnshieldedOffer)");
     log_info!("  fallible_unshielded_offer: None");
     log_info!("  actions: empty");
     log_info!("  dust_actions: {:?}", if dust_actions_opt.is_some() { "Some(DustActions)" } else { "None" });
     log_info!("  ttl: {} (Timestamp)", ttl_ms / 1000);
-    log_info!("  binding_commitment: PedersenRandomness (will be sealed to PureGeneratorPedersen)");
+    log_info!("  binding_commitment: Pedersen (curve point g^r, from randomness r)");
 
     // CRITICAL: Use ProofPreimageMarker (not ()) to match TypeScript SDK wire format
     // This affects the tagged type in the serialization:
     // - () = proof-erased (wrong)
     // - ProofPreimageMarker = proof-preimage (correct for unproven transactions)
     //
-    // CRITICAL: Use PedersenRandomness for binding type (will be sealed to PureGeneratorPedersen)
-    // This matches TypeScript SDK flow: PreBinding -> seal() -> Binding
-    let intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
+    // CRITICAL: Use Pedersen for binding type (commitment g^r), not PedersenRandomness (scalar r)
+    // StandardTransaction stores both: intents (with Pedersen) AND binding_randomness (PedersenRandomness)
+    let intent = Intent::<Signature, ProofPreimageMarker, Pedersen, DefaultDB> {
         guaranteed_unshielded_offer: Some(Sp::new(unshielded_offer)),
         fallible_unshielded_offer: None,
         actions: std::iter::empty().collect(),
         dust_actions: dust_actions_opt,
         ttl: Timestamp::from_secs(ttl_ms / 1000),
-        binding_commitment: binding_randomness,  // PedersenRandomness
+        binding_commitment,  // Pedersen (curve point)
     };
 
     log_info!("  ✅ Intent created successfully");
@@ -625,28 +629,30 @@ pub fn build_and_serialize_intent(
     });
 
     log_info!("  ✅ Transaction::Standard created with network_id='undeployed'");
-    log_info!("  Type: Transaction<Signature, ProofPreimageMarker, PedersenRandomness, D>");
+    log_info!("  Type: Transaction<Signature, ProofPreimageMarker, Pedersen, D>");
+    log_info!("  Intent binding_commitment type: Pedersen (curve point g^r)");
+    log_info!("  StandardTx binding_randomness type: PedersenRandomness (scalar r)");
+    log_info!("  Expected tag: midnight:transaction[v6](signature[v1],proof-preimage,pedersen[v1])");
 
-    // CRITICAL: Seal the transaction to convert from PedersenRandomness to PureGeneratorPedersen
-    // This matches TypeScript SDK's .bind() call
-    log_info!("\n[Kuira FFI] 🔐 Sealing transaction (PedersenRandomness -> PureGeneratorPedersen):");
-    use rand::rngs::OsRng;
-    let sealed_transaction = transaction.seal(OsRng);
-    log_info!("  ✅ Transaction sealed!");
-    log_info!("  Type: Transaction<Signature, ProofPreimageMarker, PureGeneratorPedersen, D>");
-    log_info!("  Tag should now be: midnight:transaction[v6](signature[v1],proof-preimage,embedded-fr[v1])");
+    // DEBUG: Serialize binding_randomness alone to see what bytes it produces
+    let mut br_bytes = Vec::new();
+    Serializable::serialize(&binding_randomness, &mut br_bytes)
+        .map_err(|e| format!("Failed to serialize binding_randomness: {:?}", e))?;
+    log_info!("\n[Kuira FFI] 🔍 DEBUG: binding_randomness serialization:");
+    log_info!("  Serialized bytes: {} bytes", br_bytes.len());
+    log_info!("  Hex: {}", hex::encode(&br_bytes));
 
     // DEBUG: First serialize WITHOUT tag to see raw SCALE
-    log_info!("\n[Kuira FFI] 🔍 DEBUG: Serializing Sealed Transaction:");
+    log_info!("\n[Kuira FFI] 🔍 DEBUG: Serializing Transaction:");
     let mut raw_bytes = Vec::new();
-    Serializable::serialize(&sealed_transaction, &mut raw_bytes)
+    Serializable::serialize(&transaction, &mut raw_bytes)
         .map_err(|e| format!("Raw SCALE serialization failed: {:?}", e))?;
     log_info!("  - Raw SCALE (no tag): {} bytes", raw_bytes.len());
-    log_info!("  - Raw hex: {}", hex::encode(&raw_bytes));
+    log_info!("  - First 100 hex chars: {}", hex::encode(&raw_bytes[..raw_bytes.len().min(50)]));
 
     // Now serialize WITH tag
     let mut bytes = Vec::new();
-    tagged_serialize(&sealed_transaction, &mut bytes)
+    tagged_serialize(&transaction, &mut bytes)
         .map_err(|e| format!("Tagged SCALE serialization failed: {:?}", e))?;
 
     log_info!("[Kuira FFI] Serialized Transaction (with tag):");
@@ -822,11 +828,12 @@ pub fn build_and_serialize_intent_with_dust(
         signatures: signatures.into_iter().collect(),
     };
 
-    // Deserialize binding_randomness
+    // Deserialize binding_randomness from raw 32-byte field element
     let randomness_bytes = hex::decode(&binding_randomness_hex)
         .map_err(|e| format!("Invalid binding_randomness hex: {}", e))?;
-    let binding_randomness: PedersenRandomness = <PedersenRandomness as Deserializable>::deserialize(&mut &randomness_bytes[..], 32)
-        .map_err(|e| format!("Invalid PedersenRandomness: {:?}", e))?;
+    // Use from_le_bytes() instead of SCALE deserialization (same as build_and_serialize_intent)
+    let binding_randomness: PedersenRandomness = EmbeddedFr::from_le_bytes(&randomness_bytes)
+        .ok_or_else(|| "Failed to parse binding_randomness as EmbeddedFr".to_string())?;
 
     // Create DustActions from real DustSpend objects (if provided)
     let dust_actions_opt = if let Some((dust_spends, ctime)) = dust_spends_opt {
@@ -1164,15 +1171,20 @@ fn build_intent_and_get_signature_data(
 
     // Serialize the PedersenRandomness (scalar) to return it
     // NOTE: We return the RANDOMNESS, not the Pedersen commitment (curve point)!
-    // The commitment will be computed when creating the Intent: Pedersen::from(randomness)
-    let mut randomness_bytes = Vec::new();
-    Serializable::serialize(&binding_randomness, &mut randomness_bytes)
-        .map_err(|e| format!("Failed to serialize binding_randomness: {:?}", e))?;
+    // CRITICAL: Get RAW 32 bytes from EmbeddedFr, NOT SCALE-encoded!
+    // Using SCALE serialization adds a length prefix, making it 33 bytes instead of 32.
+    // We need the raw field element bytes.
+    // EmbeddedFr is a newtype wrapper, so access inner embedded::Scalar with .0
+    let randomness_bytes = binding_randomness.0.to_bytes();  // Returns Vec<u8> with exactly 32 bytes
+
+    log_info!("[Kuira FFI] 🔐 Returning binding_randomness:");
+    log_info!("  Raw bytes (should be 32): {}", randomness_bytes.len());
+    log_info!("  Hex: {}", hex::encode(&randomness_bytes));
 
     // Return JSON with both signing_message and binding_randomness
     let result = serde_json::json!({
         "signing_message": hex::encode(&signature_data),
-        "binding_randomness": hex::encode(&randomness_bytes)  // Changed from binding_commitment
+        "binding_randomness": hex::encode(&randomness_bytes)  // Exactly 32 bytes
     });
 
     Ok(result.to_string())

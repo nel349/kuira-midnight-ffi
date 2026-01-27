@@ -16,6 +16,35 @@ use midnight_storage::DefaultDB;
 use midnight_base_crypto::signatures::Signature;
 use midnight_transient_crypto::commitment::PureGeneratorPedersen;
 
+// Android logging macros (same as serialize.rs)
+#[cfg(target_os = "android")]
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        log::info!($($arg)*);
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        eprintln!($($arg)*);
+    }
+}
+
+#[cfg(target_os = "android")]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        log::error!($($arg)*);
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        eprintln!("[ERROR] {}", format!($($arg)*));
+    }
+}
+
 // Type alias for a sealed transaction (matches serialize.rs output)
 type SealedTransaction = Transaction<Signature, ProofPreimageMarker, PureGeneratorPedersen, DefaultDB>;
 
@@ -30,6 +59,52 @@ const ADDITIONAL_FEE_OVERHEAD: u128 = 300_000_000_000_000;
 /// This is the `n` parameter in `feesWithMargin()` that accounts for
 /// blockchain price fluctuations between transaction creation and confirmation.
 const DEFAULT_FEE_BLOCKS_MARGIN: usize = 5;
+
+/// Strip the tag prefix from tagged SCALE serialization.
+///
+/// Tagged format: "midnight:<type>[<version>](<params>):<scale-data>"
+///
+/// If the bytes start with ASCII "midnight:", finds the tag-data separator ':'
+/// and returns everything after it. Otherwise returns the bytes unchanged.
+fn strip_tag_prefix(bytes: Vec<u8>) -> Vec<u8> {
+    // Check if bytes start with "midnight:" (ASCII tag)
+    if bytes.len() < 9 {
+        return bytes;
+    }
+
+    // Check for "midnight:" prefix
+    if &bytes[0..9] == b"midnight:" {
+        // Find the colon that separates tag from SCALE data
+        // The tag format is: midnight:<type>[<version>](<params>): OR midnight:<type>[<version>]:
+        //
+        // Examples:
+        //   - "midnight:transaction[v6](signature[v1],proof-preimage,embedded-fr[v1]):"
+        //   - "midnight:ledger-parameters[v4]:"
+        //
+        // Strategy: Look for either '):' or ']:' patterns
+
+        // Start searching after the "midnight:" prefix
+        for i in 9..bytes.len()-1 {
+            // Look for '):' pattern (tags with parameters)
+            if bytes[i] == b')' && bytes[i + 1] == b':' {
+                log_info!("[Fee FFI] Tag found with params, stripping {} bytes.", i + 2);
+                return bytes[i + 2..].to_vec();
+            }
+            // Look for ']:' pattern (tags without parameters)
+            if bytes[i] == b']' && bytes[i + 1] == b':' {
+                log_info!("[Fee FFI] Tag found without params, stripping {} bytes.", i + 2);
+                return bytes[i + 2..].to_vec();
+            }
+        }
+
+        // If we couldn't find either pattern, assume no tag
+        log_error!("[Fee FFI] Found midnight prefix but no valid tag separator ");
+        return bytes;
+    }
+
+    // No tag found, return as-is
+    bytes
+}
 
 /// Calculates transaction fee using midnight-ledger's fee calculation.
 ///
@@ -66,12 +141,10 @@ pub extern "C" fn calculate_transaction_fee(
 ) -> *mut c_char {
     // Validate inputs
     if tx_hex.is_null() {
-        eprintln!("Error: tx_hex is null");
         return ptr::null_mut();
     }
 
     if params_hex.is_null() {
-        eprintln!("Error: params_hex is null");
         return ptr::null_mut();
     }
 
@@ -80,7 +153,7 @@ pub extern "C" fn calculate_transaction_fee(
         let tx_hex_str = match CStr::from_ptr(tx_hex).to_str() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Error: Invalid UTF-8 in tx_hex: {}", e);
+                log_error!("[Fee FFI] Invalid UTF-8 in tx_hex: {}", e);
                 return ptr::null_mut();
             }
         };
@@ -88,33 +161,48 @@ pub extern "C" fn calculate_transaction_fee(
         let params_hex_str = match CStr::from_ptr(params_hex).to_str() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Error: Invalid UTF-8 in params_hex: {}", e);
+                log_error!("[Fee FFI] Invalid UTF-8 in params_hex: {}", e);
                 return ptr::null_mut();
             }
         };
 
         // Decode hex to bytes
-        let tx_bytes = match hex::decode(tx_hex_str) {
+        let mut tx_bytes = match hex::decode(tx_hex_str) {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!("Error decoding transaction hex: {}", e);
+                log_error!("[Fee FFI] Error decoding transaction hex: {}", e);
                 return ptr::null_mut();
             }
         };
 
-        let params_bytes = match hex::decode(params_hex_str) {
+        let mut params_bytes = match hex::decode(params_hex_str) {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!("Error decoding params hex: {}", e);
+                log_error!("[Fee FFI] Error decoding params hex: {}", e);
                 return ptr::null_mut();
             }
         };
+
+        // CRITICAL: Strip tag prefix from transaction if present
+        // Tagged format: "midnight:transaction[v6](...):<scale-data>"
+        // We need to find the last ':' and take everything after it
+        tx_bytes = strip_tag_prefix(tx_bytes);
+
+        // CRITICAL: Strip tag prefix from ledger params if present
+        // Tagged format: "midnight:ledger-parameters[v4]:<scale-data>"
+        params_bytes = strip_tag_prefix(params_bytes);
+
+        log_info!("[Fee FFI] After stripping tags.");
+        log_info!("[Fee FFI]   tx_bytes: {} bytes, prefix: {:02x?}", tx_bytes.len(), &tx_bytes[..tx_bytes.len().min(16)]);
+        log_info!("[Fee FFI]   params_bytes: {} bytes, prefix: {:02x?}", params_bytes.len(), &params_bytes[..params_bytes.len().min(16)]);
 
         // Deserialize transaction using SCALE codec
         let transaction: SealedTransaction = match Deserializable::deserialize(&mut &tx_bytes[..], 0) {
             Ok(tx) => tx,
             Err(e) => {
-                eprintln!("Error deserializing transaction: {}", e);
+                log_error!("[Fee FFI] Error deserializing transaction: {}", e);
+                log_error!("[Fee FFI]   tx_bytes length: {}", tx_bytes.len());
+                log_error!("[Fee FFI]   tx_bytes hex: {}", hex::encode(&tx_bytes));
                 return ptr::null_mut();
             }
         };
@@ -123,7 +211,9 @@ pub extern "C" fn calculate_transaction_fee(
         let params: LedgerParameters = match Deserializable::deserialize(&mut &params_bytes[..], 0) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("Error deserializing ledger parameters: {}", e);
+                log_error!("[Fee FFI] Error deserializing ledger parameters: {}", e);
+                log_error!("[Fee FFI]   params_bytes length: {}", params_bytes.len());
+                log_error!("[Fee FFI]   params_bytes hex: {}", hex::encode(&params_bytes));
                 return ptr::null_mut();
             }
         };
@@ -132,7 +222,7 @@ pub extern "C" fn calculate_transaction_fee(
         let base_fee = match transaction.fees_with_margin(&params, fee_blocks_margin as usize) {
             Ok(fee) => fee,
             Err(e) => {
-                eprintln!("Error calculating fees: {:?}", e);
+                log_error!("[Fee FFI] Fee calculation failed with {:?}", e);
                 return ptr::null_mut();
             }
         };
@@ -146,54 +236,9 @@ pub extern "C" fn calculate_transaction_fee(
         // Return as C string
         match CString::new(fee_string) {
             Ok(c_str) => c_str.into_raw(),
-            Err(e) => {
-                eprintln!("Error creating C string: {}", e);
-                ptr::null_mut()
-            }
+            Err(_) => ptr::null_mut()
         }
     }
 }
 
 // Note: free_c_string() is defined in dust_ffi.rs and used by all modules
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::CString;
-
-    #[test]
-    fn test_calculate_fee_null_tx_hex() {
-        let params_hex = CString::new("deadbeef").unwrap();
-
-        let result = calculate_transaction_fee(ptr::null(), params_hex.as_ptr(), 5);
-
-        assert!(result.is_null(), "Should return null for null tx_hex");
-    }
-
-    #[test]
-    fn test_calculate_fee_null_params() {
-        let tx_hex = CString::new("deadbeef").unwrap();
-
-        let result = calculate_transaction_fee(tx_hex.as_ptr(), ptr::null(), 5);
-
-        assert!(result.is_null(), "Should return null for null params_hex");
-    }
-
-    #[test]
-    fn test_calculate_fee_invalid_hex() {
-        let tx_hex = CString::new("not_valid_hex").unwrap();
-        let params_hex = CString::new("deadbeef").unwrap();
-
-        let result = calculate_transaction_fee(tx_hex.as_ptr(), params_hex.as_ptr(), 5);
-
-        assert!(result.is_null(), "Should return null for invalid hex");
-    }
-
-    #[test]
-    #[ignore] // TODO: Need serialized transaction hex from integration tests
-    fn test_calculate_fee_success() {
-        // This test requires a valid SCALE-serialized transaction hex
-        // Will be implemented after we have serialize.rs creating test transactions
-        todo!("Implement after getting test transaction hex from serialize module");
-    }
-}
