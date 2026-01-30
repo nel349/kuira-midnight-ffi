@@ -122,6 +122,12 @@ extern void free_serialized_transaction(char* ptr);
 extern char* get_signing_message_for_input(const char* inputs_json, const char* outputs_json, uint32_t input_index, uint64_t ttl, const char* binding_commitment_hex);
 extern void free_signing_message(char* ptr);
 
+/* Transaction sealing (Phase 2) */
+extern char* seal_proven_transaction(const char* proven_tx_hex);
+
+/* Transaction hash extraction (Phase 2) */
+extern char* get_transaction_hash(const char* sealed_tx_hex);
+
 /* Fee calculation (Phase 2E) */
 extern char* calculate_transaction_fee(const char* tx_hex, const char* params_hex, uint32_t fee_blocks_margin);
 
@@ -992,6 +998,138 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeGetSignin
 
     if (result == NULL) {
         LOGE("nativeGetSigningMessageForInput: NewStringUTF failed");
+        return NULL;
+    }
+
+    return result;
+}
+
+/**
+ * Seals a proven transaction by transforming the binding commitment (Phase 2)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.ledger.api
+ *   class FfiTransactionSerializer {
+ *       private external fun nativeSealProvenTransaction(provenTxHex: String): String?
+ *   }
+ *
+ * @param env JNI environment
+ * @param thiz FfiTransactionSerializer object
+ * @param proven_tx_hex Hex-encoded proven transaction from proof server
+ * @return Hex-encoded finalized (sealed) transaction, or NULL on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSealProvenTransaction(
+    JNIEnv* env,
+    jobject thiz,
+    jstring proven_tx_hex)
+{
+    /* Validate input */
+    if (proven_tx_hex == NULL) {
+        LOGE("nativeSealProvenTransaction: proven_tx_hex is NULL");
+        return NULL;
+    }
+
+    /* Convert Java string to C string */
+    const char* proven_hex_c = (*env)->GetStringUTFChars(env, proven_tx_hex, NULL);
+    if (proven_hex_c == NULL) {
+        LOGE("nativeSealProvenTransaction: GetStringUTFChars failed");
+        return NULL;
+    }
+
+    LOGI("Sealing proven transaction: %zu hex chars", strlen(proven_hex_c));
+
+    /* Call Rust FFI to seal transaction */
+    char* sealed_hex = seal_proven_transaction(proven_hex_c);
+
+    /* Release Java string */
+    (*env)->ReleaseStringUTFChars(env, proven_tx_hex, proven_hex_c);
+
+    if (sealed_hex == NULL) {
+        LOGE("nativeSealProvenTransaction: Rust FFI returned NULL");
+        return NULL;
+    }
+
+    /* Log before freeing */
+    size_t sealed_len = strlen(sealed_hex);
+    LOGI("Transaction sealed successfully: %zu hex chars", sealed_len);
+
+    /* Convert C string to Java string */
+    jstring result = (*env)->NewStringUTF(env, sealed_hex);
+
+    /* Free Rust-allocated string */
+    free_serialized_transaction(sealed_hex);
+
+    if (result == NULL) {
+        LOGE("nativeSealProvenTransaction: NewStringUTF failed");
+        return NULL;
+    }
+
+    return result;
+}
+
+/**
+ * Gets the Midnight transaction hash from a sealed transaction (Phase 2)
+ *
+ * This returns the hash that will appear in the indexer, NOT the extrinsic hash
+ * that the node RPC returns. These are different hashes:
+ * - Extrinsic hash: Hash of the Substrate extrinsic wrapper (from node RPC)
+ * - Midnight tx hash: Hash of the actual Midnight transaction (what indexer uses)
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.ledger.api
+ *   class FfiTransactionSerializer {
+ *       private external fun nativeGetTransactionHash(sealedTxHex: String): String?
+ *   }
+ *
+ * @param env JNI environment
+ * @param thiz FfiTransactionSerializer object
+ * @param sealed_tx_hex Hex-encoded sealed transaction
+ * @return Hex-encoded Midnight transaction hash (64 hex chars), or NULL on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeGetTransactionHash(
+    JNIEnv* env,
+    jobject thiz,
+    jstring sealed_tx_hex)
+{
+    /* Validate input */
+    if (sealed_tx_hex == NULL) {
+        LOGE("nativeGetTransactionHash: sealed_tx_hex is NULL");
+        return NULL;
+    }
+
+    /* Convert Java string to C string */
+    const char* sealed_hex_c = (*env)->GetStringUTFChars(env, sealed_tx_hex, NULL);
+    if (sealed_hex_c == NULL) {
+        LOGE("nativeGetTransactionHash: GetStringUTFChars failed");
+        return NULL;
+    }
+
+    LOGI("Getting Midnight transaction hash from sealed tx: %zu hex chars", strlen(sealed_hex_c));
+
+    /* Call Rust FFI to get transaction hash */
+    char* hash_hex = get_transaction_hash(sealed_hex_c);
+
+    /* Release Java string */
+    (*env)->ReleaseStringUTFChars(env, sealed_tx_hex, sealed_hex_c);
+
+    if (hash_hex == NULL) {
+        LOGE("nativeGetTransactionHash: Rust FFI returned NULL");
+        return NULL;
+    }
+
+    /* Log the hash */
+    LOGI("Midnight transaction hash: %s", hash_hex);
+
+    /* Convert C string to Java string */
+    jstring result = (*env)->NewStringUTF(env, hash_hex);
+
+    /* Free Rust-allocated string */
+    free_c_string(hash_hex);
+
+    if (result == NULL) {
+        LOGE("nativeGetTransactionHash: NewStringUTF failed");
         return NULL;
     }
 

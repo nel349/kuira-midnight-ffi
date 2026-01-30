@@ -40,17 +40,19 @@ macro_rules! log_error {
     }
 }
 
-use midnight_ledger::structure::{Intent, UnshieldedOffer, UtxoSpend, UtxoOutput, IntentHash, ProofPreimageMarker};
+use midnight_ledger::structure::{Intent, UnshieldedOffer, UtxoSpend, UtxoOutput, IntentHash, ProofPreimageMarker, Transaction, ProofMarker};
 use midnight_ledger::dust::{DustActions, DustLocalState, DustSecretKey, Seed};
 use midnight_coin_structure::coin::{UnshieldedTokenType, UserAddress};
 use midnight_storage::DefaultDB;
-use midnight_serialize::tagged_serialize;  // CRITICAL: Use tagged serialization
+use midnight_serialize::{tagged_serialize, tagged_deserialize};  // CRITICAL: Use tagged serialization
 use midnight_storage::arena::Sp;
 use midnight_base_crypto::signatures::{Signature, VerifyingKey};
 use midnight_base_crypto::time::Timestamp;
+use rand::{SeedableRng, rngs::StdRng};
 use midnight_base_crypto::hash::HashOutput;
 use midnight_transient_crypto::commitment::{Pedersen, PedersenRandomness, PureGeneratorPedersen};
 use midnight_transient_crypto::curve::EmbeddedFr;
+use midnight_transient_crypto::proofs::ProvingKeyMaterial;
 use midnight_serialize::{Serializable, Deserializable};
 use serde::{Deserialize as SerdeDeserialize, Serialize};
 use rand::Rng;
@@ -181,40 +183,48 @@ pub extern "C" fn serialize_unshielded_transaction_with_dust(
     let mut current_state = dust_state.clone();
     let mut dust_spends = Vec::new();
 
-    for selection in dust_selections {
-        if selection.utxo_index >= utxos.len() {
-            log_error!("[Kuira FFI] utxo_index {} out of bounds (total: {})", selection.utxo_index, utxos.len());
-            return std::ptr::null_mut();
+    // Calculate total fee to pay (sum of all v_fee values from Kotlin)
+    let total_fee: u128 = dust_selections.iter()
+        .map(|s| s.v_fee.parse::<u128>().unwrap_or(0))
+        .sum();
+
+    if total_fee == 0 {
+        log_error!("[Kuira FFI] Total fee is 0 - nothing to pay");
+        return std::ptr::null_mut();
+    }
+
+    // Smart UTXO selection: try each UTXO until we find one with enough balance.
+    // Kotlin doesn't know which UTXOs have balance, so we find the right one here.
+    // Stop once fee is covered - don't create extra DustSpends with v_fee=0.
+    let mut fee_remaining = total_fee;
+
+    for (idx, utxo) in utxos.iter().enumerate() {
+        if fee_remaining == 0 {
+            break;  // Fee is covered, stop creating DustSpends
         }
 
-        let v_fee: u128 = match selection.v_fee.parse() {
-            Ok(fee) => fee,
-            Err(e) => {
-                log_error!("[Kuira FFI] Invalid v_fee '{}': {}", selection.v_fee, e);
-                return std::ptr::null_mut();
-            }
-        };
-
-        let utxo = utxos[selection.utxo_index];
-
-        // Call state.spend() - returns (new_state, dust_spend)
-        match current_state.spend(&dust_secret_key, &utxo, v_fee, timestamp) {
+        // Try to pay the remaining fee from this UTXO
+        match current_state.spend(&dust_secret_key, utxo, fee_remaining, timestamp) {
             Ok((new_state, dust_spend)) => {
                 current_state = new_state;
                 dust_spends.push(dust_spend);
-                log_info!("[Kuira FFI] Created DustSpend for UTXO {}: v_fee={}", selection.utxo_index, v_fee);
+                log_info!("[Kuira FFI] Created DustSpend from UTXO {}: v_fee={}", idx, fee_remaining);
+                fee_remaining = 0;  // Full fee paid from this UTXO
             }
             Err(e) => {
-                log_error!("[Kuira FFI] Failed to create dust spend for UTXO {}: {:?}", selection.utxo_index, e);
-                return std::ptr::null_mut();
+                // This UTXO doesn't have enough balance - try the next one
+                log_info!("[Kuira FFI] Skipping UTXO {} (insufficient balance: {:?})", idx, e);
+                continue;
             }
         }
     }
 
-    log_info!("[Kuira FFI] Created {} DustSpend objects", dust_spends.len());
+    if fee_remaining > 0 {
+        log_error!("[Kuira FFI] No UTXO has enough balance to pay fee. Need: {}", total_fee);
+        return std::ptr::null_mut();
+    }
 
-    // Build and serialize Intent with real DustActions
-    log_info!("[Kuira FFI] About to call build_and_serialize_intent_with_dust...");
+    log_info!("[Kuira FFI] Created {} DustSpend(s) for total fee {}", dust_spends.len(), total_fee);
     match build_and_serialize_intent_with_dust(
         inputs_str,
         outputs_str,
@@ -386,10 +396,6 @@ pub fn build_and_serialize_intent(
         let owner_bytes = hex::decode(&json_input.owner)
             .map_err(|e| format!("Invalid owner hex: {}", e))?;
 
-        // DEBUG: Log the owner bytes we received from Kotlin
-        log_info!("[Kuira FFI] 🔍 Owner bytes from Kotlin: {} bytes", owner_bytes.len());
-        log_info!("   owner_bytes hex: {}", hex::encode(&owner_bytes));
-
         // WORKAROUND: Deserializable::deserialize has a platform-specific bug on Android
         // when using &mut &bytes[..]. Use std::io::Cursor instead.
         if owner_bytes.len() != 32 {
@@ -398,11 +404,6 @@ pub fn build_and_serialize_intent(
         let mut cursor = std::io::Cursor::new(owner_bytes.clone());
         let verifying_key = <VerifyingKey as Deserializable>::deserialize(&mut cursor, 32)
             .map_err(|e| format!("Invalid verifying key: {:?}", e))?;
-
-        // DEBUG: Log what we got after deserialization
-        let mut vk_bytes = Vec::new();
-        <VerifyingKey as Serializable>::serialize(&verifying_key, &mut vk_bytes).map_err(|e| format!("Failed to serialize verifying_key: {:?}", e))?;
-        log_info!("   After deserialize, VerifyingKey serializes to: {}", hex::encode(&vk_bytes));
 
         let token_type_bytes = hex::decode(&json_input.token_type)
             .map_err(|e| format!("Invalid token type hex: {}", e))?;
@@ -468,60 +469,10 @@ pub fn build_and_serialize_intent(
     inputs.sort();
     outputs.sort();
 
-    // DIAGNOSTIC: Serialize JUST the inputs Vec to see structure
-    let mut inputs_bytes = Vec::new();
-    inputs.serialize(&mut inputs_bytes)
-        .map_err(|e| format!("Inputs serialization failed: {:?}", e))?;
-    log_info!("[Kuira FFI] 🔍 inputs Vec alone serializes to {} bytes", inputs_bytes.len());
-    log_info!("   First 48 bytes: {}", hex::encode(&inputs_bytes[..inputs_bytes.len().min(48)]));
-
-    // Store lengths and log details BEFORE consuming vectors
+    // Store lengths for logging
     let input_count = inputs.len();
     let output_count = outputs.len();
     let signature_count = signatures.len();
-
-    log_info!("[Kuira FFI] 🔍 DETAILED FIELD-BY-FIELD BREAKDOWN:");
-    log_info!("  ═══════════════════════════════════════════");
-    log_info!("  INPUTS: {}", input_count);
-    for (i, input) in inputs.iter().enumerate() {
-        log_info!("    Input[{}]:", i);
-        log_info!("      value: {}", input.value);
-
-        // Serialize VerifyingKey to check exact bytes
-        let mut vk_bytes = Vec::new();
-        Serializable::serialize(&input.owner, &mut vk_bytes).expect("VK serialize");
-        log_info!("      owner (VerifyingKey):");
-        log_info!("        hex: {}", hex::encode(&vk_bytes));
-        log_info!("        bytes: {:?}", vk_bytes);
-
-        log_info!("      type (token): {}", hex::encode(&input.type_.0.0));
-        log_info!("      intent_hash: {}", hex::encode(&input.intent_hash.0.0));
-        log_info!("      output_no: {}", input.output_no);
-    }
-    log_info!("  ═══════════════════════════════════════════");
-    log_info!("  OUTPUTS: {}", output_count);
-    for (i, output) in outputs.iter().enumerate() {
-        log_info!("    Output[{}]:", i);
-        log_info!("      value: {}", output.value);
-
-        // Serialize UserAddress to check exact bytes
-        let mut addr_bytes = Vec::new();
-        Serializable::serialize(&output.owner, &mut addr_bytes).expect("Addr serialize");
-        log_info!("      owner (UserAddress):");
-        log_info!("        hex: {}", hex::encode(&addr_bytes));
-        log_info!("        bytes: {:?}", addr_bytes);
-
-        log_info!("      type (token): {}", hex::encode(&output.type_.0.0));
-    }
-    log_info!("  ═══════════════════════════════════════════");
-    log_info!("  SIGNATURES: {}", signature_count);
-    for (i, sig) in signatures.iter().enumerate() {
-        let mut sig_bytes = Vec::new();
-        Serializable::serialize(&sig, &mut sig_bytes).expect("Sig serialize");
-        log_info!("    Signature[{}]: {} bytes", i, sig_bytes.len());
-        log_info!("      hex: {}", hex::encode(&sig_bytes));
-    }
-    log_info!("  ═══════════════════════════════════════════");
 
     // Build UnshieldedOffer (EXACT same pattern as diagnostic program)
     let unshielded_offer = UnshieldedOffer::<Signature, DefaultDB> {
@@ -530,95 +481,52 @@ pub fn build_and_serialize_intent(
         signatures: signatures.into_iter().collect(),
     };
 
-    // DIAGNOSTIC: Serialize JUST the UnshieldedOffer to see structure
-    let mut offer_bytes = Vec::new();
-    unshielded_offer.serialize(&mut offer_bytes)
-        .map_err(|e| format!("Offer serialization failed: {:?}", e))?;
-    log_info!("[Kuira FFI] 🔍 UnshieldedOffer alone serializes to {} bytes", offer_bytes.len());
-    log_info!("   First 64 bytes: {}", hex::encode(&offer_bytes[..offer_bytes.len().min(64)]));
-
     // Build Intent with PROVIDED binding_randomness
     // CRITICAL: Construct EmbeddedFr from raw 32 bytes, NOT SCALE deserialization!
     let randomness_bytes = hex::decode(&binding_randomness_hex)
         .map_err(|e| format!("Invalid binding_randomness hex: {}", e))?;
-
-    log_info!("[Kuira FFI] 🔐 Binding Randomness:");
-    log_info!("  Hex: {}", binding_randomness_hex);
-    log_info!("  Bytes length: {}", randomness_bytes.len());
 
     // CRITICAL: Use from_le_bytes() to construct from raw field element bytes.
     // SCALE deserialization expects a compact length prefix, but we have raw bytes from .0.to_bytes()
     let binding_randomness: PedersenRandomness = EmbeddedFr::from_le_bytes(&randomness_bytes)
         .ok_or_else(|| "Failed to parse binding_randomness as EmbeddedFr".to_string())?;
 
-    // CRITICAL: Convert randomness (scalar r) to commitment (curve point g^r) for Intent
-    // Intent::binding_commitment type is Pedersen (commitment), not PedersenRandomness (randomness)!
-    let binding_commitment: Pedersen = Pedersen::from(binding_randomness);
-
-    log_info!("  TTL: {} ms ({} secs)", ttl_ms, ttl_ms / 1000);
-
     // Parse dust_actions_json (empty array "[]" means no dust)
     let dust_actions_opt = if dust_actions_json.trim() == "[]" {
-        log_info!("[Kuira FFI] 💨 Dust actions: None (no dust payment)");
         None
     } else {
-        log_info!("[Kuira FFI] 💨 Dust actions: JSON provided (calling build_and_serialize_intent_with_dust recommended)");
         None
     };
-
-    // Build Intent structure with Pedersen commitment (NOT PedersenRandomness!)
-    log_info!("[Kuira FFI] 📋 Building Intent structure:");
-    log_info!("  guaranteed_unshielded_offer: Some(UnshieldedOffer)");
-    log_info!("  fallible_unshielded_offer: None");
-    log_info!("  actions: empty");
-    log_info!("  dust_actions: {:?}", if dust_actions_opt.is_some() { "Some(DustActions)" } else { "None" });
-    log_info!("  ttl: {} (Timestamp)", ttl_ms / 1000);
-    log_info!("  binding_commitment: Pedersen (curve point g^r, from randomness r)");
 
     // CRITICAL: Use ProofPreimageMarker (not ()) to match TypeScript SDK wire format
     // This affects the tagged type in the serialization:
     // - () = proof-erased (wrong)
     // - ProofPreimageMarker = proof-preimage (correct for unproven transactions)
     //
-    // CRITICAL: Use Pedersen for binding type (commitment g^r), not PedersenRandomness (scalar r)
-    // StandardTransaction stores both: intents (with Pedersen) AND binding_randomness (PedersenRandomness)
-    let intent = Intent::<Signature, ProofPreimageMarker, Pedersen, DefaultDB> {
+    // CRITICAL: Use PedersenRandomness for unproven transactions (official Midnight type)
+    // From midnight-node/ledger/helpers/src/versions/common/transaction.rs:
+    //   UnprovenTransaction = Transaction<Signature, ProofPreimageMarker, PedersenRandomness, D>
+    //   FinalizedTransaction = Transaction<Signature, ProofMarker, PureGeneratorPedersen, D>
+    // Type parameter determines tag: PedersenRandomness → embedded-fr[v1]
+    // Proof server transforms: embedded-fr[v1] → pedersen-schnorr[v1]
+    let intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
         guaranteed_unshielded_offer: Some(Sp::new(unshielded_offer)),
         fallible_unshielded_offer: None,
         actions: std::iter::empty().collect(),
         dust_actions: dust_actions_opt,
         ttl: Timestamp::from_secs(ttl_ms / 1000),
-        binding_commitment,  // Pedersen (curve point)
+        binding_commitment: binding_randomness,  // PedersenRandomness (scalar)
     };
-
-    log_info!("  ✅ Intent created successfully");
 
     // CRITICAL FIX: Wrap Intent in Transaction::Standard
     // The Midnight node expects a tagged Transaction type, not a raw Intent!
-    use midnight_ledger::structure::Transaction;
-    use midnight_ledger::structure::StandardTransaction;
+    use midnight_ledger::structure::{Transaction, StandardTransaction};
     use midnight_storage::storage::HashMap as StorageHashMap;
 
     // CRITICAL: insert() returns a NEW HashMap (persistent data structure)
-    let intents_map = StorageHashMap::default().insert(0u16, intent);
-
-    // DEBUG: Serialize components BEFORE moving into transaction
-    log_info!("\n[Kuira FFI] 🔍 DEBUG: Serializing components:");
-
-    // DEBUG: Serialize just the Intent to compare
-    let mut intent_bytes = Vec::new();
-    if let Some(first_intent) = intents_map.get(&0u16) {
-        Serializable::serialize(&*first_intent, &mut intent_bytes)
-            .map_err(|e| format!("Intent serialization failed: {:?}", e))?;
-        log_info!("  - Intent alone: {} bytes", intent_bytes.len());
-    }
-
-    // DEBUG: Serialize the HashMap
-    let mut hashmap_bytes = Vec::new();
-    Serializable::serialize(&intents_map, &mut hashmap_bytes)
-        .map_err(|e| format!("HashMap serialization failed: {:?}", e))?;
-    log_info!("  - HashMap<u16, Intent>: {} bytes", hashmap_bytes.len());
-    log_info!("  - HashMap hex: {}", hex::encode(&hashmap_bytes));
+    // CRITICAL: Use segment 1, not 0! Segment 0 is reserved for guaranteed offers.
+    // Intents MUST use segment >= 1 (see midnight-ledger verify.rs:616-618)
+    let intents_map = StorageHashMap::default().insert(1u16, intent);
 
     let transaction = Transaction::Standard(StandardTransaction {
         network_id: "undeployed".into(),
@@ -628,86 +536,17 @@ pub fn build_and_serialize_intent(
         binding_randomness,
     });
 
-    log_info!("  ✅ Transaction::Standard created with network_id='undeployed'");
-    log_info!("  Type: Transaction<Signature, ProofPreimageMarker, Pedersen, D>");
-    log_info!("  Intent binding_commitment type: Pedersen (curve point g^r)");
-    log_info!("  StandardTx binding_randomness type: PedersenRandomness (scalar r)");
-    log_info!("  Expected tag: midnight:transaction[v6](signature[v1],proof-preimage,pedersen[v1])");
+    // CRITICAL: Proof server expects tuple format: (Transaction, HashMap<String, ProvingKeyMaterial>)
+    // For simple unshielded transactions, the HashMap is empty (no ZK circuits)
+    let proof_data = std::collections::HashMap::<String, ProvingKeyMaterial>::new();
 
-    // DEBUG: Serialize binding_randomness alone to see what bytes it produces
-    let mut br_bytes = Vec::new();
-    Serializable::serialize(&binding_randomness, &mut br_bytes)
-        .map_err(|e| format!("Failed to serialize binding_randomness: {:?}", e))?;
-    log_info!("\n[Kuira FFI] 🔍 DEBUG: binding_randomness serialization:");
-    log_info!("  Serialized bytes: {} bytes", br_bytes.len());
-    log_info!("  Hex: {}", hex::encode(&br_bytes));
-
-    // DEBUG: First serialize WITHOUT tag to see raw SCALE
-    log_info!("\n[Kuira FFI] 🔍 DEBUG: Serializing Transaction:");
-    let mut raw_bytes = Vec::new();
-    Serializable::serialize(&transaction, &mut raw_bytes)
-        .map_err(|e| format!("Raw SCALE serialization failed: {:?}", e))?;
-    log_info!("  - Raw SCALE (no tag): {} bytes", raw_bytes.len());
-    log_info!("  - First 100 hex chars: {}", hex::encode(&raw_bytes[..raw_bytes.len().min(50)]));
-
-    // Now serialize WITH tag
+    // Serialize as tuple: (transaction, proof_data)
     let mut bytes = Vec::new();
-    tagged_serialize(&transaction, &mut bytes)
-        .map_err(|e| format!("Tagged SCALE serialization failed: {:?}", e))?;
+    tagged_serialize(&(&transaction, &proof_data), &mut bytes)
+        .map_err(|e| format!("Tagged SCALE serialization of tuple failed: {:?}", e))?;
 
-    log_info!("[Kuira FFI] Serialized Transaction (with tag):");
-    log_info!("  - SCALE bytes: {} bytes (includes 'midnight:transaction[v6]:' prefix)", bytes.len());
-    log_info!("  - First 32 bytes: {}", hex::encode(&bytes[..bytes.len().min(32)]));
-
-    // Check if the tag prefix is included (should start with "6d69646e696768743a" = "midnight:")
-    let tag_prefix = &bytes[..bytes.len().min(9)];
-    if let Ok(tag_str) = std::str::from_utf8(tag_prefix) {
-        log_info!("  - Tag prefix: '{}' ✅", tag_str);
-    } else {
-        log_info!("  - Tag prefix (hex): {}", hex::encode(tag_prefix));
-    }
-
-    // CRITICAL: Extract and display FULL tag to verify binding type
-    let tag_end = bytes.iter().position(|&b| b == b':').unwrap_or(100);
-    if tag_end < bytes.len() {
-        let full_tag = &bytes[0..=tag_end];
-        if let Ok(tag_str) = std::str::from_utf8(full_tag) {
-            log_info!("\n[Kuira FFI] 🔍 FULL TRANSACTION TAG:");
-            log_info!("  {}", tag_str);
-
-            // Check binding type
-            if tag_str.contains("pedersen-schnorr[v1]") {
-                log_info!("  ✅ Binding type: pedersen-schnorr[v1] (PureGeneratorPedersen - SEALED!)");
-            } else if tag_str.contains("embedded-fr[v1]") {
-                log_info!("  ✅ Binding type: embedded-fr[v1] (PureGeneratorPedersen - SEALED!)");
-            } else if tag_str.contains("pedersen[v1]") {
-                log_info!("  ❌ Binding type: pedersen[v1] (Pedersen - NOT SEALED!)");
-            } else {
-                log_info!("  ⚠️  Binding type: UNKNOWN");
-            }
-
-            // Check proof type
-            if tag_str.contains("proof-preimage") {
-                log_info!("  ✅ Proof type: proof-preimage (ProofPreimageMarker - CORRECT!)");
-            } else if tag_str.contains("()") {
-                log_info!("  ❌ Proof type: () (ProofErased - WRONG!)");
-            }
-        }
-    }
-
-    log_info!("  - First 100 bytes: {}", hex::encode(&bytes[..bytes.len().min(100)]));
-    log_info!("  - Inputs: {}, Outputs: {}, Signatures: {}",
-              input_count, output_count, signature_count);
-    log_info!("  - TTL: {} ms ({} secs)", ttl_ms, ttl_ms / 1000);
-    log_info!("  - Pedersen commitment (hex): {}", binding_randomness_hex);
-
-    // Detailed breakdown of first 100 bytes to help debug
-    log_info!("\n[Kuira FFI] 🔍 SCALE Breakdown (first 100 bytes):");
-    let hex_str = hex::encode(&bytes[..bytes.len().min(100)]);
-    for (i, chunk) in hex_str.as_bytes().chunks(32).enumerate() {
-        let offset = i * 16;
-        log_info!("  Offset {:3}: {}", offset, std::str::from_utf8(chunk).unwrap_or("??"));
-    }
+    log_info!("[Kuira FFI] Serialized base tx: {} bytes, {} inputs, {} outputs",
+              bytes.len(), input_count, output_count);
 
     Ok(hex::encode(&bytes))
 }
@@ -835,15 +674,43 @@ pub fn build_and_serialize_intent_with_dust(
     let binding_randomness: PedersenRandomness = EmbeddedFr::from_le_bytes(&randomness_bytes)
         .ok_or_else(|| "Failed to parse binding_randomness as EmbeddedFr".to_string())?;
 
-    // Create DustActions from real DustSpend objects (if provided)
-    let dust_actions_opt = if let Some((dust_spends, ctime)) = dust_spends_opt {
-        log_info!("[Kuira FFI] 💨 Creating DustActions with {} spends", dust_spends.len());
+    use midnight_ledger::structure::Transaction;
+    use midnight_storage::storage::HashMap as StorageHashMap;
+
+    // STEP 1: Create base transaction with unshielded offer at segment 1
+    // CRITICAL: Segment 0 is RESERVED for guaranteed offers (zswap).
+    // Intents MUST use segment >= 1 (see midnight-ledger verify.rs:616-618)
+    // Lace SDK uses segment 1 for base intent (Transaction.fromParts())
+    let base_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
+        guaranteed_unshielded_offer: Some(Sp::new(unshielded_offer)),
+        fallible_unshielded_offer: None,
+        actions: std::iter::empty().collect(),
+        dust_actions: None,  // NO dust in base intent
+        ttl: Timestamp::from_secs(ttl_ms / 1000),
+        binding_commitment: binding_randomness,
+    };
+
+    let mut base_intents_map = StorageHashMap::default();
+    base_intents_map = base_intents_map.insert(1u16, base_intent);
+    log_info!("[Kuira FFI] ✅ Created base intent at segment 1 (unshielded offer)");
+
+    // Create base transaction with ONLY the unshielded offer intent
+    let mut base_transaction = Transaction::new(
+        "undeployed",
+        base_intents_map,
+        None,  // No guaranteed_coins
+        std::collections::HashMap::new(),  // No fallible_coins
+    );
+
+    // STEP 2: If dust spends provided, create SEPARATE dust transaction and merge
+    if let Some((dust_spends, ctime)) = dust_spends_opt {
+        let dust_spend_count = dust_spends.len();
 
         // Convert Vec<DustSpend> to storage::Array<DustSpend>
         use midnight_storage::storage::Array as StorageArray;
         let spends_array: StorageArray<_, DefaultDB> = dust_spends.into_iter().collect();
 
-        // Create empty registrations
+        // Create empty registrations (Lace passes empty array for fee payment)
         let registrations_array: StorageArray<midnight_ledger::dust::DustRegistration<Signature, DefaultDB>, DefaultDB> = std::iter::empty().collect();
 
         // Create DustActions with real spends
@@ -853,53 +720,62 @@ pub fn build_and_serialize_intent_with_dust(
             ctime,
         };
 
-        Some(Sp::new(dust_actions))
-    } else {
-        log_info!("[Kuira FFI] 💨 Dust actions: None (no dust payment)");
-        None
-    };
+        // Generate random segment ID for dust intent (like TypeScript SDK fromPartsRandomized)
+        use rand::Rng;
+        let dust_segment_id: u16 = rand::rngs::OsRng.gen_range(2..u16::MAX);
 
-    // Build Intent with DustActions
-    let intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
-        guaranteed_unshielded_offer: Some(Sp::new(unshielded_offer)),
-        fallible_unshielded_offer: None,
-        actions: std::iter::empty().collect(),
-        dust_actions: dust_actions_opt,
-        ttl: Timestamp::from_secs(ttl_ms / 1000),
-        binding_commitment: binding_randomness,
-    };
+        // Dust intent uses zero binding_commitment (no unshielded inputs/outputs)
+        // This matches Lace: `let dust_intent_commitment = PedersenRandomness::from(0);`
+        let dust_intent_commitment = PedersenRandomness::from(0);
 
-    log_info!("[Kuira FFI] ✅ Intent created successfully with dust actions");
+        // Create dust-only intent (matches Lace's addFeePayment at line 325)
+        let dust_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
+            guaranteed_unshielded_offer: None,  // NO unshielded offer
+            fallible_unshielded_offer: None,
+            actions: std::iter::empty().collect(),
+            dust_actions: Some(Sp::new(dust_actions)),
+            ttl: Timestamp::from_secs(ttl_ms / 1000),  // Same TTL as base intent
+            binding_commitment: dust_intent_commitment,
+        };
 
-    // Wrap Intent in Transaction::Standard (same as original)
-    use midnight_ledger::structure::Transaction;
-    use midnight_ledger::structure::StandardTransaction;
-    use midnight_storage::storage::HashMap as StorageHashMap;
+        let mut dust_intents_map = StorageHashMap::default();
+        dust_intents_map = dust_intents_map.insert(dust_segment_id, dust_intent);
 
-    let intents_map = StorageHashMap::default().insert(0u16, intent);
+        // Create dust transaction with ONLY the dust intent
+        // This matches Lace: `const feeTransaction = Transaction.fromPartsRandomized(network, undefined, undefined, intent);`
+        let dust_transaction = Transaction::new(
+            "undeployed",
+            dust_intents_map,
+            None,  // No guaranteed_coins
+            std::collections::HashMap::new(),  // No fallible_coins
+        );
 
-    let transaction = Transaction::Standard(StandardTransaction {
-        network_id: "undeployed".into(),
-        intents: intents_map,
-        guaranteed_coins: None,
-        fallible_coins: StorageHashMap::default(),
-        binding_randomness,
-    });
+        // CRITICAL: Merge the two transactions (matches Lace: `transaction.merge(feeTransaction)`)
+        // The merge() function combines intents and SUMS binding_randomness values
+        base_transaction = base_transaction.merge(&dust_transaction)
+            .map_err(|e| format!("Failed to merge dust transaction: {:?}", e))?;
 
-    log_info!("[Kuira FFI] ✅ Transaction::Standard created with dust actions");
+        log_info!("[Kuira FFI] Merged {} dust spends at segment {}", dust_spend_count, dust_segment_id);
+    }
 
-    // Seal the transaction (converts PedersenRandomness to PureGeneratorPedersen)
-    use rand::rngs::OsRng;
-    let sealed_transaction = transaction.seal(OsRng);
+    // Final transaction is either:
+    // - Just base transaction (if no dust)
+    // - Merged base + dust transaction (if dust present)
+    let transaction = base_transaction;
 
-    log_info!("[Kuira FFI] ✅ Transaction sealed");
+    let intent_count = transaction.intents().count();
 
-    // Serialize with tag
+    // CRITICAL: Proof server expects tuple format: (Transaction, HashMap<String, ProvingKeyMaterial>)
+    // For simple unshielded transactions, the HashMap is empty (no ZK circuits)
+    let proof_data = std::collections::HashMap::<String, ProvingKeyMaterial>::new();
+
+    // Serialize as tuple: (transaction, proof_data)
+    // DO NOT seal the transaction - proof server expects unproven transaction
     let mut bytes = Vec::new();
-    tagged_serialize(&sealed_transaction, &mut bytes)
-        .map_err(|e| format!("Tagged SCALE serialization failed: {:?}", e))?;
+    tagged_serialize(&(&transaction, &proof_data), &mut bytes)
+        .map_err(|e| format!("Tagged SCALE serialization of tuple failed: {:?}", e))?;
 
-    log_info!("[Kuira FFI] Serialized Transaction with dust: {} bytes", bytes.len());
+    log_info!("[Kuira FFI] Serialized tx with dust: {} bytes, {} intent(s)", bytes.len(), intent_count);
 
     Ok(hex::encode(&bytes))
 }
@@ -1043,10 +919,6 @@ fn build_intent_and_get_signature_data(
         let owner_bytes = hex::decode(&json_input.owner)
             .map_err(|e| format!("Invalid owner hex: {}", e))?;
 
-        // DEBUG: Log the owner bytes we received from Kotlin
-        log_info!("[Kuira FFI] 🔍 Owner bytes from Kotlin: {} bytes", owner_bytes.len());
-        log_info!("   owner_bytes hex: {}", hex::encode(&owner_bytes));
-
         // WORKAROUND: Deserializable::deserialize has a platform-specific bug on Android
         // when using &mut &bytes[..]. Use std::io::Cursor instead.
         if owner_bytes.len() != 32 {
@@ -1055,11 +927,6 @@ fn build_intent_and_get_signature_data(
         let mut cursor = std::io::Cursor::new(owner_bytes.clone());
         let verifying_key = <VerifyingKey as Deserializable>::deserialize(&mut cursor, 32)
             .map_err(|e| format!("Invalid verifying key: {:?}", e))?;
-
-        // DEBUG: Log what we got after deserialization
-        let mut vk_bytes = Vec::new();
-        <VerifyingKey as Serializable>::serialize(&verifying_key, &mut vk_bytes).map_err(|e| format!("Failed to serialize verifying_key: {:?}", e))?;
-        log_info!("   After deserialize, VerifyingKey serializes to: {}", hex::encode(&vk_bytes));
 
         let token_type_bytes = hex::decode(&json_input.token_type)
             .map_err(|e| format!("Invalid token type hex: {}", e))?;
@@ -1176,10 +1043,6 @@ fn build_intent_and_get_signature_data(
     // We need the raw field element bytes.
     // EmbeddedFr is a newtype wrapper, so access inner embedded::Scalar with .0
     let randomness_bytes = binding_randomness.0.to_bytes();  // Returns Vec<u8> with exactly 32 bytes
-
-    log_info!("[Kuira FFI] 🔐 Returning binding_randomness:");
-    log_info!("  Raw bytes (should be 32): {}", randomness_bytes.len());
-    log_info!("  Hex: {}", hex::encode(&randomness_bytes));
 
     // Return JSON with both signing_message and binding_randomness
     let result = serde_json::json!({
@@ -1308,4 +1171,150 @@ mod tests {
             }
         }
     }
+}
+
+/// Seals a proven transaction by transforming the binding commitment.
+///
+/// **Purpose:** After receiving a proven transaction from the proof server, we need to
+/// call `.seal()` to transform the binding from `PedersenRandomness` (embedded-fr[v1])
+/// to `PureGeneratorPedersen` (pedersen-schnorr[v1]) before submitting to the node.
+///
+/// **Input:** Hex-encoded proven transaction from proof server
+/// **Output:** Hex-encoded finalized (sealed) transaction ready for node submission
+///
+/// # Safety
+/// Requires valid C string pointer for proven_tx_hex
+#[no_mangle]
+pub extern "C" fn seal_proven_transaction(
+    proven_tx_hex: *const c_char,
+) -> *mut c_char {
+    if proven_tx_hex.is_null() {
+        log_error!("seal_proven_transaction: proven_tx_hex is null");
+        return std::ptr::null_mut();
+    }
+
+    // Convert C string to Rust string
+    let proven_hex = match unsafe { CStr::from_ptr(proven_tx_hex).to_str() } {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            log_error!("seal_proven_transaction: Invalid UTF-8 in proven_tx_hex: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    match seal_proven_transaction_impl(&proven_hex) {
+        Ok(sealed_hex) => {
+            match CString::new(sealed_hex) {
+                Ok(c_str) => c_str.into_raw(),
+                Err(e) => {
+                    log_error!("seal_proven_transaction: Failed to create C string: {}", e);
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            log_error!("seal_proven_transaction: {}", e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn seal_proven_transaction_impl(proven_hex: &str) -> Result<String, String> {
+    use midnight_transient_crypto::commitment::PedersenRandomness;
+
+    // Decode hex to bytes
+    let proven_bytes = hex::decode(proven_hex)
+        .map_err(|e| format!("Failed to decode proven transaction hex: {}", e))?;
+
+    // Deserialize the proven transaction
+    let proven_tx: Transaction<Signature, ProofMarker, PedersenRandomness, DefaultDB> =
+        tagged_deserialize(&proven_bytes[..])
+            .map_err(|e| format!("Failed to deserialize proven transaction: {:?}", e))?;
+
+    // Seal the transaction (transforms binding: PedersenRandomness → PureGeneratorPedersen)
+    // Use a deterministic RNG for reproducibility (same as midnight-node uses for testing)
+    let rng = StdRng::seed_from_u64(0x00);
+    let finalized_tx: Transaction<Signature, ProofMarker, PureGeneratorPedersen, DefaultDB> =
+        proven_tx.seal(rng);
+
+    // Serialize the finalized transaction
+    let mut finalized_bytes = Vec::new();
+    tagged_serialize(&finalized_tx, &mut finalized_bytes)
+        .map_err(|e| format!("Failed to serialize finalized transaction: {:?}", e))?;
+
+    let finalized_hex = hex::encode(&finalized_bytes);
+
+    log_info!("[Kuira FFI] Sealed tx: {} bytes", finalized_bytes.len());
+
+    Ok(finalized_hex)
+}
+
+/// Get the Midnight transaction hash from a sealed transaction.
+///
+/// This returns the hash that will appear in the indexer, NOT the extrinsic hash
+/// that the node RPC returns. These are different hashes:
+/// - Extrinsic hash: Hash of the Substrate extrinsic wrapper (from node RPC)
+/// - Midnight tx hash: Hash of the Midnight transaction (what indexer uses)
+///
+/// # Arguments
+/// * `sealed_tx_hex` - Hex-encoded sealed transaction (from seal_proven_transaction)
+///
+/// # Returns
+/// - Non-null C string containing hex-encoded transaction hash (64 hex chars)
+/// - Null pointer on error
+///
+/// # Safety
+/// Requires valid C string pointer for sealed_tx_hex
+#[no_mangle]
+pub extern "C" fn get_transaction_hash(
+    sealed_tx_hex: *const c_char,
+) -> *mut c_char {
+    if sealed_tx_hex.is_null() {
+        log_error!("get_transaction_hash: sealed_tx_hex is null");
+        return std::ptr::null_mut();
+    }
+
+    // Convert C string to Rust string
+    let sealed_hex = match unsafe { CStr::from_ptr(sealed_tx_hex).to_str() } {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            log_error!("get_transaction_hash: Invalid UTF-8 in sealed_tx_hex: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    match get_transaction_hash_impl(&sealed_hex) {
+        Ok(hash_hex) => {
+            match CString::new(hash_hex) {
+                Ok(c_str) => c_str.into_raw(),
+                Err(e) => {
+                    log_error!("get_transaction_hash: Failed to create C string: {}", e);
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            log_error!("get_transaction_hash: {}", e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn get_transaction_hash_impl(sealed_hex: &str) -> Result<String, String> {
+    // Decode hex to bytes
+    let sealed_bytes = hex::decode(sealed_hex)
+        .map_err(|e| format!("Failed to decode sealed transaction hex: {}", e))?;
+
+    // Deserialize the sealed transaction
+    let sealed_tx: Transaction<Signature, ProofMarker, PureGeneratorPedersen, DefaultDB> =
+        tagged_deserialize(&sealed_bytes[..])
+            .map_err(|e| format!("Failed to deserialize sealed transaction: {:?}", e))?;
+
+    // Calculate transaction hash
+    let tx_hash = sealed_tx.transaction_hash();
+    let hash_hex = hex::encode(tx_hash.0.0);
+
+    log_info!("[Kuira FFI] Tx hash: {}", hash_hex);
+
+    Ok(hash_hex)
 }
