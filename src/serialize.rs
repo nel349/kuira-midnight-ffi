@@ -84,7 +84,7 @@ pub extern "C" fn serialize_unshielded_transaction_with_dust(
     inputs_hex: *const c_char,
     outputs_hex: *const c_char,
     signatures_hex: *const c_char,
-    dust_state_ptr: *const DustLocalState<DefaultDB>,
+    dust_state_ptr: *mut DustLocalState<DefaultDB>,
     seed_ptr: *const u8,
     seed_len: usize,
     dust_utxos_json: *const c_char,
@@ -235,6 +235,14 @@ pub extern "C" fn serialize_unshielded_transaction_with_dust(
     ) {
         Ok(hex) => {
             log_info!("[Kuira FFI] Serialization succeeded! Hex length: {}", hex.len());
+
+            // CRITICAL: Update the original state with the new state (nullifier recorded)
+            // This ensures Kotlin saves the correct state after transaction finalization
+            unsafe {
+                *dust_state_ptr = current_state;
+            }
+            log_info!("[Kuira FFI] ✅ Updated dust state pointer with spent nullifier");
+
             match CString::new(hex) {
                 Ok(c_str) => c_str.into_raw(),
                 Err(e) => {

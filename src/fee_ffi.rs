@@ -48,11 +48,11 @@ macro_rules! log_error {
 // Type alias for a sealed transaction (matches serialize.rs output)
 type SealedTransaction = Transaction<Signature, ProofPreimageMarker, PureGeneratorPedersen, DefaultDB>;
 
-/// Additional safety overhead added to all fees (0.3 Dust = 300 trillion Specks).
+/// Additional safety overhead percentage (1% of base fee).
 ///
-/// This matches TypeScript SDK's `additionalFeeOverhead` parameter:
-/// `/midnight-wallet/packages/dust-wallet/src/Transacting.ts:274`
-const ADDITIONAL_FEE_OVERHEAD: u128 = 300_000_000_000_000;
+/// The `feesWithMargin()` already includes margin for block-based price fluctuations,
+/// but we add 1% extra as a conservative safety buffer.
+const FEE_OVERHEAD_PERCENT: u128 = 1;
 
 /// Default fee blocks margin (matches TypeScript SDK).
 ///
@@ -129,8 +129,8 @@ fn strip_tag_prefix(bytes: Vec<u8>) -> Vec<u8> {
 /// ```text
 /// 1. Deserialize transaction from hex
 /// 2. Deserialize ledger params from hex
-/// 3. fee = transaction.fees_with_margin(params, margin)
-/// 4. total_fee = fee + ADDITIONAL_FEE_OVERHEAD (0.3 Dust)
+/// 3. base_fee = transaction.fees_with_margin(params, margin)
+/// 4. total_fee = base_fee + (base_fee * 1%)  // 1% safety overhead
 /// 5. Return as string
 /// ```
 #[no_mangle]
@@ -227,8 +227,9 @@ pub extern "C" fn calculate_transaction_fee(
             }
         };
 
-        // Add safety overhead (0.3 Dust)
-        let total_fee: u128 = base_fee + ADDITIONAL_FEE_OVERHEAD;
+        // Add 1% safety overhead
+        let overhead = base_fee * FEE_OVERHEAD_PERCENT / 100;
+        let total_fee: u128 = base_fee + overhead;
 
         // Convert to decimal string
         let fee_string = total_fee.to_string();
