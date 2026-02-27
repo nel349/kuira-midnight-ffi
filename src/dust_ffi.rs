@@ -483,9 +483,9 @@ pub extern "C" fn dust_replay_events(
             }
         };
 
-        // Split events by "midnight:event[v5]:" prefix
+        // Split events by "midnight:event[v9]:" prefix
         // Each event from GraphQL has this prefix + SCALE-encoded Event
-        const EVENT_PREFIX: &str = "6d69646e696768743a6576656e745b76355d3a"; // "midnight:event[v5]:"
+        const EVENT_PREFIX: &str = "6d69646e696768743a6576656e745b76395d3a"; // "midnight:event[v9]:"
 
         let event_hex_strings: Vec<&str> = events_hex_str
             .split(EVENT_PREFIX)

@@ -1095,6 +1095,252 @@ pub extern "C" fn serialize_unshielded_transaction_stub(
     }
 }
 
+/// Build a dust registration transaction and serialize to SCALE hex.
+///
+/// Creates a complete transaction with a DustRegistration action, signed with
+/// the night key. Returns SCALE hex ready for proof server submission.
+///
+/// # Flow
+///
+/// 1. Create DustRegistration with None signature
+/// 2. Wrap in DustActions → Intent → Transaction
+/// 3. Erase signatures/proofs, call data_to_sign(segment_id) to get signing data
+/// 4. Sign with night private key
+/// 5. Rebuild DustRegistration with the signature
+/// 6. Rebuild full Intent → Transaction
+/// 7. Serialize to SCALE hex
+///
+/// # Parameters
+///
+/// - `night_private_key_ptr`: 32-byte private key for NIGHT address (signs the registration)
+/// - `night_private_key_len`: Must be 32
+/// - `dust_public_key_hex`: Hex-encoded DustPublicKey (from derive_dust_public_key)
+/// - `allow_fee_payment_str`: Max fee this registration pays, as decimal string (u128)
+/// - `ttl_millis`: Transaction TTL in milliseconds since epoch
+/// - `current_time_millis`: Current time in milliseconds since epoch
+///
+/// # Returns
+///
+/// - Non-null C string containing hex-encoded SCALE bytes (transaction tuple)
+/// - Null pointer on error
+///
+/// # Safety
+///
+/// - `night_private_key_ptr` must point to valid 32-byte memory
+/// - `dust_public_key_hex`, `allow_fee_payment_str` must be valid C strings
+/// - Caller must call `free_serialized_transaction` on result
+#[no_mangle]
+pub extern "C" fn build_dust_registration_transaction(
+    night_private_key_ptr: *const u8,
+    night_private_key_len: usize,
+    dust_public_key_hex: *const c_char,
+    allow_fee_payment_str: *const c_char,
+    ttl_millis: u64,
+    current_time_millis: i64,
+) -> *mut c_char {
+    // Validate inputs
+    if night_private_key_ptr.is_null() {
+        log_error!("[Kuira FFI] build_dust_registration_transaction: night_private_key_ptr is null");
+        return std::ptr::null_mut();
+    }
+    if night_private_key_len != 32 {
+        log_error!("[Kuira FFI] build_dust_registration_transaction: key must be 32 bytes, got {}", night_private_key_len);
+        return std::ptr::null_mut();
+    }
+    if dust_public_key_hex.is_null() || allow_fee_payment_str.is_null() {
+        log_error!("[Kuira FFI] build_dust_registration_transaction: null string parameter");
+        return std::ptr::null_mut();
+    }
+
+    // Convert inputs — copy key to mutable buffer for zeroization
+    use zeroize::Zeroize;
+    let key_slice = unsafe { std::slice::from_raw_parts(night_private_key_ptr, 32) };
+    let mut key_buf = [0u8; 32];
+    key_buf.copy_from_slice(key_slice);
+
+    let dust_pk_str = match unsafe { CStr::from_ptr(dust_public_key_hex).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            key_buf.zeroize();
+            log_error!("[Kuira FFI] Invalid UTF-8 in dust_public_key_hex: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let fee_str = match unsafe { CStr::from_ptr(allow_fee_payment_str).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            key_buf.zeroize();
+            log_error!("[Kuira FFI] Invalid UTF-8 in allow_fee_payment_str: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let result = build_dust_registration_transaction_impl(
+        &key_buf,
+        dust_pk_str,
+        fee_str,
+        ttl_millis,
+        current_time_millis,
+    );
+
+    // SECURITY: Always zeroize key buffer before returning
+    key_buf.zeroize();
+
+    match result {
+        Ok(hex) => {
+            match CString::new(hex) {
+                Ok(c_str) => c_str.into_raw(),
+                Err(e) => {
+                    log_error!("[Kuira FFI] Failed to create C string: {}", e);
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            log_error!("[Kuira FFI] build_dust_registration_transaction failed: {}", e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn build_dust_registration_transaction_impl(
+    night_private_key: &[u8; 32],
+    dust_public_key_hex: &str,
+    allow_fee_payment_str: &str,
+    ttl_millis: u64,
+    current_time_millis: i64,
+) -> Result<String, String> {
+    use midnight_ledger::dust::{DustRegistration, DustActions, DustPublicKey};
+    use midnight_storage::storage::Array as StorageArray;
+    use midnight_storage::storage::HashMap as StorageHashMap;
+
+    // 1. Create SigningKey and derive VerifyingKey
+    let signing_key = midnight_base_crypto::signatures::SigningKey::from_bytes(night_private_key)
+        .map_err(|e| format!("Invalid night private key: {}", e))?;
+    let verifying_key = signing_key.verifying_key();
+
+    // 2. Parse DustPublicKey from hex
+    let dust_pk_bytes = hex::decode(dust_public_key_hex)
+        .map_err(|e| format!("Invalid dust public key hex: {}", e))?;
+    let dust_pk = <DustPublicKey as Deserializable>::deserialize(&mut &dust_pk_bytes[..], 0)
+        .map_err(|e| format!("Failed to deserialize DustPublicKey: {:?}", e))?;
+
+    // 3. Parse allow_fee_payment
+    let allow_fee_payment: u128 = allow_fee_payment_str.parse()
+        .map_err(|e| format!("Invalid allow_fee_payment '{}': {}", allow_fee_payment_str, e))?;
+
+    // 4. Create timestamps
+    let ctime = Timestamp::from_secs((current_time_millis / 1000) as u64);
+    let ttl = Timestamp::from_secs(ttl_millis / 1000);
+
+    // 5. Generate random binding randomness
+    let binding_randomness: PedersenRandomness = rand::rngs::OsRng.gen();
+
+    // 6. Create DustRegistration WITHOUT signature (for signing data computation)
+    let unsigned_registration = DustRegistration::<Signature, DefaultDB> {
+        night_key: verifying_key.clone(),
+        dust_address: Some(Sp::new(dust_pk.clone())),
+        allow_fee_payment,
+        signature: None,
+    };
+
+    // 7. Build DustActions with the unsigned registration
+    let unsigned_registrations: StorageArray<DustRegistration<Signature, DefaultDB>, DefaultDB> =
+        vec![unsigned_registration].into_iter().collect();
+    let unsigned_spends: StorageArray<midnight_ledger::dust::DustSpend<ProofPreimageMarker, DefaultDB>, DefaultDB> =
+        std::iter::empty().collect();
+
+    let unsigned_dust_actions = DustActions {
+        spends: unsigned_spends.clone(),
+        registrations: unsigned_registrations,
+        ctime,
+    };
+
+    // 8. Build the unsigned Intent (dust registration only — no unshielded offers)
+    let segment_id: u16 = 1;
+
+    let unsigned_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
+        guaranteed_unshielded_offer: None,
+        fallible_unshielded_offer: None,
+        actions: std::iter::empty().collect(),
+        dust_actions: Some(Sp::new(unsigned_dust_actions)),
+        ttl,
+        binding_commitment: binding_randomness,
+    };
+
+    // 9. Downgrade to Pedersen, erase signatures/proofs, get signing data
+    let intent_pedersen = Intent::<Signature, ProofPreimageMarker, Pedersen, DefaultDB> {
+        guaranteed_unshielded_offer: unsigned_intent.guaranteed_unshielded_offer.clone(),
+        fallible_unshielded_offer: unsigned_intent.fallible_unshielded_offer.clone(),
+        actions: unsigned_intent.actions.clone(),
+        dust_actions: unsigned_intent.dust_actions.clone(),
+        ttl: unsigned_intent.ttl,
+        binding_commitment: Pedersen::from(binding_randomness),
+    };
+
+    let sig_erased = intent_pedersen.erase_signatures();
+    let fully_erased = sig_erased.erase_proofs();
+    let signature_data = fully_erased.data_to_sign(segment_id);
+
+    log_info!("[Kuira FFI] Dust registration signing data: {} bytes", signature_data.len());
+
+    // 10. Sign with night key
+    let mut rng = rand::rngs::OsRng;
+    let signature: Signature = signing_key.sign(&mut rng, &signature_data);
+
+    // 11. Rebuild DustRegistration WITH signature
+    let signed_registration = DustRegistration::<Signature, DefaultDB> {
+        night_key: verifying_key,
+        dust_address: Some(Sp::new(dust_pk)),
+        allow_fee_payment,
+        signature: Some(Sp::new(signature)),
+    };
+
+    // 12. Build signed DustActions
+    let signed_registrations: StorageArray<DustRegistration<Signature, DefaultDB>, DefaultDB> =
+        vec![signed_registration].into_iter().collect();
+
+    let signed_dust_actions = DustActions {
+        spends: unsigned_spends,
+        registrations: signed_registrations,
+        ctime,
+    };
+
+    // 13. Build the signed Intent
+    let signed_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
+        guaranteed_unshielded_offer: None,
+        fallible_unshielded_offer: None,
+        actions: std::iter::empty().collect(),
+        dust_actions: Some(Sp::new(signed_dust_actions)),
+        ttl,
+        binding_commitment: binding_randomness,
+    };
+
+    // 14. Build Transaction
+    let mut intents_map = StorageHashMap::default();
+    intents_map = intents_map.insert(segment_id, signed_intent);
+
+    let transaction = Transaction::new(
+        "undeployed",
+        intents_map,
+        None,
+        std::collections::HashMap::new(),
+    );
+
+    // 15. Serialize as (Transaction, HashMap<String, ProvingKeyMaterial>) tuple
+    // Proof server expects this format — empty proof data for dust registration
+    let proof_data = std::collections::HashMap::<String, ProvingKeyMaterial>::new();
+
+    let mut bytes = Vec::new();
+    tagged_serialize(&(&transaction, &proof_data), &mut bytes)
+        .map_err(|e| format!("SCALE serialization failed: {:?}", e))?;
+
+    log_info!("[Kuira FFI] Dust registration tx serialized: {} bytes", bytes.len());
+
+    Ok(hex::encode(&bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,12 +1357,14 @@ mod tests {
         let inputs = CString::new("[]").unwrap();
         let outputs = CString::new("[]").unwrap();
         let signatures = CString::new("[]").unwrap();
+        let dust_actions = CString::new("").unwrap();
         let binding = CString::new("09c2a8bc7eb805257257fe7bc69db72334d2f9c21574ec6a78398453a5c67a2d").unwrap();
 
         let hex_ptr = serialize_unshielded_transaction(
             inputs.as_ptr(),
             outputs.as_ptr(),
             signatures.as_ptr(),
+            dust_actions.as_ptr(),
             1704067200000,
             binding.as_ptr()
         );
@@ -1128,6 +1376,274 @@ mod tests {
         assert!(hex_str.chars().all(|c| c.is_ascii_hexdigit()));
 
         free_serialized_transaction(hex_ptr);
+    }
+
+    #[test]
+    fn test_build_dust_registration_transaction() {
+        use midnight_ledger::dust::{DustSecretKey, DustPublicKey, Seed};
+        use midnight_serialize::Serializable;
+
+        // 1. Create a night signing key from deterministic bytes (same pattern as midnight tests)
+        let night_private_key: [u8; 32] = [42u8; 32];
+        let signing_key = midnight_base_crypto::signatures::SigningKey::from_bytes(&night_private_key)
+            .expect("Valid signing key");
+        let verifying_key = signing_key.verifying_key();
+
+        // 2. Derive a dust public key from a deterministic seed
+        let seed: Seed = [7u8; 32];
+        let dust_sk = DustSecretKey::derive_secret_key(&seed);
+        let dust_pk = DustPublicKey::from(dust_sk);
+        let mut pk_bytes = Vec::new();
+        dust_pk.serialize(&mut pk_bytes).unwrap();
+        let dust_pk_hex = hex::encode(&pk_bytes);
+
+        // 3. Set fee and timestamps
+        let allow_fee_payment = "1000000"; // 1M specks
+        let ttl_millis = 1737658800000u64;
+        let current_time_millis = 1737658700000i64;
+
+        // 4. Call the impl function
+        let result = build_dust_registration_transaction_impl(
+            &night_private_key,
+            &dust_pk_hex,
+            allow_fee_payment,
+            ttl_millis,
+            current_time_millis,
+        );
+
+        let hex = result.expect("Dust registration transaction build should succeed");
+
+        // 5. Verify valid hex output with reasonable size
+        assert!(!hex.is_empty(), "Serialized hex should not be empty");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "Output must be valid hex");
+        assert!(hex.len() / 2 > 100, "Transaction should be at least 100 bytes");
+        eprintln!("Dust registration tx: {} bytes", hex.len() / 2);
+
+        // 6. Deserialize round-trip: verify the SCALE output is a valid (Transaction, ProofData) tuple
+        let tx_bytes = hex::decode(&hex).expect("Valid hex");
+        let (tx, _proof_data): (
+            Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>,
+            std::collections::HashMap<String, ProvingKeyMaterial>,
+        ) = tagged_deserialize(&tx_bytes[..]).expect("SCALE deserialization should succeed");
+
+        // 7. Extract the intent from segment 1 and verify structure
+        let intent = tx.intents().find(|(seg_id, _)| *seg_id == 1)
+            .expect("Transaction should have segment 1")
+            .1;
+
+        // Verify no unshielded offers (dust registration only)
+        assert!(intent.guaranteed_unshielded_offer.is_none(), "No guaranteed offer for dust-only tx");
+        assert!(intent.fallible_unshielded_offer.is_none(), "No fallible offer for dust-only tx");
+
+        // Verify dust actions exist with exactly 1 registration
+        let dust_actions = intent.dust_actions.as_ref().expect("Dust actions should be present");
+        assert_eq!(dust_actions.registrations.len(), 1, "Should have exactly 1 registration");
+        assert_eq!(dust_actions.spends.len(), 0, "Should have no dust spends");
+
+        // 8. Verify the registration fields
+        let reg = dust_actions.registrations.iter().next().unwrap();
+        assert_eq!(reg.night_key, verifying_key, "night_key should match our verifying key");
+        assert_eq!(reg.allow_fee_payment, 1_000_000u128, "allow_fee_payment should match");
+        assert!(reg.dust_address.is_some(), "dust_address should be present");
+        assert!(reg.signature.is_some(), "signature should be present");
+
+        // 9. Verify signature: same pattern as DustRegistration::well_formed() in midnight-ledger
+        //    well_formed() calls: S::signature_verify(&parent.data_to_sign(segment_id), night_key, sig)
+        //    For Signature kind, that's: key.verify(msg, signature)
+        let erased_intent = intent.erase_signatures().erase_proofs();
+        let signing_data = erased_intent.data_to_sign(1u16);
+
+        let sig = reg.signature.as_ref().unwrap();
+        assert!(
+            verifying_key.verify(&signing_data, sig),
+            "Dust registration signature must verify against data_to_sign(segment_id)"
+        );
+        eprintln!("Signature verification passed");
+    }
+
+    /// Test that mirrors midnight-ledger/ledger/tests/dust.rs `test_registration_dust_payment`.
+    ///
+    /// Uses the library's own `Intent::empty()` + `intent.sign()` + `Transaction::from_intents()`
+    /// to build the same kind of registration transaction the ledger tests build, proving our
+    /// manual construction is compatible with the library's signing/verification pipeline.
+    #[test]
+    fn test_dust_registration_via_library_sign_method() {
+        use midnight_ledger::dust::{DustSecretKey, DustPublicKey, DustRegistration, DustActions, Seed};
+        use rand::{SeedableRng, rngs::StdRng};
+
+        // Deterministic RNG (same pattern as midnight test: StdRng::seed_from_u64(0x42))
+        let mut rng = StdRng::seed_from_u64(0x42);
+
+        // Create signing key
+        let night_private_key: [u8; 32] = [42u8; 32];
+        let signing_key = midnight_base_crypto::signatures::SigningKey::from_bytes(&night_private_key)
+            .expect("Valid signing key");
+        let verifying_key = signing_key.verifying_key();
+
+        // Derive dust public key
+        let seed: Seed = [7u8; 32];
+        let dust_sk = DustSecretKey::derive_secret_key(&seed);
+        let dust_pk = DustPublicKey::from(dust_sk);
+
+        let ttl = Timestamp::from_secs(1737658800);
+        let ctime = Timestamp::from_secs(1737658700);
+
+        // 1. Build unsigned intent using the library's Intent::empty()
+        //    Use Signature kind (not ()) so we get real Schnorr signatures
+        let mut intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>::empty(
+            &mut rng, ttl,
+        );
+
+        // 2. Add dust registration (unsigned, same as midnight test pattern)
+        intent.dust_actions = Some(Sp::new(DustActions {
+            spends: vec![].into(),
+            registrations: vec![DustRegistration {
+                allow_fee_payment: 1_000_000u128,
+                dust_address: Some(Sp::new(dust_pk)),
+                night_key: verifying_key.clone(),
+                signature: None,
+            }]
+            .into(),
+            ctime,
+        }));
+
+        // 3. Sign using the library's intent.sign() method
+        //    This is the same code path midnight-ledger uses internally
+        let segment_id: u16 = 1;
+        let signed_intent = intent
+            .sign(
+                &mut rng,
+                segment_id,
+                &[],                        // no guaranteed signing keys
+                &[],                        // no fallible signing keys
+                &[signing_key.clone()],     // dust registration signing keys
+            )
+            .expect("Library sign() should succeed");
+
+        // 4. Build transaction using the library's Transaction::from_intents()
+        let intents_map = [(segment_id, signed_intent)].into_iter().collect();
+        let tx: Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>
+            = Transaction::from_intents("undeployed", intents_map);
+
+        // 5. Verify: extract intent and check dust registration
+        let (_, intent_ref) = tx.intents().find(|(seg_id, _)| *seg_id == segment_id)
+            .expect("Should have segment 1");
+
+        let dust_actions = intent_ref.dust_actions.as_ref()
+            .expect("Dust actions should be present");
+        assert_eq!(dust_actions.registrations.len(), 1);
+        assert_eq!(dust_actions.spends.len(), 0);
+
+        let reg = dust_actions.registrations.iter().next().unwrap();
+        assert_eq!(reg.night_key, verifying_key);
+        assert_eq!(reg.allow_fee_payment, 1_000_000u128);
+        assert!(reg.signature.is_some(), "Library sign() should have set signature");
+
+        // 6. Verify signature using the same pattern as DustRegistration::well_formed()
+        let erased = intent_ref.erase_signatures().erase_proofs();
+        let data = erased.data_to_sign(segment_id);
+        let sig = reg.signature.as_ref().unwrap();
+        assert!(
+            verifying_key.verify(&data, sig),
+            "Library-signed registration must verify"
+        );
+
+        // 7. Serialize to SCALE and verify round-trip (same format our FFI produces)
+        let proof_data = std::collections::HashMap::<String, ProvingKeyMaterial>::new();
+        let mut bytes = Vec::new();
+        tagged_serialize(&(&tx, &proof_data), &mut bytes)
+            .expect("SCALE serialization should succeed");
+
+        let (tx_rt, _): (
+            Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>,
+            std::collections::HashMap<String, ProvingKeyMaterial>,
+        ) = tagged_deserialize(&bytes[..]).expect("Round-trip deserialization should succeed");
+
+        let (_, intent_rt) = tx_rt.intents().find(|(seg_id, _)| *seg_id == segment_id).unwrap();
+        let reg_rt = intent_rt.dust_actions.as_ref().unwrap()
+            .registrations.iter().next().unwrap();
+        assert!(reg_rt.signature.is_some(), "Signature should survive round-trip");
+
+        eprintln!("Library-path dust registration: build + sign + serialize + round-trip all passed");
+    }
+
+    #[test]
+    fn test_build_dust_registration_transaction_invalid_dust_key() {
+        let night_private_key: [u8; 32] = [42u8; 32];
+        let result = build_dust_registration_transaction_impl(
+            &night_private_key,
+            "not_valid_hex!!!",
+            "1000000",
+            1737658800000,
+            1737658700000,
+        );
+        assert!(result.is_err(), "Should fail on invalid dust public key hex");
+    }
+
+    #[test]
+    fn test_build_dust_registration_transaction_invalid_fee() {
+        use midnight_ledger::dust::{DustSecretKey, DustPublicKey, Seed};
+        use midnight_serialize::Serializable;
+
+        let night_private_key: [u8; 32] = [42u8; 32];
+        let seed: Seed = [7u8; 32];
+        let dust_sk = DustSecretKey::derive_secret_key(&seed);
+        let dust_pk = DustPublicKey::from(dust_sk);
+        let mut pk_bytes = Vec::new();
+        dust_pk.serialize(&mut pk_bytes).unwrap();
+        let dust_pk_hex = hex::encode(&pk_bytes);
+
+        let result = build_dust_registration_transaction_impl(
+            &night_private_key,
+            &dust_pk_hex,
+            "not_a_number",
+            1737658800000,
+            1737658700000,
+        );
+        assert!(result.is_err(), "Should fail on non-numeric allow_fee_payment");
+    }
+
+    #[test]
+    fn test_build_dust_registration_transaction_ttl_preserved() {
+        use midnight_ledger::dust::{DustSecretKey, DustPublicKey, Seed};
+        use midnight_serialize::Serializable;
+
+        let night_private_key: [u8; 32] = [42u8; 32];
+        let seed: Seed = [7u8; 32];
+        let dust_sk = DustSecretKey::derive_secret_key(&seed);
+        let dust_pk = DustPublicKey::from(dust_sk);
+        let mut pk_bytes = Vec::new();
+        dust_pk.serialize(&mut pk_bytes).unwrap();
+        let dust_pk_hex = hex::encode(&pk_bytes);
+
+        let ttl_millis = 1800000000000u64; // ~2027
+        let ctime_millis = 1737658700000i64; // ~2025
+
+        let hex = build_dust_registration_transaction_impl(
+            &night_private_key,
+            &dust_pk_hex,
+            "500000",
+            ttl_millis,
+            ctime_millis,
+        ).expect("Should succeed");
+
+        // Deserialize and verify timestamps
+        let tx_bytes = hex::decode(&hex).unwrap();
+        let (tx, _): (
+            Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>,
+            std::collections::HashMap<String, ProvingKeyMaterial>,
+        ) = tagged_deserialize(&tx_bytes[..]).unwrap();
+
+        let intent = tx.intents().find(|(seg_id, _)| *seg_id == 1).unwrap().1;
+
+        // TTL should be ttl_millis / 1000 in seconds
+        let expected_ttl = Timestamp::from_secs(ttl_millis / 1000);
+        assert_eq!(intent.ttl, expected_ttl, "TTL should match input");
+
+        // ctime on dust actions should be ctime_millis / 1000 in seconds
+        let dust_actions = intent.dust_actions.as_ref().unwrap();
+        let expected_ctime = Timestamp::from_secs((ctime_millis / 1000) as u64);
+        assert_eq!(dust_actions.ctime, expected_ctime, "ctime should match input");
     }
 
     #[test]
@@ -1158,10 +1674,13 @@ mod tests {
 
         eprintln!("\n🔬 Testing FFI serialize with same data as Android test...\n");
 
+        let dust_actions_json = "";
+
         let result = build_and_serialize_intent(
             inputs_json,
             outputs_json,
             signatures_json,
+            dust_actions_json,
             ttl_ms,
             binding_commitment
         );

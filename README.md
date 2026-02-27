@@ -168,7 +168,7 @@ Transaction fee estimation.
 
 2. **Android NDK 26+** (LLVM toolchain)
 
-3. **Midnight libraries** checked out at compatible version (v6.1.0-alpha.5)
+3. **Midnight libraries** checked out at compatible version (currently v7.0.0)
 
 ### Build Commands
 
@@ -309,14 +309,14 @@ This library is part of the **Kuira Android Wallet** project, implementing crypt
 
 ### midnight-zswap (Shielded Key Derivation)
 
-**CRITICAL:** The `midnight-libraries` repo must be checked out at a commit compatible with **midnight-zswap v6.1.0-alpha.5**.
+**Current version:** midnight-zswap v7.0.0 (via local path dependency).
 
 | midnight-zswap Version | Compatibility |
 |------------------------|---------------|
-| v6.1.0-alpha.5 | ✅ Compatible with Lace wallet SDK v6.1.0-alpha.6 |
-| v7.0.0+ | ❌ Changed key derivation algorithm - generates incompatible keys |
+| v7.0.0 | ✅ Current — key derivation identical to v6, fully validated |
+| v6.1.0-alpha.5 | ✅ Previous — same key derivation algorithm as v7 |
 
-**Why this matters:** The `midnight-zswap` crate derives shielded keys (coin public key, encryption public key) from BIP-32 seeds using the JubJub curve. Version 7.0 changed the derivation algorithm, producing completely different keys from the same seed. Using the wrong version means wallets created in Kuira cannot be restored in Lace (and vice versa).
+**Version-abstract FFI:** The Rust FFI layer is the abstraction boundary. Kotlin depends on stable C function signatures and JSON/blob return formats. When a new Midnight version arrives (e.g. v8), only the Rust implementation changes — not the FFI contract. Key derivation uses the same domain separators and KDF across v6/v7.
 
 **Dependency Resolution:** This project uses local path dependencies (see `Cargo.toml`):
 ```toml

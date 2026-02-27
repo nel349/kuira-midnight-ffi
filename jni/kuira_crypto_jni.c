@@ -131,6 +131,9 @@ extern char* get_transaction_hash(const char* sealed_tx_hex);
 /* Fee calculation (Phase 2E) */
 extern char* calculate_transaction_fee(const char* tx_hex, const char* params_hex, uint32_t fee_blocks_margin);
 
+/* Dust registration transaction builder (serialize.rs) */
+extern char* build_dust_registration_transaction(const uint8_t* night_private_key_ptr, size_t night_private_key_len, const char* dust_public_key_hex, const char* allow_fee_payment_str, uint64_t ttl_millis, int64_t current_time_millis);
+
 /* JNI function implementations */
 
 /**
@@ -1859,6 +1862,130 @@ Java_com_midnight_kuira_core_ledger_fee_DustSpendCreator_nativeCreateDustSpend(
     }
 
     LOGD("nativeCreateDustSpend: success");
+    return result;
+}
+
+/*
+ * Build a complete dust registration transaction (signed, SCALE-encoded).
+ *
+ * Creates a transaction that registers a NIGHT address for dust generation.
+ * The transaction is fully signed and serialized, ready for proof server submission.
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.core.ledger.dust
+ *   object DustRegistrationBuilder {
+ *       external fun nativeBuildDustRegistrationTransaction(
+ *           nightPrivateKey: ByteArray,
+ *           dustPublicKeyHex: String,
+ *           allowFeePayment: String,
+ *           ttlMillis: Long,
+ *           currentTimeMillis: Long
+ *       ): String?
+ *   }
+ *
+ * @param env JNI environment
+ * @param obj DustRegistrationBuilder object (unused, static method)
+ * @param night_private_key Java byte array (32-byte NIGHT signing key)
+ * @param dust_public_key_hex Hex-encoded DustPublicKey
+ * @param allow_fee_payment Max fee as decimal string (u128 Specks)
+ * @param ttl_millis Transaction TTL in milliseconds since epoch
+ * @param current_time_millis Current time in milliseconds since epoch
+ * @return Hex-encoded SCALE transaction, or NULL on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDustRegistrationTransaction(
+    JNIEnv* env,
+    jobject obj,
+    jbyteArray night_private_key,
+    jstring dust_public_key_hex,
+    jstring allow_fee_payment,
+    jlong ttl_millis,
+    jlong current_time_millis
+) {
+    /* Validate inputs */
+    if (night_private_key == NULL) {
+        LOGE("nativeBuildDustRegistrationTransaction: night_private_key is null");
+        return NULL;
+    }
+
+    if (dust_public_key_hex == NULL) {
+        LOGE("nativeBuildDustRegistrationTransaction: dust_public_key_hex is null");
+        return NULL;
+    }
+
+    if (allow_fee_payment == NULL) {
+        LOGE("nativeBuildDustRegistrationTransaction: allow_fee_payment is null");
+        return NULL;
+    }
+
+    /* Validate key length */
+    jsize key_len = (*env)->GetArrayLength(env, night_private_key);
+    if (key_len != 32) {
+        LOGE("nativeBuildDustRegistrationTransaction: invalid key length %d (expected 32)", key_len);
+        return NULL;
+    }
+
+    /* Extract key bytes */
+    uint8_t key_buf[32];
+    (*env)->GetByteArrayRegion(env, night_private_key, 0, 32, (jbyte*)key_buf);
+    if ((*env)->ExceptionCheck(env)) {
+        LOGE("nativeBuildDustRegistrationTransaction: exception during GetByteArrayRegion");
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        secure_memzero(key_buf, 32);
+        return NULL;
+    }
+
+    /* Extract string parameters */
+    const char* dust_pk_c = (*env)->GetStringUTFChars(env, dust_public_key_hex, NULL);
+    if (dust_pk_c == NULL) {
+        LOGE("nativeBuildDustRegistrationTransaction: GetStringUTFChars failed for dust_public_key_hex");
+        secure_memzero(key_buf, 32);
+        return NULL;
+    }
+
+    const char* fee_c = (*env)->GetStringUTFChars(env, allow_fee_payment, NULL);
+    if (fee_c == NULL) {
+        LOGE("nativeBuildDustRegistrationTransaction: GetStringUTFChars failed for allow_fee_payment");
+        (*env)->ReleaseStringUTFChars(env, dust_public_key_hex, dust_pk_c);
+        secure_memzero(key_buf, 32);
+        return NULL;
+    }
+
+    /* Call Rust FFI */
+    char* tx_hex = build_dust_registration_transaction(
+        key_buf,
+        32,
+        dust_pk_c,
+        fee_c,
+        (uint64_t)ttl_millis,
+        (int64_t)current_time_millis
+    );
+
+    /* SECURITY: Zeroize key after use */
+    secure_memzero(key_buf, 32);
+
+    /* Release Java strings */
+    (*env)->ReleaseStringUTFChars(env, dust_public_key_hex, dust_pk_c);
+    (*env)->ReleaseStringUTFChars(env, allow_fee_payment, fee_c);
+
+    if (tx_hex == NULL) {
+        LOGE("nativeBuildDustRegistrationTransaction: Rust FFI returned NULL");
+        return NULL;
+    }
+
+    /* Convert C string to Java string */
+    jstring result = (*env)->NewStringUTF(env, tx_hex);
+
+    /* Free Rust-allocated string */
+    free_serialized_transaction(tx_hex);
+
+    if (result == NULL) {
+        LOGE("nativeBuildDustRegistrationTransaction: NewStringUTF failed");
+        return NULL;
+    }
+
+    LOGD("nativeBuildDustRegistrationTransaction: success");
     return result;
 }
 
