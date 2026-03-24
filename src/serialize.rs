@@ -373,6 +373,17 @@ struct JsonUtxoOutput {
     token_type: String,  // hex-encoded token type (32 bytes)
 }
 
+/// Simplified UTXO input for dust registration.
+/// Owner and token type are derived internally (owner = night verifying key,
+/// type = NIGHT = all-zero 32 bytes), so only value and UTXO location needed.
+#[derive(Debug, SerdeDeserialize)]
+struct JsonDustUtxo {
+    value: String,        // u128 as string
+    intent_hash: String,  // hex-encoded intent hash (32 bytes)
+    output_no: u32,
+    ctime: u64,           // UTXO creation time (Unix seconds) — for dust calculation
+}
+
 /// Build an Intent from JSON strings and serialize to SCALE hex
 pub fn build_and_serialize_intent(
     inputs_json: &str,
@@ -1097,18 +1108,20 @@ pub extern "C" fn serialize_unshielded_transaction_stub(
 
 /// Build a dust registration transaction and serialize to SCALE hex.
 ///
-/// Creates a complete transaction with a DustRegistration action, signed with
-/// the night key. Returns SCALE hex ready for proof server submission.
+/// Creates a complete transaction with a DustRegistration action AND a
+/// guaranteed UnshieldedOffer that consolidates the user's NIGHT UTXOs.
+/// The node requires this offer to validate the registration.
 ///
 /// # Flow
 ///
-/// 1. Create DustRegistration with None signature
-/// 2. Wrap in DustActions → Intent → Transaction
-/// 3. Erase signatures/proofs, call data_to_sign(segment_id) to get signing data
-/// 4. Sign with night private key
-/// 5. Rebuild DustRegistration with the signature
-/// 6. Rebuild full Intent → Transaction
-/// 7. Serialize to SCALE hex
+/// 1. Parse NIGHT UTXOs, build UnshieldedOffer (inputs → single output back to owner)
+/// 2. Create DustRegistration with None signature
+/// 3. Build Intent with guaranteed_unshielded_offer + dust_actions
+/// 4. Erase signatures/proofs, call data_to_sign(segment_id)
+/// 5. Sign once with night key
+/// 6. Clone signature for DustRegistration AND each offer input
+/// 7. Rebuild signed Intent → Transaction
+/// 8. Serialize to SCALE hex
 ///
 /// # Parameters
 ///
@@ -1118,6 +1131,7 @@ pub extern "C" fn serialize_unshielded_transaction_stub(
 /// - `allow_fee_payment_str`: Max fee this registration pays, as decimal string (u128)
 /// - `ttl_millis`: Transaction TTL in milliseconds since epoch
 /// - `current_time_millis`: Current time in milliseconds since epoch
+/// - `utxos_json`: JSON array of NIGHT UTXOs: `[{"value":"...","intent_hash":"...","output_no":N}]`
 ///
 /// # Returns
 ///
@@ -1127,7 +1141,7 @@ pub extern "C" fn serialize_unshielded_transaction_stub(
 /// # Safety
 ///
 /// - `night_private_key_ptr` must point to valid 32-byte memory
-/// - `dust_public_key_hex`, `allow_fee_payment_str` must be valid C strings
+/// - `dust_public_key_hex`, `allow_fee_payment_str`, `utxos_json` must be valid C strings
 /// - Caller must call `free_serialized_transaction` on result
 #[no_mangle]
 pub extern "C" fn build_dust_registration_transaction(
@@ -1137,6 +1151,7 @@ pub extern "C" fn build_dust_registration_transaction(
     allow_fee_payment_str: *const c_char,
     ttl_millis: u64,
     current_time_millis: i64,
+    utxos_json: *const c_char,
 ) -> *mut c_char {
     // Validate inputs
     if night_private_key_ptr.is_null() {
@@ -1147,7 +1162,7 @@ pub extern "C" fn build_dust_registration_transaction(
         log_error!("[Kuira FFI] build_dust_registration_transaction: key must be 32 bytes, got {}", night_private_key_len);
         return std::ptr::null_mut();
     }
-    if dust_public_key_hex.is_null() || allow_fee_payment_str.is_null() {
+    if dust_public_key_hex.is_null() || allow_fee_payment_str.is_null() || utxos_json.is_null() {
         log_error!("[Kuira FFI] build_dust_registration_transaction: null string parameter");
         return std::ptr::null_mut();
     }
@@ -1176,12 +1191,22 @@ pub extern "C" fn build_dust_registration_transaction(
         }
     };
 
+    let utxos_str = match unsafe { CStr::from_ptr(utxos_json).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            key_buf.zeroize();
+            log_error!("[Kuira FFI] Invalid UTF-8 in utxos_json: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
     let result = build_dust_registration_transaction_impl(
         &key_buf,
         dust_pk_str,
         fee_str,
         ttl_millis,
         current_time_millis,
+        utxos_str,
     );
 
     // SECURITY: Always zeroize key buffer before returning
@@ -1207,9 +1232,10 @@ pub extern "C" fn build_dust_registration_transaction(
 fn build_dust_registration_transaction_impl(
     night_private_key: &[u8; 32],
     dust_public_key_hex: &str,
-    allow_fee_payment_str: &str,
+    _allow_fee_payment_str: &str, // Ignored: calculated from UTXO values and creation times
     ttl_millis: u64,
     current_time_millis: i64,
+    utxos_json: &str,
 ) -> Result<String, String> {
     use midnight_ledger::dust::{DustRegistration, DustActions, DustPublicKey};
     use midnight_storage::storage::Array as StorageArray;
@@ -1226,18 +1252,94 @@ fn build_dust_registration_transaction_impl(
     let dust_pk = <DustPublicKey as Deserializable>::deserialize(&mut &dust_pk_bytes[..], 0)
         .map_err(|e| format!("Failed to deserialize DustPublicKey: {:?}", e))?;
 
-    // 3. Parse allow_fee_payment
-    let allow_fee_payment: u128 = allow_fee_payment_str.parse()
-        .map_err(|e| format!("Invalid allow_fee_payment '{}': {}", allow_fee_payment_str, e))?;
-
-    // 4. Create timestamps
-    let ctime = Timestamp::from_secs((current_time_millis / 1000) as u64);
+    // 3. Create timestamps
+    let current_time_secs = (current_time_millis / 1000) as u64;
+    let ctime = Timestamp::from_secs(current_time_secs);
     let ttl = Timestamp::from_secs(ttl_millis / 1000);
 
-    // 5. Generate random binding randomness
+    // 4. Generate random binding randomness
     let binding_randomness: PedersenRandomness = rand::rngs::OsRng.gen();
 
-    // 6. Create DustRegistration WITHOUT signature (for signing data computation)
+    // 5. Parse NIGHT UTXOs and build UnshieldedOffer
+    //    Matches SDK pattern: include all NIGHT UTXOs as guaranteed offer inputs,
+    //    with a single consolidation output back to the same owner.
+    let json_utxos: Vec<JsonDustUtxo> = serde_json::from_str(utxos_json)
+        .map_err(|e| format!("Failed to parse UTXOs JSON: {}", e))?;
+
+    if json_utxos.is_empty() {
+        return Err("At least one NIGHT UTXO is required for dust registration".to_string());
+    }
+
+    // Dust generation constants from INITIAL_DUST_PARAMETERS
+    // (midnight-ledger/ledger/src/dust.rs:1266-1270)
+    //   night_dust_ratio: 5 * (SPECKS_PER_DUST / STARS_PER_NIGHT) = 5_000_000_000
+    //   generation_decay_rate: 8_267 (Specks/Star/second, ~1 week to capacity)
+    const NIGHT_DUST_RATIO: u128 = 5_000_000_000;
+    const GENERATION_DECAY_RATE: u128 = 8_267;
+
+    let user_address = UserAddress::from(verifying_key.clone());
+    let mut total_night_value: u128 = 0;
+    let mut total_dust_value: u128 = 0;
+    let mut utxo_inputs: Vec<UtxoSpend> = Vec::new();
+
+    for json_utxo in &json_utxos {
+        let value: u128 = json_utxo.value.parse()
+            .map_err(|e| format!("Invalid UTXO value '{}': {}", json_utxo.value, e))?;
+
+        // Calculate dust generated by this UTXO since its creation.
+        // Formula from generationless_fee_availability() in dust.rs:1123-1163:
+        //   vfull = value * night_dust_ratio  (max capacity)
+        //   rate  = value * generation_decay_rate  (Specks/second)
+        //   dt    = dust_actions.ctime - utxo.ctime  (seconds elapsed)
+        //   generated = min(dt * rate, vfull)
+        let vfull = value.saturating_mul(NIGHT_DUST_RATIO);
+        let rate = value.saturating_mul(GENERATION_DECAY_RATE);
+        let dt = current_time_secs.saturating_sub(json_utxo.ctime) as u128;
+        let generated = u128::min(dt.saturating_mul(rate), vfull);
+        total_dust_value = total_dust_value.saturating_add(generated);
+        total_night_value = total_night_value.checked_add(value)
+            .ok_or_else(|| "UTXO values overflow u128".to_string())?;
+
+        let intent_hash_bytes = hex::decode(&json_utxo.intent_hash)
+            .map_err(|e| format!("Invalid intent_hash hex: {}", e))?;
+        let intent_hash = IntentHash::deserialize(&mut &intent_hash_bytes[..], 32)
+            .map_err(|e| format!("Invalid intent hash: {:?}", e))?;
+
+        utxo_inputs.push(UtxoSpend {
+            value,
+            owner: verifying_key.clone(),
+            type_: UnshieldedTokenType(HashOutput([0u8; 32])),  // NIGHT
+            intent_hash,
+            output_no: json_utxo.output_no,
+        });
+    }
+
+    // Sort inputs (required by midnight-ledger verify.rs)
+    utxo_inputs.sort();
+
+    let input_count = utxo_inputs.len();
+    // allow_fee_payment = total dust generated from all NIGHT UTXOs.
+    // Must satisfy: fees <= allow_fee_payment <= dust_in (server-calculated).
+    // We compute the same formula as generationless_fee_availability() in dust.rs.
+    let allow_fee_payment = total_dust_value;
+    log_info!("[Kuira FFI] Dust registration: {} NIGHT UTXOs, total_night={}, allow_fee_payment={}",
+        input_count, total_night_value, allow_fee_payment);
+
+    // Single output: consolidate all NIGHT back to same owner
+    let utxo_output = UtxoOutput {
+        value: total_night_value,
+        owner: user_address,
+        type_: UnshieldedTokenType(HashOutput([0u8; 32])),  // NIGHT
+    };
+
+    // Build unsigned offer (empty signatures — filled after signing)
+    let unsigned_offer = UnshieldedOffer::<Signature, DefaultDB> {
+        inputs: utxo_inputs.iter().cloned().collect(),
+        outputs: vec![utxo_output.clone()].into_iter().collect(),
+        signatures: std::iter::empty().collect(),
+    };
+
+    // 7. Create DustRegistration WITHOUT signature (for signing data computation)
     let unsigned_registration = DustRegistration::<Signature, DefaultDB> {
         night_key: verifying_key.clone(),
         dust_address: Some(Sp::new(dust_pk.clone())),
@@ -1245,7 +1347,7 @@ fn build_dust_registration_transaction_impl(
         signature: None,
     };
 
-    // 7. Build DustActions with the unsigned registration
+    // 8. Build DustActions with the unsigned registration
     let unsigned_registrations: StorageArray<DustRegistration<Signature, DefaultDB>, DefaultDB> =
         vec![unsigned_registration].into_iter().collect();
     let unsigned_spends: StorageArray<midnight_ledger::dust::DustSpend<ProofPreimageMarker, DefaultDB>, DefaultDB> =
@@ -1257,11 +1359,11 @@ fn build_dust_registration_transaction_impl(
         ctime,
     };
 
-    // 8. Build the unsigned Intent (dust registration only — no unshielded offers)
+    // 9. Build the unsigned Intent WITH guaranteed unshielded offer
     let segment_id: u16 = 1;
 
     let unsigned_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
-        guaranteed_unshielded_offer: None,
+        guaranteed_unshielded_offer: Some(Sp::new(unsigned_offer)),
         fallible_unshielded_offer: None,
         actions: std::iter::empty().collect(),
         dust_actions: Some(Sp::new(unsigned_dust_actions)),
@@ -1269,7 +1371,7 @@ fn build_dust_registration_transaction_impl(
         binding_commitment: binding_randomness,
     };
 
-    // 9. Downgrade to Pedersen, erase signatures/proofs, get signing data
+    // 10. Downgrade to Pedersen, erase signatures/proofs, get signing data
     let intent_pedersen = Intent::<Signature, ProofPreimageMarker, Pedersen, DefaultDB> {
         guaranteed_unshielded_offer: unsigned_intent.guaranteed_unshielded_offer.clone(),
         fallible_unshielded_offer: unsigned_intent.fallible_unshielded_offer.clone(),
@@ -1285,19 +1387,19 @@ fn build_dust_registration_transaction_impl(
 
     log_info!("[Kuira FFI] Dust registration signing data: {} bytes", signature_data.len());
 
-    // 10. Sign with night key
+    // 11. Sign with night key (same signature used for both offer inputs and dust registration)
     let mut rng = rand::rngs::OsRng;
     let signature: Signature = signing_key.sign(&mut rng, &signature_data);
 
-    // 11. Rebuild DustRegistration WITH signature
+    // 12. Rebuild DustRegistration WITH signature
     let signed_registration = DustRegistration::<Signature, DefaultDB> {
-        night_key: verifying_key,
+        night_key: verifying_key.clone(),
         dust_address: Some(Sp::new(dust_pk)),
         allow_fee_payment,
-        signature: Some(Sp::new(signature)),
+        signature: Some(Sp::new(signature.clone())),
     };
 
-    // 12. Build signed DustActions
+    // 13. Build signed DustActions
     let signed_registrations: StorageArray<DustRegistration<Signature, DefaultDB>, DefaultDB> =
         vec![signed_registration].into_iter().collect();
 
@@ -1307,9 +1409,18 @@ fn build_dust_registration_transaction_impl(
         ctime,
     };
 
-    // 13. Build the signed Intent
+    // 14. Build signed UnshieldedOffer: clone the signature for each input
+    //     (SDK uses same signature for all — same key signs same data_to_sign)
+    let signed_signatures: Vec<Signature> = (0..input_count).map(|_| signature.clone()).collect();
+    let signed_offer = UnshieldedOffer::<Signature, DefaultDB> {
+        inputs: utxo_inputs.into_iter().collect(),
+        outputs: vec![utxo_output].into_iter().collect(),
+        signatures: signed_signatures.into_iter().collect(),
+    };
+
+    // 15. Build the signed Intent
     let signed_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
-        guaranteed_unshielded_offer: None,
+        guaranteed_unshielded_offer: Some(Sp::new(signed_offer)),
         fallible_unshielded_offer: None,
         actions: std::iter::empty().collect(),
         dust_actions: Some(Sp::new(signed_dust_actions)),
@@ -1317,7 +1428,7 @@ fn build_dust_registration_transaction_impl(
         binding_commitment: binding_randomness,
     };
 
-    // 14. Build Transaction
+    // 16. Build Transaction
     let mut intents_map = StorageHashMap::default();
     intents_map = intents_map.insert(segment_id, signed_intent);
 
@@ -1328,7 +1439,7 @@ fn build_dust_registration_transaction_impl(
         std::collections::HashMap::new(),
     );
 
-    // 15. Serialize as (Transaction, HashMap<String, ProvingKeyMaterial>) tuple
+    // 17. Serialize as (Transaction, HashMap<String, ProvingKeyMaterial>) tuple
     // Proof server expects this format — empty proof data for dust registration
     let proof_data = std::collections::HashMap::<String, ProvingKeyMaterial>::new();
 
@@ -1398,67 +1509,107 @@ mod tests {
         let dust_pk_hex = hex::encode(&pk_bytes);
 
         // 3. Set fee and timestamps
-        let allow_fee_payment = "1000000"; // 1M specks
-        let ttl_millis = 1737658800000u64;
-        let current_time_millis = 1737658700000i64;
+        let allow_fee_payment = "0"; // Ignored — calculated from UTXO ctime internally
+        let ttl_millis = 1737658800000u64;  // ~Jan 23 2025
+        let current_time_millis = 1737658700000i64;  // ~100s before TTL
+        let current_time_secs = (current_time_millis / 1000) as u64;  // 1737658700
 
-        // 4. Call the impl function
+        // 4. Create UTXO JSON (NIGHT UTXOs to include in guaranteed offer)
+        //    ctime = 2 weeks before current time → UTXO is well past full dust capacity
+        //    (time to capacity ≈ 604,836s ≈ ~1 week, so 2 weeks guarantees vfull)
+        let utxo_ctime = current_time_secs - (2 * 604800);
+        let utxos_json = format!(
+            r#"[{{"value":"1000000","intent_hash":"ab6642ef7dd8420c4673a56c57da96adeeedfc5a98140c8a42500b8369464fed","output_no":0,"ctime":{}}}]"#,
+            utxo_ctime
+        );
+        let utxos_json = utxos_json.as_str();
+
+        // 5. Call the impl function
         let result = build_dust_registration_transaction_impl(
             &night_private_key,
             &dust_pk_hex,
             allow_fee_payment,
             ttl_millis,
             current_time_millis,
+            utxos_json,
         );
 
         let hex = result.expect("Dust registration transaction build should succeed");
 
-        // 5. Verify valid hex output with reasonable size
+        // 6. Verify valid hex output with reasonable size
         assert!(!hex.is_empty(), "Serialized hex should not be empty");
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "Output must be valid hex");
         assert!(hex.len() / 2 > 100, "Transaction should be at least 100 bytes");
         eprintln!("Dust registration tx: {} bytes", hex.len() / 2);
 
-        // 6. Deserialize round-trip: verify the SCALE output is a valid (Transaction, ProofData) tuple
+        // 7. Deserialize round-trip: verify the SCALE output is a valid (Transaction, ProofData) tuple
         let tx_bytes = hex::decode(&hex).expect("Valid hex");
         let (tx, _proof_data): (
             Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>,
             std::collections::HashMap<String, ProvingKeyMaterial>,
         ) = tagged_deserialize(&tx_bytes[..]).expect("SCALE deserialization should succeed");
 
-        // 7. Extract the intent from segment 1 and verify structure
+        // 8. Extract the intent from segment 1 and verify structure
         let intent = tx.intents().find(|(seg_id, _)| *seg_id == 1)
             .expect("Transaction should have segment 1")
             .1;
 
-        // Verify no unshielded offers (dust registration only)
-        assert!(intent.guaranteed_unshielded_offer.is_none(), "No guaranteed offer for dust-only tx");
-        assert!(intent.fallible_unshielded_offer.is_none(), "No fallible offer for dust-only tx");
+        // Verify guaranteed unshielded offer IS present (required for dust registration)
+        let offer = intent.guaranteed_unshielded_offer.as_ref()
+            .expect("Guaranteed unshielded offer must be present for dust registration");
+        assert_eq!(offer.inputs.len(), 1, "Should have 1 UTXO input");
+        assert_eq!(offer.outputs.len(), 1, "Should have 1 consolidation output");
+        assert_eq!(offer.signatures.len(), 1, "Should have 1 signature (one per input)");
+        assert!(intent.fallible_unshielded_offer.is_none(), "No fallible offer");
+
+        // Verify offer input matches our UTXO
+        let input = offer.inputs.iter().next().unwrap();
+        assert_eq!(input.value, 1_000_000u128, "Input value should match UTXO");
+        assert_eq!(input.owner, verifying_key, "Input owner should be our verifying key");
+        assert_eq!(input.type_, UnshieldedTokenType(HashOutput([0u8; 32])), "Input type should be NIGHT");
+
+        // Verify offer output consolidates back to same owner
+        let output = offer.outputs.iter().next().unwrap();
+        assert_eq!(output.value, 1_000_000u128, "Output value should equal total input");
+        assert_eq!(output.owner, UserAddress::from(verifying_key.clone()), "Output owner should be our address");
+        assert_eq!(output.type_, UnshieldedTokenType(HashOutput([0u8; 32])), "Output type should be NIGHT");
 
         // Verify dust actions exist with exactly 1 registration
         let dust_actions = intent.dust_actions.as_ref().expect("Dust actions should be present");
         assert_eq!(dust_actions.registrations.len(), 1, "Should have exactly 1 registration");
         assert_eq!(dust_actions.spends.len(), 0, "Should have no dust spends");
 
-        // 8. Verify the registration fields
+        // 9. Verify the registration fields
         let reg = dust_actions.registrations.iter().next().unwrap();
         assert_eq!(reg.night_key, verifying_key, "night_key should match our verifying key");
-        assert_eq!(reg.allow_fee_payment, 1_000_000u128, "allow_fee_payment should match");
+        // allow_fee_payment = min(dt * rate, vfull) where:
+        //   dt = 604800, rate = 1_000_000 * 8267, vfull = 1_000_000 * 5_000_000_000
+        //   dt * rate = 5_000_569_600_000_000 > vfull = 5_000_000_000_000_000
+        //   → clamped to vfull
+        assert_eq!(reg.allow_fee_payment, 5_000_000_000_000_000u128,
+            "allow_fee_payment should equal dust generated from NIGHT UTXOs (vfull for mature UTXO)");
         assert!(reg.dust_address.is_some(), "dust_address should be present");
         assert!(reg.signature.is_some(), "signature should be present");
 
-        // 9. Verify signature: same pattern as DustRegistration::well_formed() in midnight-ledger
-        //    well_formed() calls: S::signature_verify(&parent.data_to_sign(segment_id), night_key, sig)
-        //    For Signature kind, that's: key.verify(msg, signature)
+        // 10. Verify signatures: both dust registration and offer inputs should verify
         let erased_intent = intent.erase_signatures().erase_proofs();
         let signing_data = erased_intent.data_to_sign(1u16);
 
-        let sig = reg.signature.as_ref().unwrap();
+        // Dust registration signature
+        let dust_sig = reg.signature.as_ref().unwrap();
         assert!(
-            verifying_key.verify(&signing_data, sig),
+            verifying_key.verify(&signing_data, dust_sig),
             "Dust registration signature must verify against data_to_sign(segment_id)"
         );
-        eprintln!("Signature verification passed");
+
+        // Offer input signature (same data, same key)
+        let offer_sig = offer.signatures.iter().next().unwrap();
+        assert!(
+            verifying_key.verify(&signing_data, &offer_sig),
+            "Offer input signature must verify against data_to_sign(segment_id)"
+        );
+
+        eprintln!("All signature verifications passed (dust registration + offer)");
     }
 
     /// Test that mirrors midnight-ledger/ledger/tests/dust.rs `test_registration_dust_payment`.
@@ -1570,18 +1721,20 @@ mod tests {
     #[test]
     fn test_build_dust_registration_transaction_invalid_dust_key() {
         let night_private_key: [u8; 32] = [42u8; 32];
+        let utxos_json = r#"[{"value":"1000000","intent_hash":"ab6642ef7dd8420c4673a56c57da96adeeedfc5a98140c8a42500b8369464fed","output_no":0,"ctime":1737054000}]"#;
         let result = build_dust_registration_transaction_impl(
             &night_private_key,
             "not_valid_hex!!!",
             "1000000",
             1737658800000,
             1737658700000,
+            utxos_json,
         );
         assert!(result.is_err(), "Should fail on invalid dust public key hex");
     }
 
     #[test]
-    fn test_build_dust_registration_transaction_invalid_fee() {
+    fn test_build_dust_registration_transaction_empty_utxos() {
         use midnight_ledger::dust::{DustSecretKey, DustPublicKey, Seed};
         use midnight_serialize::Serializable;
 
@@ -1593,14 +1746,17 @@ mod tests {
         dust_pk.serialize(&mut pk_bytes).unwrap();
         let dust_pk_hex = hex::encode(&pk_bytes);
 
+        let utxos_json = r#"[]"#;
         let result = build_dust_registration_transaction_impl(
             &night_private_key,
             &dust_pk_hex,
-            "not_a_number",
+            "0",
             1737658800000,
             1737658700000,
+            utxos_json,
         );
-        assert!(result.is_err(), "Should fail on non-numeric allow_fee_payment");
+        assert!(result.is_err(), "Should fail with empty UTXOs");
+        assert!(result.unwrap_err().contains("At least one NIGHT UTXO"));
     }
 
     #[test]
@@ -1619,12 +1775,14 @@ mod tests {
         let ttl_millis = 1800000000000u64; // ~2027
         let ctime_millis = 1737658700000i64; // ~2025
 
+        let utxos_json = r#"[{"value":"1000000","intent_hash":"ab6642ef7dd8420c4673a56c57da96adeeedfc5a98140c8a42500b8369464fed","output_no":0,"ctime":1737054000}]"#;
         let hex = build_dust_registration_transaction_impl(
             &night_private_key,
             &dust_pk_hex,
-            "500000",
+            "0",
             ttl_millis,
             ctime_millis,
+            utxos_json,
         ).expect("Should succeed");
 
         // Deserialize and verify timestamps

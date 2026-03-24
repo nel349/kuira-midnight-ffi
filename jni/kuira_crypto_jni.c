@@ -132,7 +132,7 @@ extern char* get_transaction_hash(const char* sealed_tx_hex);
 extern char* calculate_transaction_fee(const char* tx_hex, const char* params_hex, uint32_t fee_blocks_margin);
 
 /* Dust registration transaction builder (serialize.rs) */
-extern char* build_dust_registration_transaction(const uint8_t* night_private_key_ptr, size_t night_private_key_len, const char* dust_public_key_hex, const char* allow_fee_payment_str, uint64_t ttl_millis, int64_t current_time_millis);
+extern char* build_dust_registration_transaction(const uint8_t* night_private_key_ptr, size_t night_private_key_len, const char* dust_public_key_hex, const char* allow_fee_payment_str, uint64_t ttl_millis, int64_t current_time_millis, const char* utxos_json);
 
 /* JNI function implementations */
 
@@ -1869,6 +1869,7 @@ Java_com_midnight_kuira_core_ledger_fee_DustSpendCreator_nativeCreateDustSpend(
  * Build a complete dust registration transaction (signed, SCALE-encoded).
  *
  * Creates a transaction that registers a NIGHT address for dust generation.
+ * Includes a guaranteed UnshieldedOffer that consolidates NIGHT UTXOs.
  * The transaction is fully signed and serialized, ready for proof server submission.
  *
  * JNI signature matches:
@@ -1879,7 +1880,8 @@ Java_com_midnight_kuira_core_ledger_fee_DustSpendCreator_nativeCreateDustSpend(
  *           dustPublicKeyHex: String,
  *           allowFeePayment: String,
  *           ttlMillis: Long,
- *           currentTimeMillis: Long
+ *           currentTimeMillis: Long,
+ *           utxosJson: String
  *       ): String?
  *   }
  *
@@ -1890,6 +1892,7 @@ Java_com_midnight_kuira_core_ledger_fee_DustSpendCreator_nativeCreateDustSpend(
  * @param allow_fee_payment Max fee as decimal string (u128 Specks)
  * @param ttl_millis Transaction TTL in milliseconds since epoch
  * @param current_time_millis Current time in milliseconds since epoch
+ * @param utxos_json JSON array of NIGHT UTXOs: [{"value":"...","intent_hash":"...","output_no":N}]
  * @return Hex-encoded SCALE transaction, or NULL on error
  */
 JNIEXPORT jstring JNICALL
@@ -1900,7 +1903,8 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
     jstring dust_public_key_hex,
     jstring allow_fee_payment,
     jlong ttl_millis,
-    jlong current_time_millis
+    jlong current_time_millis,
+    jstring utxos_json
 ) {
     /* Validate inputs */
     if (night_private_key == NULL) {
@@ -1915,6 +1919,11 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
 
     if (allow_fee_payment == NULL) {
         LOGE("nativeBuildDustRegistrationTransaction: allow_fee_payment is null");
+        return NULL;
+    }
+
+    if (utxos_json == NULL) {
+        LOGE("nativeBuildDustRegistrationTransaction: utxos_json is null");
         return NULL;
     }
 
@@ -1952,6 +1961,15 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
         return NULL;
     }
 
+    const char* utxos_c = (*env)->GetStringUTFChars(env, utxos_json, NULL);
+    if (utxos_c == NULL) {
+        LOGE("nativeBuildDustRegistrationTransaction: GetStringUTFChars failed for utxos_json");
+        (*env)->ReleaseStringUTFChars(env, allow_fee_payment, fee_c);
+        (*env)->ReleaseStringUTFChars(env, dust_public_key_hex, dust_pk_c);
+        secure_memzero(key_buf, 32);
+        return NULL;
+    }
+
     /* Call Rust FFI */
     char* tx_hex = build_dust_registration_transaction(
         key_buf,
@@ -1959,7 +1977,8 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
         dust_pk_c,
         fee_c,
         (uint64_t)ttl_millis,
-        (int64_t)current_time_millis
+        (int64_t)current_time_millis,
+        utxos_c
     );
 
     /* SECURITY: Zeroize key after use */
@@ -1968,6 +1987,7 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
     /* Release Java strings */
     (*env)->ReleaseStringUTFChars(env, dust_public_key_hex, dust_pk_c);
     (*env)->ReleaseStringUTFChars(env, allow_fee_payment, fee_c);
+    (*env)->ReleaseStringUTFChars(env, utxos_json, utxos_c);
 
     if (tx_hex == NULL) {
         LOGE("nativeBuildDustRegistrationTransaction: Rust FFI returned NULL");
