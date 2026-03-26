@@ -103,6 +103,17 @@ extern void* dust_replay_events(const void* state_ptr, const uint8_t* seed_ptr, 
 /* Dust spend creation (Phase 2E) */
 extern char* create_dust_spend(const void* state_ptr, const uint8_t* seed_ptr, size_t seed_len, size_t utxo_index, const char* v_fee_str, int64_t current_time_ms);
 
+/* Zswap (shielded) state management (Phase 4B-Shielded) */
+extern void* create_zswap_local_state(void);
+extern void free_zswap_local_state(void* ptr);
+extern void* zswap_replay_events(const void* state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* events_hex);
+extern const char* zswap_get_balances(const void* state_ptr);
+extern int32_t zswap_get_coin_count(const void* state_ptr);
+extern uint64_t zswap_get_first_free(const void* state_ptr);
+extern const char* zswap_serialize(const void* state_ptr);
+extern void* zswap_deserialize(const char* hex_ptr);
+extern void free_zswap_string(char* ptr);
+
 /* Transaction signing (Phase 2D-FFI) */
 extern void* create_signing_key(const uint8_t* private_key_ptr, size_t private_key_len);
 extern void free_signing_key(void* ptr);
@@ -2007,6 +2018,117 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
 
     LOGD("nativeBuildDustRegistrationTransaction: success");
     return result;
+}
+
+/* ======================================================================
+ * Zswap (Shielded) State Management — Phase 4B-Shielded
+ * ====================================================================== */
+
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeCreate(
+    JNIEnv* env, jclass clazz) {
+    void* state = create_zswap_local_state();
+    return (jlong)(intptr_t)state;
+}
+
+JNIEXPORT void JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeFree(
+    JNIEnv* env, jobject obj, jlong statePtr) {
+    if (statePtr != 0) {
+        free_zswap_local_state((void*)(intptr_t)statePtr);
+    }
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeReplayEvents(
+    JNIEnv* env, jobject obj, jlong statePtr, jbyteArray seed, jstring eventsHex) {
+    if (statePtr == 0 || seed == NULL || eventsHex == NULL) {
+        LOGE("nativeZswapReplayEvents: null parameter");
+        return 0;
+    }
+
+    jsize seed_len = (*env)->GetArrayLength(env, seed);
+    if (seed_len != 32) {
+        LOGE("nativeZswapReplayEvents: seed must be 32 bytes, got %d", seed_len);
+        return 0;
+    }
+
+    jbyte* seed_buf = (*env)->GetByteArrayElements(env, seed, NULL);
+    if (seed_buf == NULL) return 0;
+
+    const char* events_hex_c = (*env)->GetStringUTFChars(env, eventsHex, NULL);
+    if (events_hex_c == NULL) {
+        (*env)->ReleaseByteArrayElements(env, seed, seed_buf, JNI_ABORT);
+        return 0;
+    }
+
+    void* new_state = zswap_replay_events(
+        (void*)(intptr_t)statePtr,
+        (const uint8_t*)seed_buf,
+        32,
+        events_hex_c
+    );
+
+    (*env)->ReleaseStringUTFChars(env, eventsHex, events_hex_c);
+    /* Securely wipe seed from JNI buffer */
+    memset(seed_buf, 0, seed_len);
+    (*env)->ReleaseByteArrayElements(env, seed, seed_buf, 0);
+
+    return (jlong)(intptr_t)new_state;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeGetBalances(
+    JNIEnv* env, jobject obj, jlong statePtr) {
+    if (statePtr == 0) return NULL;
+
+    const char* json = zswap_get_balances((void*)(intptr_t)statePtr);
+    if (json == NULL) return NULL;
+
+    jstring result = (*env)->NewStringUTF(env, json);
+    free_zswap_string((char*)json);
+    return result;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeGetCoinCount(
+    JNIEnv* env, jobject obj, jlong statePtr) {
+    if (statePtr == 0) return 0;
+    return (jint)zswap_get_coin_count((void*)(intptr_t)statePtr);
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeGetFirstFree(
+    JNIEnv* env, jobject obj, jlong statePtr) {
+    if (statePtr == 0) return 0;
+    return (jlong)zswap_get_first_free((void*)(intptr_t)statePtr);
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeSerialize(
+    JNIEnv* env, jobject obj, jlong statePtr) {
+    if (statePtr == 0) return NULL;
+
+    const char* hex = zswap_serialize((void*)(intptr_t)statePtr);
+    if (hex == NULL) return NULL;
+
+    jstring result = (*env)->NewStringUTF(env, hex);
+    free_zswap_string((char*)hex);
+    return result;
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeDeserialize(
+    JNIEnv* env, jclass clazz, jstring hexStr) {
+    if (hexStr == NULL) return 0;
+
+    const char* hex_c = (*env)->GetStringUTFChars(env, hexStr, NULL);
+    if (hex_c == NULL) return 0;
+
+    void* state = zswap_deserialize(hex_c);
+    (*env)->ReleaseStringUTFChars(env, hexStr, hex_c);
+
+    return (jlong)(intptr_t)state;
 }
 
 JNIEXPORT jint JNICALL

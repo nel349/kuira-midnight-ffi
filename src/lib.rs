@@ -43,6 +43,9 @@ pub mod serialize;
 // Dust key derivation FFI
 pub mod dust_ffi;
 
+// Zswap (shielded) wallet FFI (Phase 4B-Shielded)
+pub mod zswap_ffi;
+
 // Fee calculation FFI (Phase 2E)
 pub mod fee_ffi;
 
