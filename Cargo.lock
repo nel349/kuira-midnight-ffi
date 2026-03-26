@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "midnight-ledger"
-version = "8.0.0-rc.5"
+version = "8.0.3"
 dependencies = [
  "anyhow",
  "derive-where",
@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "midnight-onchain-runtime"
-version = "3.0.0-rc.1"
+version = "3.0.0"
 dependencies = [
  "derive-where",
  "enum_index",
@@ -1383,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "midnight-onchain-state"
-version = "3.0.0-rc.1"
+version = "3.0.0"
 dependencies = [
  "derive-where",
  "fake",
@@ -1400,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "midnight-onchain-vm"
-version = "3.0.0-rc.1"
+version = "3.0.0"
 dependencies = [
  "derive-where",
  "fake",
@@ -1568,7 +1568,7 @@ dependencies = [
 
 [[package]]
 name = "midnight-zswap"
-version = "8.0.0-rc.5"
+version = "8.0.3"
 dependencies = [
  "derive-where",
  "fake",

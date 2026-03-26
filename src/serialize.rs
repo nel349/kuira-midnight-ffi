@@ -718,7 +718,7 @@ pub fn build_and_serialize_intent_with_dust(
         "undeployed",
         base_intents_map,
         None,  // No guaranteed_coins
-        std::collections::HashMap::new(),  // No fallible_coins
+        midnight_storage::storage::HashMap::new(),  // No fallible_coins
     );
 
     // STEP 2: If dust spends provided, create SEPARATE dust transaction and merge
@@ -766,7 +766,7 @@ pub fn build_and_serialize_intent_with_dust(
             "undeployed",
             dust_intents_map,
             None,  // No guaranteed_coins
-            std::collections::HashMap::new(),  // No fallible_coins
+            midnight_storage::storage::HashMap::new(),  // No fallible_coins
         );
 
         // CRITICAL: Merge the two transactions (matches Lace: `transaction.merge(feeTransaction)`)
@@ -1436,7 +1436,7 @@ fn build_dust_registration_transaction_impl(
         "undeployed",
         intents_map,
         None,
-        std::collections::HashMap::new(),
+        midnight_storage::storage::HashMap::new(),  // No fallible_coins
     );
 
     // 17. Serialize as (Transaction, HashMap<String, ProvingKeyMaterial>) tuple
@@ -1469,7 +1469,7 @@ mod tests {
         let outputs = CString::new("[]").unwrap();
         let signatures = CString::new("[]").unwrap();
         let dust_actions = CString::new("").unwrap();
-        let binding = CString::new("09c2a8bc7eb805257257fe7bc69db72334d2f9c21574ec6a78398453a5c67a2d").unwrap();
+        let binding = CString::new("0500000000000000000000000000000000000000000000000000000000000000").unwrap();
 
         let hex_ptr = serialize_unshielded_transaction(
             inputs.as_ptr(),
@@ -1828,7 +1828,7 @@ mod tests {
         let signatures_json = r#"["7fcd704b204a598d87375b046ff9b4c1bd26e039f471c1cbbb107d4f962507151f17d58df17a7b2772649faa67a7bd25821c229470bcc9d85e8d21f9fb80757e"]"#;
 
         let ttl_ms = 1737658800000u64;
-        let binding_commitment = "09c2a8bc7eb805257257fe7bc69db72334d2f9c21574ec6a78398453a5c67a2d".to_string();
+        let binding_commitment = "0500000000000000000000000000000000000000000000000000000000000000".to_string();
 
         eprintln!("\n🔬 Testing FFI serialize with same data as Android test...\n");
 

@@ -239,10 +239,10 @@ mod tests {
                 .to_str()
                 .unwrap();
 
-            // Expected values from Midnight SDK
+            // Expected values from Midnight SDK (v8 — updated for audit-fixed domain separators)
             assert_eq!(
                 coin_pk,
-                "274c79e90fdf0e29468299ff624dc7092423041ba3976b76464feae3a07b994a",
+                "9408aeffbeedc6b9b45e1bcc621d1a273fb67f77de3f65bfbb1814d84f8b6524",
                 "Coin public key mismatch"
             );
             assert_eq!(

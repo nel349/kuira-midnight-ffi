@@ -8,13 +8,14 @@ crate-type = ["lib", "staticlib", "cdylib"]  # lib for tests, staticlib for Andr
 
 [dependencies]
 # Midnight ledger libraries (from local midnight-libraries repo)
-midnight-zswap = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/zswap" }
-midnight-serialize = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/serialize" }
-midnight-ledger = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/ledger" }
-midnight-base-crypto = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/base-crypto" }
-midnight-storage = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/storage" }
-midnight-coin-structure = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/coin-structure" }
-midnight-transient-crypto = { path = "../../../../../midnight/midnight-libraries/midnight-ledger/transient-crypto" }
+# Path: 4 levels up from kuira-crypto-ffi → android/Development, then into midnight/
+midnight-zswap = { path = "../../../../midnight/midnight-libraries/midnight-ledger/zswap" }
+midnight-serialize = { path = "../../../../midnight/midnight-libraries/midnight-ledger/serialize" }
+midnight-ledger = { path = "../../../../midnight/midnight-libraries/midnight-ledger/ledger" }
+midnight-base-crypto = { path = "../../../../midnight/midnight-libraries/midnight-ledger/base-crypto" }
+midnight-storage = { path = "../../../../midnight/midnight-libraries/midnight-ledger/storage" }
+midnight-coin-structure = { path = "../../../../midnight/midnight-libraries/midnight-ledger/coin-structure" }
+midnight-transient-crypto = { path = "../../../../midnight/midnight-libraries/midnight-ledger/transient-crypto" }
 
 # For hex encoding
 hex = "0.4"

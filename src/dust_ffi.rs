@@ -991,12 +991,8 @@ mod tests {
 
         let seed = [0u8; 32];
 
-        // Create empty events vector
-        let empty_events = Vec::<Event<InMemoryDB>>::new();
-        let mut events_bytes = Vec::new();
-        empty_events.serialize(&mut events_bytes).unwrap();
-        let events_hex = hex::encode(&events_bytes);
-        let events_cstr = CString::new(events_hex).unwrap();
+        // Empty events = empty string (no "midnight:event[v9]:" prefixed entries)
+        let events_cstr = CString::new("").unwrap();
 
         // Replay empty events (should succeed and return new state)
         let new_state_ptr = dust_replay_events(
@@ -1093,11 +1089,13 @@ mod tests {
             },
         };
 
-        // Serialize event
-        let events = vec![mock_event];
-        let mut events_bytes = Vec::new();
-        events.serialize(&mut events_bytes).unwrap();
-        let events_hex = hex::encode(&events_bytes);
+        // Serialize event individually with "midnight:event[v9]:" prefix
+        // This matches the format returned by the indexer GraphQL API
+        let mut event_bytes = Vec::new();
+        mock_event.serialize(&mut event_bytes).unwrap();
+        let event_hex = hex::encode(&event_bytes);
+        // Prefix: "midnight:event[v9]:" hex-encoded = "6d69646e696768743a6576656e745b76395d3a"
+        let events_hex = format!("6d69646e696768743a6576656e745b76395d3a{}", event_hex);
         let events_cstr = CString::new(events_hex).unwrap();
 
         // Replay event into state
