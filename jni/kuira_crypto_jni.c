@@ -2070,9 +2070,9 @@ Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeReplayEvents(
     );
 
     (*env)->ReleaseStringUTFChars(env, eventsHex, events_hex_c);
-    /* Securely wipe seed from JNI buffer */
+    /* Securely wipe seed from JNI buffer without copying back to Java array */
     memset(seed_buf, 0, seed_len);
-    (*env)->ReleaseByteArrayElements(env, seed, seed_buf, 0);
+    (*env)->ReleaseByteArrayElements(env, seed, seed_buf, JNI_ABORT);
 
     return (jlong)(intptr_t)new_state;
 }
