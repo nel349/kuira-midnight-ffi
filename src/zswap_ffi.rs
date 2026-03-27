@@ -476,6 +476,32 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_events_does_not_modify_seed() {
+        // Regression test: JNI was zeroing the seed array after replay.
+        // The Rust FFI must NOT modify the input seed.
+        let state = create_zswap_local_state();
+        assert!(!state.is_null());
+
+        let mut seed = [42u8; 32]; // Non-zero seed
+        let seed_copy = seed;
+        let events = CString::new("").unwrap();
+
+        let new_state = zswap_replay_events(
+            state,
+            seed.as_ptr(),
+            32,
+            events.as_ptr(),
+        );
+
+        assert!(!new_state.is_null());
+        // Seed must NOT be modified by replay_events
+        assert_eq!(seed, seed_copy, "replay_events must not modify the seed array");
+
+        free_zswap_local_state(new_state);
+        free_zswap_local_state(state);
+    }
+
+    #[test]
     fn test_null_safety() {
         // All functions should handle null gracefully
         assert!(zswap_replay_events(ptr::null(), ptr::null(), 0, ptr::null()).is_null());
