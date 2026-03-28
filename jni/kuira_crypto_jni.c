@@ -114,6 +114,20 @@ extern const char* zswap_serialize(const void* state_ptr);
 extern void* zswap_deserialize(const char* hex_ptr);
 extern void free_zswap_string(char* ptr);
 
+/* Zswap transfer primitives (Phase 3 — Step 7, ADR-001) */
+typedef struct {
+    void* new_state;    /* New ZswapLocalState pointer (null on error) */
+    char* result_json;  /* JSON with input_hex + binding_randomness_hex (null on error) */
+} ZswapSpendResult;
+
+extern const char* zswap_select_coins(const void* state_ptr, const char* token_type_hex, const char* amount_str);
+extern ZswapSpendResult zswap_spend_coin(const void* state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* coin_json);
+extern const char* zswap_create_output(const char* recipient_coin_pk_hex, const char* recipient_enc_pk_hex, const char* token_type_hex, const char* amount_str);
+extern const char* zswap_build_offer(const char* inputs_hex_json, const char* outputs_hex_json);
+extern const char* zswap_merge_offers(const char* offer1_hex, const char* offer2_hex);
+extern const char* zswap_serialize_offer(const char* offer_hex);
+extern const char* zswap_build_shielded_transaction(const char* offer_hex, const char* network_id, const char* dust_tx_hex, size_t reserved1, const char* reserved2, uint64_t reserved3, uint64_t ttl_ms);
+
 /* Transaction signing (Phase 2D-FFI) */
 extern void* create_signing_key(const uint8_t* private_key_ptr, size_t private_key_len);
 extern void free_signing_key(void* ptr);
@@ -2039,6 +2053,15 @@ Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeFree(
     }
 }
 
+/* Static version of nativeFree for ZswapTransferBuilder cleanup */
+JNIEXPORT void JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_00024Companion_nativeFreeStatic(
+    JNIEnv* env, jobject companion, jlong statePtr) {
+    if (statePtr != 0) {
+        free_zswap_local_state((void*)(intptr_t)statePtr);
+    }
+}
+
 JNIEXPORT jlong JNICALL
 Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeReplayEvents(
     JNIEnv* env, jobject obj, jlong statePtr, jbyteArray seed, jstring eventsHex) {
@@ -2129,6 +2152,320 @@ Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeDeserialize(
     (*env)->ReleaseStringUTFChars(env, hexStr, hex_c);
 
     return (jlong)(intptr_t)state;
+}
+
+/* ======================================================================
+ * Zswap Transfer Primitives — Phase 3, Step 7 (ADR-001)
+ *
+ * Kotlin class: com.midnight.kuira.core.crypto.shielded.ZswapTransferBuilder
+ * ====================================================================== */
+
+/*
+ * 7a: Select coins from state to cover an amount.
+ *
+ * Returns JSON array of coin objects, or null if insufficient balance.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeSelectCoins(
+    JNIEnv* env, jclass clazz, jlong statePtr, jstring tokenTypeHex, jstring amountStr) {
+
+    if (statePtr == 0 || tokenTypeHex == NULL || amountStr == NULL) {
+        LOGE("nativeSelectCoins: null parameter");
+        return NULL;
+    }
+
+    const char* token_c = (*env)->GetStringUTFChars(env, tokenTypeHex, NULL);
+    if (token_c == NULL) return NULL;
+
+    const char* amount_c = (*env)->GetStringUTFChars(env, amountStr, NULL);
+    if (amount_c == NULL) {
+        (*env)->ReleaseStringUTFChars(env, tokenTypeHex, token_c);
+        return NULL;
+    }
+
+    const char* result = zswap_select_coins((void*)(intptr_t)statePtr, token_c, amount_c);
+
+    (*env)->ReleaseStringUTFChars(env, tokenTypeHex, token_c);
+    (*env)->ReleaseStringUTFChars(env, amountStr, amount_c);
+
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    free_zswap_string((char*)result);
+    return jresult;
+}
+
+/*
+ * 7b: Spend a coin, creating an Input<ProofPreimage>.
+ *
+ * Returns JSON: {"new_state_ptr":<long>, "input_hex":"...", "binding_randomness_hex":"..."}
+ * The new_state_ptr is a native pointer that Kotlin uses for subsequent operations.
+ * Caller must free the state via ZswapLocalState.freeNativePtr when done.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeSpendCoinFull(
+    JNIEnv* env, jclass clazz, jlong statePtr, jbyteArray seed, jstring coinJson) {
+
+    if (statePtr == 0 || seed == NULL || coinJson == NULL) {
+        LOGE("nativeSpendCoinFull: null parameter");
+        return NULL;
+    }
+
+    jsize seed_len = (*env)->GetArrayLength(env, seed);
+    if (seed_len != 32) {
+        LOGE("nativeSpendCoinFull: seed must be 32 bytes, got %d", seed_len);
+        return NULL;
+    }
+
+    jbyte* seed_buf = (*env)->GetByteArrayElements(env, seed, NULL);
+    if (seed_buf == NULL) return NULL;
+
+    const char* coin_c = (*env)->GetStringUTFChars(env, coinJson, NULL);
+    if (coin_c == NULL) {
+        memset(seed_buf, 0, seed_len);
+        (*env)->ReleaseByteArrayElements(env, seed, seed_buf, JNI_ABORT);
+        return NULL;
+    }
+
+    ZswapSpendResult result = zswap_spend_coin(
+        (void*)(intptr_t)statePtr,
+        (const uint8_t*)seed_buf,
+        32,
+        coin_c
+    );
+
+    (*env)->ReleaseStringUTFChars(env, coinJson, coin_c);
+    memset(seed_buf, 0, seed_len);
+    (*env)->ReleaseByteArrayElements(env, seed, seed_buf, JNI_ABORT);
+
+    if (result.new_state == NULL || result.result_json == NULL) {
+        if (result.new_state != NULL) free_zswap_local_state(result.new_state);
+        if (result.result_json != NULL) free_zswap_string(result.result_json);
+        return NULL;
+    }
+
+    /* Build combined JSON: {"new_state_ptr": <long>, ...rest of result_json} */
+    /* result_json is: {"input_hex":"...", "binding_randomness_hex":"..."} */
+    /* We insert new_state_ptr at the beginning */
+    jlong new_state_ptr = (jlong)(intptr_t)result.new_state;
+
+    /* Calculate buffer size: {"new_state_ptr":NNNN, + rest without leading { */
+    size_t json_len = strlen(result.result_json);
+    size_t buf_size;
+    if (!safe_size_add(json_len, 64, &buf_size)) {
+        free_zswap_local_state(result.new_state);
+        free_zswap_string(result.result_json);
+        LOGE("nativeSpendCoinFull: buffer size overflow");
+        return NULL;
+    }
+    char* combined = (char*)malloc(buf_size);
+    if (combined == NULL) {
+        free_zswap_local_state(result.new_state);
+        free_zswap_string(result.result_json);
+        LOGE("nativeSpendCoinFull: malloc failed");
+        return NULL;
+    }
+
+    /* Merge: skip leading '{' of result_json, prepend our field */
+    snprintf(combined, buf_size, "{\"new_state_ptr\":%lld,%s",
+             (long long)new_state_ptr,
+             result.result_json + 1); /* +1 skips the '{' */
+
+    free_zswap_string(result.result_json);
+
+    jstring jresult = (*env)->NewStringUTF(env, combined);
+    free(combined);
+
+    return jresult;
+}
+
+/*
+ * 7c: Create an encrypted output for a recipient.
+ *
+ * Returns JSON: {"output_hex":"...", "binding_randomness_hex":"..."}
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeCreateOutput(
+    JNIEnv* env, jclass clazz, jstring coinPkHex, jstring encPkHex,
+    jstring tokenTypeHex, jstring amountStr) {
+
+    if (coinPkHex == NULL || encPkHex == NULL || tokenTypeHex == NULL || amountStr == NULL) {
+        LOGE("nativeCreateOutput: null parameter");
+        return NULL;
+    }
+
+    const char* cpk_c = (*env)->GetStringUTFChars(env, coinPkHex, NULL);
+    const char* epk_c = (*env)->GetStringUTFChars(env, encPkHex, NULL);
+    const char* token_c = (*env)->GetStringUTFChars(env, tokenTypeHex, NULL);
+    const char* amount_c = (*env)->GetStringUTFChars(env, amountStr, NULL);
+
+    if (cpk_c == NULL || epk_c == NULL || token_c == NULL || amount_c == NULL) {
+        if (cpk_c) (*env)->ReleaseStringUTFChars(env, coinPkHex, cpk_c);
+        if (epk_c) (*env)->ReleaseStringUTFChars(env, encPkHex, epk_c);
+        if (token_c) (*env)->ReleaseStringUTFChars(env, tokenTypeHex, token_c);
+        if (amount_c) (*env)->ReleaseStringUTFChars(env, amountStr, amount_c);
+        return NULL;
+    }
+
+    const char* result = zswap_create_output(cpk_c, epk_c, token_c, amount_c);
+
+    (*env)->ReleaseStringUTFChars(env, coinPkHex, cpk_c);
+    (*env)->ReleaseStringUTFChars(env, encPkHex, epk_c);
+    (*env)->ReleaseStringUTFChars(env, tokenTypeHex, token_c);
+    (*env)->ReleaseStringUTFChars(env, amountStr, amount_c);
+
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    free_zswap_string((char*)result);
+    return jresult;
+}
+
+/*
+ * 7d: Build an Offer from inputs + outputs.
+ *
+ * Returns JSON: {"offer_hex":"...", "binding_randomness_hex":"..."}
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeBuildOffer(
+    JNIEnv* env, jclass clazz, jstring inputsHexJson, jstring outputsHexJson) {
+
+    if (inputsHexJson == NULL || outputsHexJson == NULL) {
+        LOGE("nativeBuildOffer: null parameter");
+        return NULL;
+    }
+
+    const char* inputs_c = (*env)->GetStringUTFChars(env, inputsHexJson, NULL);
+    const char* outputs_c = (*env)->GetStringUTFChars(env, outputsHexJson, NULL);
+
+    if (inputs_c == NULL || outputs_c == NULL) {
+        if (inputs_c) (*env)->ReleaseStringUTFChars(env, inputsHexJson, inputs_c);
+        if (outputs_c) (*env)->ReleaseStringUTFChars(env, outputsHexJson, outputs_c);
+        return NULL;
+    }
+
+    const char* result = zswap_build_offer(inputs_c, outputs_c);
+
+    (*env)->ReleaseStringUTFChars(env, inputsHexJson, inputs_c);
+    (*env)->ReleaseStringUTFChars(env, outputsHexJson, outputs_c);
+
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    free_zswap_string((char*)result);
+    return jresult;
+}
+
+/*
+ * 7e: Merge two offers into one.
+ *
+ * Returns merged offer hex string, or null on error.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeMergeOffers(
+    JNIEnv* env, jclass clazz, jstring offer1Hex, jstring offer2Hex) {
+
+    if (offer1Hex == NULL || offer2Hex == NULL) {
+        LOGE("nativeMergeOffers: null parameter");
+        return NULL;
+    }
+
+    const char* o1_c = (*env)->GetStringUTFChars(env, offer1Hex, NULL);
+    const char* o2_c = (*env)->GetStringUTFChars(env, offer2Hex, NULL);
+
+    if (o1_c == NULL || o2_c == NULL) {
+        if (o1_c) (*env)->ReleaseStringUTFChars(env, offer1Hex, o1_c);
+        if (o2_c) (*env)->ReleaseStringUTFChars(env, offer2Hex, o2_c);
+        return NULL;
+    }
+
+    const char* result = zswap_merge_offers(o1_c, o2_c);
+
+    (*env)->ReleaseStringUTFChars(env, offer1Hex, o1_c);
+    (*env)->ReleaseStringUTFChars(env, offer2Hex, o2_c);
+
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    free_zswap_string((char*)result);
+    return jresult;
+}
+
+/*
+ * 7f: Validate and re-serialize an offer.
+ *
+ * Returns validated SCALE hex, or null if malformed.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeSerializeOffer(
+    JNIEnv* env, jclass clazz, jstring offerHex) {
+
+    if (offerHex == NULL) {
+        LOGE("nativeSerializeOffer: null parameter");
+        return NULL;
+    }
+
+    const char* hex_c = (*env)->GetStringUTFChars(env, offerHex, NULL);
+    if (hex_c == NULL) return NULL;
+
+    const char* result = zswap_serialize_offer(hex_c);
+
+    (*env)->ReleaseStringUTFChars(env, offerHex, hex_c);
+
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    free_zswap_string((char*)result);
+    return jresult;
+}
+
+/*
+ * 7g: Build full unproven Transaction for proof server.
+ *
+ * Returns hex-encoded (Transaction, HashMap) tuple.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeBuildShieldedTransaction(
+    JNIEnv* env, jclass clazz, jstring offerHex, jstring networkId,
+    jstring dustTxHex, jlong ttlMs) {
+
+    if (offerHex == NULL || networkId == NULL) {
+        LOGE("nativeBuildShieldedTransaction: null required parameter");
+        return NULL;
+    }
+
+    const char* offer_c = (*env)->GetStringUTFChars(env, offerHex, NULL);
+    const char* network_c = (*env)->GetStringUTFChars(env, networkId, NULL);
+    const char* dust_c = NULL;
+
+    if (offer_c == NULL || network_c == NULL) {
+        if (offer_c) (*env)->ReleaseStringUTFChars(env, offerHex, offer_c);
+        if (network_c) (*env)->ReleaseStringUTFChars(env, networkId, network_c);
+        return NULL;
+    }
+
+    /* dustTxHex is optional */
+    if (dustTxHex != NULL) {
+        dust_c = (*env)->GetStringUTFChars(env, dustTxHex, NULL);
+    }
+
+    const char* result = zswap_build_shielded_transaction(
+        offer_c,
+        network_c,
+        dust_c,  /* may be NULL */
+        0, NULL, 0,  /* reserved params */
+        (uint64_t)ttlMs
+    );
+
+    (*env)->ReleaseStringUTFChars(env, offerHex, offer_c);
+    (*env)->ReleaseStringUTFChars(env, networkId, network_c);
+    if (dust_c) (*env)->ReleaseStringUTFChars(env, dustTxHex, dust_c);
+
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    free_zswap_string((char*)result);
+    return jresult;
 }
 
 JNIEXPORT jint JNICALL
