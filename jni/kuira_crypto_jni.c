@@ -127,6 +127,7 @@ extern const char* zswap_build_offer(const char* inputs_hex_json, const char* ou
 extern const char* zswap_merge_offers(const char* offer1_hex, const char* offer2_hex);
 extern const char* zswap_serialize_offer(const char* offer_hex);
 extern const char* zswap_build_shielded_transaction(const char* offer_hex, const char* network_id, const char* dust_tx_hex, size_t reserved1, const char* reserved2, uint64_t reserved3, uint64_t ttl_ms);
+extern const char* zswap_build_shielded_transaction_with_dust(const char* offer_hex, const char* network_id, const void* dust_state_ptr, const uint8_t* dust_seed_ptr, size_t dust_seed_len, const char* dust_utxos_json, uint64_t current_time_ms, uint64_t ttl_ms);
 
 /* Transaction signing (Phase 2D-FFI) */
 extern void* create_signing_key(const uint8_t* private_key_ptr, size_t private_key_len);
@@ -2463,6 +2464,63 @@ Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeBuildShi
 
     if (result == NULL) return NULL;
 
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    free_zswap_string((char*)result);
+    return jresult;
+}
+
+/*
+ * 7g+dust: Build shielded transaction with dust fee payment.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeBuildShieldedTransactionWithDust(
+    JNIEnv* env, jclass clazz, jstring offerHex, jstring networkId,
+    jlong dustStatePtr, jbyteArray dustSeed, jstring dustUtxosJson,
+    jlong currentTimeMs, jlong ttlMs) {
+
+    if (offerHex == NULL || networkId == NULL) {
+        LOGE("nativeBuildShieldedTransactionWithDust: null required parameter");
+        return NULL;
+    }
+
+    const char* offer_c = (*env)->GetStringUTFChars(env, offerHex, NULL);
+    const char* network_c = (*env)->GetStringUTFChars(env, networkId, NULL);
+    if (offer_c == NULL || network_c == NULL) {
+        if (offer_c) (*env)->ReleaseStringUTFChars(env, offerHex, offer_c);
+        if (network_c) (*env)->ReleaseStringUTFChars(env, networkId, network_c);
+        return NULL;
+    }
+
+    /* Dust params (all optional — may be null/0) */
+    jbyte* dust_seed_buf = NULL;
+    jsize dust_seed_len = 0;
+    const char* dust_utxos_c = NULL;
+
+    if (dustSeed != NULL && dustStatePtr != 0 && dustUtxosJson != NULL) {
+        dust_seed_len = (*env)->GetArrayLength(env, dustSeed);
+        dust_seed_buf = (*env)->GetByteArrayElements(env, dustSeed, NULL);
+        dust_utxos_c = (*env)->GetStringUTFChars(env, dustUtxosJson, NULL);
+    }
+
+    const char* result = zswap_build_shielded_transaction_with_dust(
+        offer_c, network_c,
+        (void*)(intptr_t)dustStatePtr,
+        dust_seed_buf ? (const uint8_t*)dust_seed_buf : NULL,
+        (size_t)dust_seed_len,
+        dust_utxos_c,
+        (uint64_t)currentTimeMs,
+        (uint64_t)ttlMs
+    );
+
+    (*env)->ReleaseStringUTFChars(env, offerHex, offer_c);
+    (*env)->ReleaseStringUTFChars(env, networkId, network_c);
+    if (dust_seed_buf) {
+        memset(dust_seed_buf, 0, dust_seed_len);
+        (*env)->ReleaseByteArrayElements(env, dustSeed, dust_seed_buf, JNI_ABORT);
+    }
+    if (dust_utxos_c) (*env)->ReleaseStringUTFChars(env, dustUtxosJson, dust_utxos_c);
+
+    if (result == NULL) return NULL;
     jstring jresult = (*env)->NewStringUTF(env, result);
     free_zswap_string((char*)result);
     return jresult;

@@ -1226,6 +1226,180 @@ pub extern "C" fn zswap_build_shielded_transaction(
     }
 }
 
+/// 7g+dust: Builds a shielded Transaction with dust fee payment.
+///
+/// Same as `zswap_build_shielded_transaction` but builds dust actions
+/// internally from a DustLocalState, matching the pattern from serialize.rs.
+///
+/// # Parameters
+/// - `offer_hex`: Tagged-serialized unproven ZswapOffer hex
+/// - `network_id`: Network identifier ("undeployed", "preprod", "preview")
+/// - `dust_state_ptr`: DustLocalState pointer (from create/replay)
+/// - `dust_seed_ptr`: 32-byte dust seed (m/44'/2400'/0'/2/0)
+/// - `dust_seed_len`: Must be 32
+/// - `dust_utxos_json`: JSON array: [{"utxo_index":0,"v_fee":"1"}]
+/// - `current_time_ms`: Current time in milliseconds (for dust fee calculation)
+/// - `ttl_ms`: Transaction TTL in milliseconds since epoch
+#[no_mangle]
+pub extern "C" fn zswap_build_shielded_transaction_with_dust(
+    offer_hex: *const c_char,
+    network_id: *const c_char,
+    dust_state_ptr: *const std::ffi::c_void,
+    dust_seed_ptr: *const u8,
+    dust_seed_len: usize,
+    dust_utxos_json: *const c_char,
+    current_time_ms: u64,
+    ttl_ms: u64,
+) -> *const c_char {
+    if offer_hex.is_null() || network_id.is_null() {
+        android_log!(ANDROID_LOG_ERROR, TAG, "Null offer_hex or network_id");
+        return ptr::null();
+    }
+
+    // SAFETY: All required pointers validated. dust params may be null (no fees).
+    unsafe {
+        let network_str = match c_str_to_rust(network_id, "network_id") {
+            Some(s) => s,
+            None => return ptr::null(),
+        };
+
+        let offer_bytes = match c_hex_to_bytes(offer_hex, "offer") {
+            Some(b) => b,
+            None => return ptr::null(),
+        };
+        let offer: Offer<ProofPreimage, InMemoryDB> = match midnight_serialize::tagged_deserialize(&mut &offer_bytes[..]) {
+            Ok(o) => o,
+            Err(e) => {
+                android_log!(ANDROID_LOG_ERROR, TAG, "Error deserializing offer: {}", e);
+                return ptr::null();
+            }
+        };
+
+        // Build transaction with guaranteed_coins only (no empty intent)
+        // Intents will be added by dust merge if dust params provided
+        let mut transaction = Transaction::Standard(StandardTransaction::new(
+            network_str,
+            StorageHashMap::default(), // no intents — dust adds its own
+            Some(offer),
+            StorageHashMap::default(),
+        ));
+
+        // Build and merge dust if dust params provided
+        if !dust_state_ptr.is_null() && !dust_seed_ptr.is_null() && !dust_utxos_json.is_null() && dust_seed_len == 32 {
+            use midnight_ledger::dust::{DustActions, DustLocalState as DustState, DustSecretKey, Seed as DustSeed};
+            use midnight_storage::storage::Array as StorageArray;
+
+            let dust_state = &*(dust_state_ptr as *const DustState<InMemoryDB>);
+
+            // Derive dust secret key (same pattern as dust_ffi.rs)
+            let dust_seed_slice = std::slice::from_raw_parts(dust_seed_ptr, dust_seed_len);
+            let mut dust_seed_array: [u8; 32] = [0u8; 32];
+            dust_seed_array.copy_from_slice(dust_seed_slice);
+            let dust_secret_key = DustSecretKey::derive_secret_key(&dust_seed_array);
+            dust_seed_array.fill(0);
+
+            // Parse dust UTXOs JSON
+            let utxos_str = match c_str_to_rust(dust_utxos_json, "dust_utxos") {
+                Some(s) => s,
+                None => return ptr::null(),
+            };
+
+            #[derive(serde::Deserialize)]
+            struct DustUtxoSel { utxo_index: usize, v_fee: String }
+
+            let utxo_selections: Vec<DustUtxoSel> = match serde_json::from_str(utxos_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    android_log!(ANDROID_LOG_ERROR, TAG, "Invalid dust utxos JSON: {}", e);
+                    return ptr::null();
+                }
+            };
+
+            // Build dust spends (same pattern as dust_ffi.rs:656)
+            let ctime = Timestamp::from_secs(current_time_ms / 1000);
+            let all_utxos: Vec<_> = dust_state.utxos().collect();
+            let mut dust_spends = Vec::new();
+
+            for sel in &utxo_selections {
+                let v_fee: u128 = match sel.v_fee.parse() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        android_log!(ANDROID_LOG_ERROR, TAG, "Invalid v_fee: {}", e);
+                        return ptr::null();
+                    }
+                };
+
+                if sel.utxo_index >= all_utxos.len() {
+                    android_log!(ANDROID_LOG_ERROR, TAG, "Dust UTXO index {} out of bounds ({})", sel.utxo_index, all_utxos.len());
+                    return ptr::null();
+                }
+
+                let utxo = all_utxos[sel.utxo_index];
+                match dust_state.spend(&dust_secret_key, &utxo, v_fee, ctime) {
+                    Ok((_new_state, spend)) => {
+                        android_log!(ANDROID_LOG_INFO, TAG, "Created dust spend from UTXO {}", sel.utxo_index);
+                        dust_spends.push(spend);
+                    }
+                    Err(e) => {
+                        android_log!(ANDROID_LOG_ERROR, TAG, "Dust spend failed for UTXO {}: {:?}", sel.utxo_index, e);
+                        return ptr::null();
+                    }
+                }
+            }
+
+            if !dust_spends.is_empty() {
+                let spends_array: StorageArray<_, InMemoryDB> = dust_spends.into_iter().collect();
+                let registrations_array: StorageArray<midnight_ledger::dust::DustRegistration<Signature, InMemoryDB>, InMemoryDB> = std::iter::empty().collect();
+
+                let dust_actions = DustActions {
+                    spends: spends_array,
+                    registrations: registrations_array,
+                    ctime,
+                };
+
+                let dust_segment_id: u16 = OsRng.gen_range(2..u16::MAX);
+                let dust_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, InMemoryDB> {
+                    guaranteed_unshielded_offer: None,
+                    fallible_unshielded_offer: None,
+                    actions: std::iter::empty().collect(),
+                    dust_actions: Some(midnight_storage::arena::Sp::new(dust_actions)),
+                    ttl: Timestamp::from_secs(ttl_ms / 1000),
+                    binding_commitment: PedersenRandomness::from(0),
+                };
+
+                let dust_intents_map = StorageHashMap::default().insert(dust_segment_id, dust_intent);
+                let dust_transaction = Transaction::Standard(StandardTransaction::new(
+                    network_str,
+                    dust_intents_map,
+                    None,
+                    StorageHashMap::default(),
+                ));
+
+                transaction = match transaction.merge(&dust_transaction) {
+                    Ok(merged) => merged,
+                    Err(e) => {
+                        android_log!(ANDROID_LOG_ERROR, TAG, "Failed to merge dust: {:?}", e);
+                        return ptr::null();
+                    }
+                };
+
+                android_log!(ANDROID_LOG_INFO, TAG, "Merged dust into shielded transaction");
+            }
+        }
+
+        let proof_data = std::collections::HashMap::<String, ProvingKeyMaterial>::new();
+
+        let mut bytes = Vec::new();
+        if let Err(e) = midnight_serialize::tagged_serialize(&(&transaction, &proof_data), &mut bytes) {
+            android_log!(ANDROID_LOG_ERROR, TAG, "Error serializing transaction: {}", e);
+            return ptr::null();
+        }
+
+        android_log!(ANDROID_LOG_INFO, TAG, "Built shielded tx with dust: {} bytes", bytes.len());
+        string_to_c_ptr(hex::encode(&bytes))
+    }
+}
+
 // ── Internal Helpers ──
 
 /// Parses a JSON coin object from zswap_select_coins output into a QualifiedCoinInfo.
