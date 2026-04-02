@@ -13,11 +13,10 @@ use std::ptr;
 use std::io;
 use std::collections::HashMap;
 
-use midnight_serialize::{tagged_serialize, tagged_deserialize, Serializable, Deserializable};
+use midnight_serialize::{tagged_serialize, tagged_deserialize};
 use midnight_transient_crypto::proofs::{
-    KeyLocation, ParamsProver, ParamsProverProvider, ProofPreimage, ProvingKeyMaterial, Resolver,
+    KeyLocation, ParamsProver, ParamsProverProvider, ProvingKeyMaterial, Resolver,
 };
-use midnight_zkir::IrSource;
 use rand::rngs::OsRng;
 
 // Re-use helpers from zswap_ffi
@@ -94,8 +93,9 @@ impl Resolver for LocalFileResolver {
         let verifier_path = base.with_extension("verifier");
         let ir_path = base.with_extension("bzkir");
 
-        if !prover_path.exists() {
-            prove_log!(LOG_ERROR, "Prover key not found: {:?}", prover_path);
+        if !prover_path.exists() || !verifier_path.exists() || !ir_path.exists() {
+            prove_log!(LOG_ERROR, "Key files missing for '{}': prover={}, verifier={}, ir={}",
+                key_name, prover_path.exists(), verifier_path.exists(), ir_path.exists());
             return Ok(None);
         }
 
