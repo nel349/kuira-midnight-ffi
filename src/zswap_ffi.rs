@@ -414,7 +414,7 @@ pub extern "C" fn free_zswap_string(ptr: *mut c_char) {
 ///
 /// # Safety
 /// `ptr` must be a valid, null-terminated C string pointer.
-unsafe fn c_str_to_rust<'a>(ptr: *const c_char, name: &str) -> Option<&'a str> {
+pub(crate) unsafe fn c_str_to_rust<'a>(ptr: *const c_char, name: &str) -> Option<&'a str> {
     match std::ffi::CStr::from_ptr(ptr).to_str() {
         Ok(s) => Some(s),
         Err(e) => {
@@ -428,7 +428,7 @@ unsafe fn c_str_to_rust<'a>(ptr: *const c_char, name: &str) -> Option<&'a str> {
 ///
 /// # Safety
 /// `ptr` must be a valid, null-terminated C string pointer containing hex.
-unsafe fn c_hex_to_bytes(ptr: *const c_char, name: &str) -> Option<Vec<u8>> {
+pub(crate) unsafe fn c_hex_to_bytes(ptr: *const c_char, name: &str) -> Option<Vec<u8>> {
     let hex_str = c_str_to_rust(ptr, name)?;
     match hex::decode(hex_str) {
         Ok(b) => Some(b),
@@ -456,7 +456,7 @@ unsafe fn c_hex_deserialize<T: Deserializable>(ptr: *const c_char, name: &str) -
 
 /// Converts a String to a C string pointer for FFI return, logging errors.
 /// Caller must free with `free_zswap_string`.
-fn string_to_c_ptr(s: String) -> *const c_char {
+pub(crate) fn string_to_c_ptr(s: String) -> *const c_char {
     match CString::new(s) {
         Ok(c) => c.into_raw(),
         Err(e) => {
