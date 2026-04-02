@@ -17,6 +17,10 @@ midnight-storage = { path = "../../../../midnight/midnight-libraries/midnight-le
 midnight-coin-structure = { path = "../../../../midnight/midnight-libraries/midnight-ledger/coin-structure" }
 midnight-transient-crypto = { path = "../../../../midnight/midnight-libraries/midnight-ledger/transient-crypto" }
 
+# Phase 4C: Local ZK Proving
+midnight-zkir = { path = "../../../../midnight/midnight-libraries/midnight-ledger/zkir" }
+tokio = { version = "1", features = ["rt"] }
+
 # For hex encoding
 hex = "0.4"
 

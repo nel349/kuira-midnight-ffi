@@ -129,6 +129,10 @@ extern const char* zswap_serialize_offer(const char* offer_hex);
 extern const char* zswap_build_shielded_transaction(const char* offer_hex, const char* network_id, const char* dust_tx_hex, size_t reserved1, const char* reserved2, uint64_t reserved3, uint64_t ttl_ms);
 extern const char* zswap_build_shielded_transaction_with_dust(const char* offer_hex, const char* network_id, const void* dust_state_ptr, const uint8_t* dust_seed_ptr, size_t dust_seed_len, const char* dust_utxos_json, uint64_t current_time_ms, uint64_t ttl_ms);
 
+/* Local ZK proving (Phase 4C) */
+extern const char* zkir_prove_transaction_local(const char* unproven_tx_hex, const char* keys_dir);
+extern void free_proven_string(char* ptr);
+
 /* Transaction signing (Phase 2D-FFI) */
 extern void* create_signing_key(const uint8_t* private_key_ptr, size_t private_key_len);
 extern void free_signing_key(void* ptr);
@@ -2523,6 +2527,53 @@ Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeBuildShi
     if (result == NULL) return NULL;
     jstring jresult = (*env)->NewStringUTF(env, result);
     free_zswap_string((char*)result);
+    return jresult;
+}
+
+/* ======================================================================
+ * Local ZK Proving — Phase 4C
+ *
+ * Kotlin class: com.midnight.kuira.core.crypto.proving.LocalProver
+ * ====================================================================== */
+
+/*
+ * Prove a transaction locally using cached proving keys.
+ * Same input/output format as the proof server.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_proving_LocalProver_nativeProveTransactionLocal(
+    JNIEnv* env, jclass clazz, jstring unprovenTxHex, jstring keysDir) {
+
+    if (unprovenTxHex == NULL || keysDir == NULL) {
+        LOGE("nativeProveTransactionLocal: null parameter");
+        return NULL;
+    }
+
+    const char* tx_c = (*env)->GetStringUTFChars(env, unprovenTxHex, NULL);
+    const char* dir_c = (*env)->GetStringUTFChars(env, keysDir, NULL);
+
+    if (tx_c == NULL || dir_c == NULL) {
+        if (tx_c) (*env)->ReleaseStringUTFChars(env, unprovenTxHex, tx_c);
+        if (dir_c) (*env)->ReleaseStringUTFChars(env, keysDir, dir_c);
+        return NULL;
+    }
+
+    LOGI("Starting local proving (keys_dir=%s)", dir_c);
+
+    const char* result = zkir_prove_transaction_local(tx_c, dir_c);
+
+    (*env)->ReleaseStringUTFChars(env, unprovenTxHex, tx_c);
+    (*env)->ReleaseStringUTFChars(env, keysDir, dir_c);
+
+    if (result == NULL) {
+        LOGE("Local proving failed");
+        return NULL;
+    }
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    free_proven_string((char*)result);
+
+    LOGI("Local proving succeeded");
     return jresult;
 }
 

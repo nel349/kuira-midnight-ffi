@@ -49,6 +49,9 @@ pub mod zswap_ffi;
 // Fee calculation FFI (Phase 2E)
 pub mod fee_ffi;
 
+// Local ZK proving FFI (Phase 4C)
+pub mod prove_ffi;
+
 // Key validity tests
 #[cfg(test)]
 mod test_key_validity;
