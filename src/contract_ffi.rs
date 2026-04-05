@@ -86,7 +86,7 @@ pub extern "C" fn contract_state_create(state_hex: *const c_char) -> u64 {
 /// Serialize a contract state to SCALE hex.
 #[no_mangle]
 pub extern "C" fn contract_state_serialize(handle: u64) -> *const c_char {
-    let pool = STATE_POOL.lock().unwrap();
+    let mut pool = STATE_POOL.lock().unwrap();
     let state = match pool.get(&handle) {
         Some(s) => s,
         None => return std::ptr::null(),
@@ -129,7 +129,7 @@ pub extern "C" fn contract_query(
     // Get state from pool
     let state = {
         let mut pool = STATE_POOL.lock().unwrap();
-        match pool.remove(&handle) {
+        match pool.get(&handle).cloned() {
             Some(s) => s,
             None => return to_c_string("{\"error\":\"invalid state handle\"}"),
         }
@@ -150,8 +150,8 @@ pub extern "C" fn contract_query(
     match state.query(&ops, &INITIAL_COST_MODEL) {
         Ok((new_state, events)) => {
             // Store new state, get new handle
-            let new_handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            STATE_POOL.lock().unwrap().insert(new_handle, new_state);
+            // Update existing handle with new state
+            STATE_POOL.lock().unwrap().insert(handle, new_state);
 
             // Serialize events to JSON (serde)
             let events_json = match serde_json::to_string(&events) {
@@ -159,7 +159,7 @@ pub extern "C" fn contract_query(
                 Err(e) => return to_c_string(&format!("{{\"error\":\"events serialize: {}\"}}", e)),
             };
 
-            to_c_string(&format!("{{\"handle\":{},\"events\":{}}}", new_handle, events_json))
+            to_c_string(&format!("{{\"handle\":{},\"events\":{}}}", handle, events_json))
         }
         Err(e) => {
             to_c_string(&format!("{{\"error\":\"query failed: {:?}\"}}", e))
