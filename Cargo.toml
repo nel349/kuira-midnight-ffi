@@ -17,9 +17,17 @@ midnight-storage = { path = "../../../../midnight/midnight-libraries/midnight-le
 midnight-coin-structure = { path = "../../../../midnight/midnight-libraries/midnight-ledger/coin-structure" }
 midnight-transient-crypto = { path = "../../../../midnight/midnight-libraries/midnight-ledger/transient-crypto" }
 
+# Phase 6: Contract runtime (onchain-runtime for QueryContext.query)
+midnight-onchain-runtime = { path = "../../../../midnight/midnight-libraries/midnight-ledger/onchain-runtime" }
+midnight-onchain-vm = { path = "../../../../midnight/midnight-libraries/midnight-ledger/onchain-vm" }
+midnight-onchain-state = { path = "../../../../midnight/midnight-libraries/midnight-ledger/onchain-state" }
+
 # Phase 4C: Local ZK Proving
 midnight-zkir = { path = "../../../../midnight/midnight-libraries/midnight-ledger/zkir" }
 tokio = { version = "1", features = ["rt"] }
+
+# For state handle pool
+once_cell = "1.19"
 
 # For hex encoding
 hex = "0.4"

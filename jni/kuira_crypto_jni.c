@@ -133,6 +133,14 @@ extern const char* zswap_build_shielded_transaction_with_dust(const char* offer_
 extern const char* zkir_prove_transaction_local(const char* unproven_tx_hex, const char* keys_dir);
 extern void free_proven_string(char* ptr);
 
+/* Contract runtime (Phase 6) */
+extern uint64_t contract_state_create(const char* state_hex);
+extern const char* contract_state_serialize(uint64_t handle);
+extern void contract_state_free(uint64_t handle);
+extern const char* contract_query(uint64_t handle, const char* opcodes_json);
+extern const char* contract_persistent_hash(const char* input_hex);
+extern void contract_free_string(char* ptr);
+
 /* Transaction signing (Phase 2D-FFI) */
 extern void* create_signing_key(const uint8_t* private_key_ptr, size_t private_key_len);
 extern void free_signing_key(void* ptr);
@@ -2574,6 +2582,75 @@ Java_com_midnight_kuira_core_crypto_proving_LocalProver_nativeProveTransactionLo
     free_proven_string((char*)result);
 
     LOGI("Local proving succeeded");
+    return jresult;
+}
+
+/*
+ * Create a contract state from SCALE hex, return handle.
+ */
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeStateCreate(
+    JNIEnv* env, jclass clazz, jstring stateHex) {
+
+    if (stateHex == NULL) return 0;
+    const char* hex_c = (*env)->GetStringUTFChars(env, stateHex, NULL);
+    if (hex_c == NULL) return 0;
+
+    uint64_t handle = contract_state_create(hex_c);
+    (*env)->ReleaseStringUTFChars(env, stateHex, hex_c);
+    return (jlong)handle;
+}
+
+/*
+ * Free a contract state handle.
+ */
+JNIEXPORT void JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeStateFree(
+    JNIEnv* env, jclass clazz, jlong handle) {
+    contract_state_free((uint64_t)handle);
+}
+
+/*
+ * Contract query — execute opcodes against contract state via Rust VM.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeContractQuery(
+    JNIEnv* env, jclass clazz, jlong handle, jstring opcodesJson) {
+
+    if (opcodesJson == NULL) return NULL;
+
+    const char* ops_c = (*env)->GetStringUTFChars(env, opcodesJson, NULL);
+    if (ops_c == NULL) return NULL;
+
+    const char* result = contract_query((uint64_t)handle, ops_c);
+    (*env)->ReleaseStringUTFChars(env, opcodesJson, ops_c);
+
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    contract_free_string((char*)result);
+    return jresult;
+}
+
+/*
+ * Persistent hash — SHA-256 for Compact contracts.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativePersistentHash(
+    JNIEnv* env, jclass clazz, jstring inputHex) {
+
+    if (inputHex == NULL) return NULL;
+
+    const char* input_c = (*env)->GetStringUTFChars(env, inputHex, NULL);
+    if (input_c == NULL) return NULL;
+
+    const char* result = contract_persistent_hash(input_c);
+    (*env)->ReleaseStringUTFChars(env, inputHex, input_c);
+
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    contract_free_string((char*)result);
     return jresult;
 }
 

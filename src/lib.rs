@@ -52,6 +52,9 @@ pub mod fee_ffi;
 // Local ZK proving FFI (Phase 4C)
 pub mod prove_ffi;
 
+// Contract operations FFI (Phase 6)
+pub mod contract_ffi;
+
 // Key validity tests
 #[cfg(test)]
 mod test_key_validity;
