@@ -145,6 +145,7 @@ extern const char* contract_persistent_hash_aligned(const char* aligned_value_js
 extern const char* contract_big_int_to_value(const char* bigint_str);
 extern const char* contract_value_to_big_int(const char* value_json);
 extern void contract_free_string(char* ptr);
+extern const char* contract_assemble_call_tx(const char* params_json);
 
 /* Transaction signing (Phase 2D-FFI) */
 extern void* create_signing_key(const uint8_t* private_key_ptr, size_t private_key_len);
@@ -2734,6 +2735,29 @@ Java_com_midnight_kuira_core_compact_ContractRuntime_nativeValueToBigInt(
 
     const char* result = contract_value_to_big_int(json_c);
     (*env)->ReleaseStringUTFChars(env, valueJson, json_c);
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    contract_free_string((char*)result);
+    return jresult;
+}
+
+/*
+ * Assemble a contract call transaction from circuit execution output.
+ * Takes JSON with proof data, returns hex-encoded serialized UnprovenTransaction.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeAssembleContractCallTx(
+    JNIEnv* env, jclass clazz, jstring paramsJson) {
+
+    if (paramsJson == NULL) return NULL;
+
+    const char* params_c = (*env)->GetStringUTFChars(env, paramsJson, NULL);
+    if (params_c == NULL) return NULL;
+
+    const char* result = contract_assemble_call_tx(params_c);
+    (*env)->ReleaseStringUTFChars(env, paramsJson, params_c);
+
     if (result == NULL) return NULL;
 
     jstring jresult = (*env)->NewStringUTF(env, result);
