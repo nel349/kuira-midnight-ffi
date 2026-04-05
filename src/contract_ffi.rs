@@ -959,10 +959,31 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
         }
     };
 
+    // SCALE round-trip the ops to normalize internal storage state.
+    // Manually-constructed Op types may have different Sp/Arena state
+    // than ops produced through the Storable infrastructure, which causes
+    // field_repr encoding differences during proving.
+    let normalized_ops: Vec<Op<ResultModeVerify, InMemoryDB>> = {
+        let mut buf = Vec::new();
+        for op in &transcript_ops {
+            midnight_serialize::Serializable::serialize(op, &mut buf)
+                .map_err(|e| format!("op SCALE serialize: {:?}", e))?;
+        }
+        let mut reader = &buf[..];
+        let mut normalized = Vec::new();
+        for _ in 0..transcript_ops.len() {
+            let op: Op<ResultModeVerify, InMemoryDB> =
+                midnight_serialize::Deserializable::deserialize(&mut reader, 0)
+                    .map_err(|e| format!("op SCALE deserialize: {:?}", e))?;
+            normalized.push(op);
+        }
+        normalized
+    };
+
     let transcript = Transcript::<InMemoryDB> {
         gas,
         effects,
-        program: transcript_ops.into_iter().collect(),
+        program: normalized_ops.into_iter().collect(),
         version: Some(Sp::new(Transcript::<InMemoryDB>::VERSION)),
     };
 
