@@ -106,21 +106,19 @@ pub extern "C" fn contract_state_free(handle: u64) {
 
 // ── ContractState.query() ──
 
-/// Execute opcodes against a contract state (by handle) and return events.
+/// Execute opcodes against a contract state (by handle) and return events + gas.
 ///
-/// Input:
-///   handle: state handle from contract_state_create
-///   opcodes_json: array of Op (JSON via serde)
+/// Uses QueryContext::query() (not ContractStateExt::query()) to preserve gas info.
 ///
-/// Output:
-///   JSON: { "handle": <new_handle>, "events": [...] }
-///   The old handle is consumed (state is updated).
-///   or { "error": "..." } on failure
+/// Output JSON: { "handle": N, "events": [...], "gas": { "readTime": N, "computeTime": N, "bytesWritten": N, "bytesDeleted": N } }
+/// or { "error": "..." } on failure
 #[no_mangle]
 pub extern "C" fn contract_query(
     handle: u64,
     opcodes_json: *const c_char,
 ) -> *const c_char {
+    use midnight_onchain_runtime::context::QueryContext;
+
     let opcodes_str = match unsafe { c_str_to_str(opcodes_json) } {
         Some(s) => s,
         None => return std::ptr::null(),
@@ -128,7 +126,7 @@ pub extern "C" fn contract_query(
 
     // Get state from pool
     let state = {
-        let mut pool = STATE_POOL.lock().unwrap();
+        let pool = STATE_POOL.lock().unwrap();
         match pool.get(&handle).cloned() {
             Some(s) => s,
             None => return to_c_string("{\"error\":\"invalid state handle\"}"),
@@ -139,27 +137,44 @@ pub extern "C" fn contract_query(
     let ops: Vec<Op<ResultModeGather, InMemoryDB>> =
         match serde_json::from_str(opcodes_str) {
             Ok(o) => o,
-            Err(e) => {
-                // Put state back
-                STATE_POOL.lock().unwrap().insert(handle, state);
-                return to_c_string(&format!("{{\"error\":\"opcodes deserialize: {}\"}}", e));
-            }
+            Err(e) => return to_c_string(&format!("{{\"error\":\"opcodes deserialize: {}\"}}", e)),
         };
 
-    // Execute query with initial cost model
-    match state.query(&ops, &INITIAL_COST_MODEL) {
-        Ok((new_state, events)) => {
-            // Store new state, get new handle
-            // Update existing handle with new state
+    // Build QueryContext from state (same as ContractStateExt::query but preserves gas)
+    let qc = QueryContext::<InMemoryDB> {
+        state: state.data.clone(),
+        address: Default::default(),
+        effects: Default::default(),
+        call_context: Default::default(),
+    };
+
+    // Execute query — returns gas_cost
+    match qc.query(&ops, None, &INITIAL_COST_MODEL) {
+        Ok(results) => {
+            // Build new ContractState from results
+            let new_state = RustContractState {
+                data: results.context.state,
+                ..state
+            };
             STATE_POOL.lock().unwrap().insert(handle, new_state);
 
-            // Serialize events to JSON (serde)
-            let events_json = match serde_json::to_string(&events) {
+            // Serialize events
+            let events_json = match serde_json::to_string(&results.events) {
                 Ok(s) => s,
                 Err(e) => return to_c_string(&format!("{{\"error\":\"events serialize: {}\"}}", e)),
             };
 
-            to_c_string(&format!("{{\"handle\":{},\"events\":{}}}", handle, events_json))
+            // Serialize gas cost
+            let gas = &results.gas_cost;
+            let gas_json = match serde_json::to_string(gas) {
+                Ok(s) => s,
+                Err(e) => return to_c_string(&format!("{{\"error\":\"gas serialize: {}\"}}", e)),
+            };
+
+            to_c_string(&format!(
+                "{{\"handle\":{},\"events\":{},\"gas\":{}}}",
+                handle, events_json, gas_json,
+            ))
         }
         Err(e) => {
             to_c_string(&format!("{{\"error\":\"query failed: {:?}\"}}", e))
@@ -388,6 +403,21 @@ mod tests {
             contract_free_string(result as *mut c_char);
         }
     }
+}
+
+/// Clone a contract state handle (for saving initial state before queries).
+#[no_mangle]
+pub extern "C" fn contract_state_clone(handle: u64) -> u64 {
+    let pool = STATE_POOL.lock().unwrap();
+    let state = match pool.get(&handle) {
+        Some(s) => s.clone(),
+        None => return 0,
+    };
+    drop(pool);
+
+    let new_handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    STATE_POOL.lock().unwrap().insert(new_handle, state);
+    new_handle
 }
 
 /// Create a ContractState with an array of N null slots.
@@ -798,6 +828,47 @@ fn parse_state_value(val: &serde_json::Value) -> Result<midnight_onchain_state::
         serde_json::to_string(val).unwrap_or_default().chars().take(100).collect::<String>()))
 }
 
+/// Convert ResultModeVerify ops to ResultModeGather for re-execution.
+/// Strips popeq.result (AlignedValue → ()) since the VM recomputes results.
+fn convert_verify_to_gather(
+    ops: &[Op<midnight_onchain_vm::result_mode::ResultModeVerify, InMemoryDB>],
+) -> Vec<Op<ResultModeGather, InMemoryDB>> {
+    ops.iter().map(|op| match op {
+        Op::Dup { n } => Op::Dup { n: *n },
+        Op::Pop => Op::Pop,
+        Op::Popeq { cached, .. } => Op::Popeq { cached: *cached, result: () },
+        Op::Push { storage, value } => Op::Push { storage: *storage, value: value.clone() },
+        Op::Idx { cached, push_path, path } => Op::Idx {
+            cached: *cached, push_path: *push_path, path: path.clone(),
+        },
+        Op::Ins { cached, n } => Op::Ins { cached: *cached, n: *n },
+        Op::Lt => Op::Lt,
+        Op::Eq => Op::Eq,
+        Op::Add => Op::Add,
+        Op::Sub => Op::Sub,
+        Op::Neg => Op::Neg,
+        Op::And => Op::And,
+        Op::Or => Op::Or,
+        Op::Type => Op::Type,
+        Op::Size => Op::Size,
+        Op::New => Op::New,
+        Op::Log => Op::Log,
+        Op::Root => Op::Root,
+        Op::Pop => Op::Pop,
+        Op::Member => Op::Member,
+        Op::Ckpt => Op::Ckpt,
+        Op::Noop { n } => Op::Noop { n: *n },
+        Op::Branch { skip } => Op::Branch { skip: *skip },
+        Op::Jmp { skip } => Op::Jmp { skip: *skip },
+        Op::Concat { cached, n } => Op::Concat { cached: *cached, n: *n },
+        Op::Swap { n } => Op::Swap { n: *n },
+        Op::Rem { cached } => Op::Rem { cached: *cached },
+        Op::Addi { immediate } => Op::Addi { immediate: *immediate },
+        Op::Subi { immediate } => Op::Subi { immediate: *immediate },
+        _ => Op::Noop { n: 0 }, // Unknown ops → noop (shouldn't happen)
+    }).collect()
+}
+
 fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     use midnight_onchain_vm::result_mode::ResultModeVerify;
     use midnight_onchain_runtime::transcript::{Transcript, TranscriptVersion};
@@ -826,6 +897,8 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
         .ok_or("missing entry_point")?;
     let state_handle = params["state_handle"].as_u64()
         .ok_or("missing state_handle")?;
+    let initial_state_handle = params["initial_state_handle"].as_u64()
+        .ok_or("missing initial_state_handle")?;
 
     let proof_data = &params["proof_data"];
 
@@ -852,25 +925,48 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     let transcript_ops = parse_transcript_ops(transcript_array)
         .map_err(|e| format!("transcript parse: {}", e))?;
 
-    // 5. Construct Transcript
-    //    Gas and effects are defaulted — correct values will be computed
-    //    during proving/verification. For tx assembly, defaults suffice.
+    // 5. Compute correct gas by re-executing transcript ops against initial state.
+    //    The prover embeds gas into the binding_input hash — zeroed gas = proof rejection.
+    //    We use QueryContext::query() (not ContractStateExt::query()) to preserve gas.
+    let (gas, effects) = {
+        use midnight_onchain_runtime::context::QueryContext;
+
+        let pool = STATE_POOL.lock().map_err(|e| format!("lock: {}", e))?;
+        let initial_state = pool.get(&initial_state_handle)
+            .ok_or(format!("invalid initial_state_handle: {}", initial_state_handle))?;
+
+        // Also validate the final state handle
+        if !pool.contains_key(&state_handle) {
+            return Err(format!("invalid state_handle: {}", state_handle));
+        }
+
+        // Convert Verify-mode ops to Gather-mode for re-execution
+        // (strip popeq results — the VM will recompute them)
+        let gather_ops = convert_verify_to_gather(&transcript_ops);
+
+        let qc = QueryContext::<InMemoryDB> {
+            state: initial_state.data.clone(),
+            address: Default::default(),
+            effects: Default::default(),
+            call_context: Default::default(),
+        };
+
+        match qc.query(&gather_ops, None, &INITIAL_COST_MODEL) {
+            Ok(results) => {
+                (results.gas_cost, results.context.effects)
+            }
+            Err(e) => return Err(format!("gas re-execution failed: {:?}", e)),
+        }
+    };
+
     let transcript = Transcript::<InMemoryDB> {
-        gas: RunningCost::default(),
-        effects: Effects::default(),
+        gas,
+        effects,
         program: transcript_ops.into_iter().collect(),
         version: Some(Sp::new(Transcript::<InMemoryDB>::VERSION)),
     };
 
-    // 6. Validate state handle exists, get ContractOperation
-    //    Operations are set with no verifier key during circuit execution.
-    //    The verifier key is loaded separately during proving.
-    {
-        let pool = STATE_POOL.lock().map_err(|e| format!("lock: {}", e))?;
-        if !pool.contains_key(&state_handle) {
-            return Err(format!("invalid state handle: {}", state_handle));
-        }
-    }
+    // 6. ContractOperation (verifier key loaded separately during proving)
     let op = ContractOperation::new(None);
 
     // 7. Build ContractCallPrototype

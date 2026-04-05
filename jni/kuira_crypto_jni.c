@@ -146,6 +146,7 @@ extern const char* contract_big_int_to_value(const char* bigint_str);
 extern const char* contract_value_to_big_int(const char* value_json);
 extern void contract_free_string(char* ptr);
 extern const char* contract_assemble_call_tx(const char* params_json);
+extern uint64_t contract_state_clone(uint64_t handle);
 
 /* Transaction signing (Phase 2D-FFI) */
 extern void* create_signing_key(const uint8_t* private_key_ptr, size_t private_key_len);
@@ -2740,6 +2741,15 @@ Java_com_midnight_kuira_core_compact_ContractRuntime_nativeValueToBigInt(
     jstring jresult = (*env)->NewStringUTF(env, result);
     contract_free_string((char*)result);
     return jresult;
+}
+
+/*
+ * Clone a contract state handle (for saving initial state before queries).
+ */
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeStateClone(
+    JNIEnv* env, jclass clazz, jlong handle) {
+    return (jlong)contract_state_clone((uint64_t)handle);
 }
 
 /*
