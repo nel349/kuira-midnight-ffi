@@ -139,6 +139,9 @@ extern const char* contract_state_serialize(uint64_t handle);
 extern void contract_state_free(uint64_t handle);
 extern const char* contract_query(uint64_t handle, const char* opcodes_json);
 extern const char* contract_persistent_hash(const char* input_hex);
+extern const char* contract_persistent_hash_aligned(const char* aligned_value_json);
+extern const char* contract_big_int_to_value(const char* bigint_str);
+extern const char* contract_value_to_big_int(const char* value_json);
 extern void contract_free_string(char* ptr);
 
 /* Transaction signing (Phase 2D-FFI) */
@@ -2633,20 +2636,78 @@ Java_com_midnight_kuira_core_compact_ContractRuntime_nativeContractQuery(
 }
 
 /*
- * Persistent hash — SHA-256 for Compact contracts.
+ * Persistent hash — SHA-256 for Compact contracts (raw bytes).
  */
 JNIEXPORT jstring JNICALL
 Java_com_midnight_kuira_core_compact_ContractRuntime_nativePersistentHash(
     JNIEnv* env, jclass clazz, jstring inputHex) {
 
     if (inputHex == NULL) return NULL;
-
     const char* input_c = (*env)->GetStringUTFChars(env, inputHex, NULL);
     if (input_c == NULL) return NULL;
 
     const char* result = contract_persistent_hash(input_c);
     (*env)->ReleaseStringUTFChars(env, inputHex, input_c);
+    if (result == NULL) return NULL;
 
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    contract_free_string((char*)result);
+    return jresult;
+}
+
+/*
+ * Persistent hash with proper AlignedValue encoding (matches WASM).
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativePersistentHashAligned(
+    JNIEnv* env, jclass clazz, jstring alignedValueJson) {
+
+    if (alignedValueJson == NULL) return NULL;
+    const char* json_c = (*env)->GetStringUTFChars(env, alignedValueJson, NULL);
+    if (json_c == NULL) return NULL;
+
+    const char* result = contract_persistent_hash_aligned(json_c);
+    (*env)->ReleaseStringUTFChars(env, alignedValueJson, json_c);
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    contract_free_string((char*)result);
+    return jresult;
+}
+
+/*
+ * BigInt to Value encoding.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeBigIntToValue(
+    JNIEnv* env, jclass clazz, jstring bigintStr) {
+
+    if (bigintStr == NULL) return NULL;
+    const char* str_c = (*env)->GetStringUTFChars(env, bigintStr, NULL);
+    if (str_c == NULL) return NULL;
+
+    const char* result = contract_big_int_to_value(str_c);
+    (*env)->ReleaseStringUTFChars(env, bigintStr, str_c);
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    contract_free_string((char*)result);
+    return jresult;
+}
+
+/*
+ * Value to BigInt decoding.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeValueToBigInt(
+    JNIEnv* env, jclass clazz, jstring valueJson) {
+
+    if (valueJson == NULL) return NULL;
+    const char* json_c = (*env)->GetStringUTFChars(env, valueJson, NULL);
+    if (json_c == NULL) return NULL;
+
+    const char* result = contract_value_to_big_int(json_c);
+    (*env)->ReleaseStringUTFChars(env, valueJson, json_c);
     if (result == NULL) return NULL;
 
     jstring jresult = (*env)->NewStringUTF(env, result);

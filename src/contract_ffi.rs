@@ -230,28 +230,33 @@ pub extern "C" fn contract_persistent_hash_aligned(
     }
 }
 
-/// Convert a BigInt (as decimal string) to a Value (JSON).
-/// Matches the WASM's bigIntToValue.
+/// Convert a BigInt (as hex string) to a Value (JSON).
+/// Matches the WASM's bigIntToValue exactly — uses Fr::from_le_bytes.
 #[no_mangle]
 pub extern "C" fn contract_big_int_to_value(
-    bigint_str: *const c_char,
+    bigint_hex: *const c_char,
 ) -> *const c_char {
-    let s = match unsafe { c_str_to_str(bigint_str) } {
+    use midnight_transient_crypto::curve::Fr;
+
+    let s = match unsafe { c_str_to_str(bigint_hex) } {
         Some(s) => s,
         None => return std::ptr::null(),
     };
 
-    // Parse as big integer, encode as 32-byte LE field element
-    let n: u128 = match s.parse() {
-        Ok(n) => n,
-        Err(e) => return to_c_string(&format!("{{\"error\":\"parse: {}\"}}", e)),
+    // Parse hex string to bytes (same as WASM: hex → LE bytes → Fr)
+    let padded = if s.len() % 2 == 1 { format!("0{}", s) } else { s.to_string() };
+    let mut bytes = match hex::decode(&padded) {
+        Ok(b) => b,
+        Err(e) => return to_c_string(&format!("{{\"error\":\"hex decode: {}\"}}", e)),
+    };
+    bytes.reverse(); // big-endian hex → little-endian bytes
+
+    let fr = match Fr::from_le_bytes(&bytes) {
+        Some(fr) => fr,
+        None => return to_c_string("{\"error\":\"out of bounds for prime field\"}"),
     };
 
-    let mut bytes = vec![0u8; 32];
-    let n_bytes = n.to_le_bytes();
-    bytes[..n_bytes.len()].copy_from_slice(&n_bytes);
-
-    let value = Value(vec![midnight_base_crypto::fab::ValueAtom(bytes)]);
+    let value = Value::from(fr);
     match serde_json::to_string(&value) {
         Ok(s) => to_c_string(&s),
         Err(e) => to_c_string(&format!("{{\"error\":\"serialize: {}\"}}", e)),
@@ -381,6 +386,91 @@ mod tests {
         unsafe {
             contract_free_string(value_json as *mut c_char);
             contract_free_string(result as *mut c_char);
+        }
+    }
+}
+
+/// Create a ContractState with an array of N null slots.
+/// Returns a handle for subsequent query() calls.
+#[no_mangle]
+pub extern "C" fn contract_state_create_with_nulls(num_slots: u32) -> u64 {
+    use midnight_onchain_state::state::{
+        ContractState as RustCS, ChargedState as RustChargedState,
+        StateValue as RustSV, ContractOperation as RustCO,
+    };
+    use midnight_storage::db::InMemoryDB;
+
+    // Build array of N null StateValues
+    let items: Vec<RustSV<InMemoryDB>> = (0..num_slots)
+        .map(|_| RustSV::Null)
+        .collect();
+    let array = RustSV::Array(items.into());
+    let charged = RustChargedState::new(array);
+
+    let mut state = RustCS::default();
+    state.data = charged;
+
+    let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    STATE_POOL.lock().unwrap().insert(handle, state);
+    handle
+}
+
+/// Set an operation on a contract state (by handle).
+/// operation_name: e.g. "post", "takeDown"
+#[no_mangle]
+pub extern "C" fn contract_state_set_operation(
+    handle: u64,
+    operation_name: *const c_char,
+) {
+    let name = match unsafe { c_str_to_str(operation_name) } {
+        Some(s) => s,
+        None => return,
+    };
+
+    let mut pool = STATE_POOL.lock().unwrap();
+    if let Some(state) = pool.get_mut(&handle) {
+        use midnight_onchain_state::state::{ContractOperation, EntryPointBuf};
+        let ep = EntryPointBuf::from(name.as_bytes());
+        state.operations.insert(ep, ContractOperation::new(None));
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn test_create_state_with_nulls() {
+        let handle = contract_state_create_with_nulls(4);
+        assert!(handle > 0);
+
+        // Set operations
+        let op1 = CString::new("post").unwrap();
+        contract_state_set_operation(handle, op1.as_ptr());
+        let op2 = CString::new("takeDown").unwrap();
+        contract_state_set_operation(handle, op2.as_ptr());
+
+        // First: get the proper encoding of 0 as a field element
+        let zero_hex = CString::new("0").unwrap();
+        let zero_value_json_ptr = contract_big_int_to_value(zero_hex.as_ptr());
+        assert!(!zero_value_json_ptr.is_null());
+        let zero_value_json = unsafe { CStr::from_ptr(zero_value_json_ptr).to_str().unwrap() };
+        println!("bigIntToValue(0): {}", zero_value_json);
+
+        // Just do a simple dup — should succeed since the state exists
+        let opcodes = r#"[{"dup":{"n":0}}]"#.to_string();
+        unsafe { contract_free_string(zero_value_json_ptr as *mut c_char); }
+        let ops_c = CString::new(opcodes).unwrap();
+        let result = contract_query(handle, ops_c.as_ptr());
+
+        if !result.is_null() {
+            let result_str = unsafe { CStr::from_ptr(result).to_str().unwrap() };
+            println!("Query result: {}", result_str);
+            assert!(!result_str.contains("error"), "Query failed: {}", result_str);
+            unsafe { contract_free_string(result as *mut c_char); }
+        } else {
+            panic!("contract_query returned null");
         }
     }
 }
