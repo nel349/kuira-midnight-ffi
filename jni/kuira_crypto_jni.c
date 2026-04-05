@@ -135,6 +135,8 @@ extern void free_proven_string(char* ptr);
 
 /* Contract runtime (Phase 6) */
 extern uint64_t contract_state_create(const char* state_hex);
+extern uint64_t contract_state_create_with_nulls(uint32_t num_slots);
+extern void contract_state_set_operation(uint64_t handle, const char* name);
 extern const char* contract_state_serialize(uint64_t handle);
 extern void contract_state_free(uint64_t handle);
 extern const char* contract_query(uint64_t handle, const char* opcodes_json);
@@ -2586,6 +2588,30 @@ Java_com_midnight_kuira_core_crypto_proving_LocalProver_nativeProveTransactionLo
 
     LOGI("Local proving succeeded");
     return jresult;
+}
+
+/*
+ * Create a contract state with N null slots.
+ */
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeStateCreateWithNulls(
+    JNIEnv* env, jclass clazz, jint numSlots) {
+    return (jlong)contract_state_create_with_nulls((uint32_t)numSlots);
+}
+
+/*
+ * Set an operation on a contract state.
+ */
+JNIEXPORT void JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeStateSetOperation(
+    JNIEnv* env, jclass clazz, jlong handle, jstring operationName) {
+
+    if (operationName == NULL) return;
+    const char* name_c = (*env)->GetStringUTFChars(env, operationName, NULL);
+    if (name_c == NULL) return;
+
+    contract_state_set_operation((uint64_t)handle, name_c);
+    (*env)->ReleaseStringUTFChars(env, operationName, name_c);
 }
 
 /*

@@ -474,3 +474,98 @@ mod state_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+    use midnight_onchain_vm::ops::Op;
+    use midnight_onchain_vm::result_mode::ResultModeGather;
+    use midnight_storage::db::InMemoryDB;
+    use midnight_base_crypto::fab::{AlignedValue, Value, ValueAtom, Alignment, AlignmentSegment, AlignmentAtom};
+
+    #[test]
+    fn print_op_json_formats() {
+        // Create various Op types and print their JSON serialization
+
+        // 1. dup
+        let dup: Op<ResultModeGather, InMemoryDB> = Op::Dup { n: 0 };
+        println!("dup: {}", serde_json::to_string(&dup).unwrap());
+
+        // 2. popeq
+        let popeq: Op<ResultModeGather, InMemoryDB> = Op::Popeq { cached: false, result: () };
+        println!("popeq: {}", serde_json::to_string(&popeq).unwrap());
+
+        // 3. push with null
+        let push_null: Op<ResultModeGather, InMemoryDB> = Op::Push {
+            storage: false,
+            value: midnight_onchain_state::state::StateValue::Null,
+        };
+        println!("push(null): {}", serde_json::to_string(&push_null).unwrap());
+
+        // 4. ins
+        let ins: Op<ResultModeGather, InMemoryDB> = Op::Ins { cached: true, n: 1 };
+        println!("ins: {}", serde_json::to_string(&ins).unwrap());
+
+        // 5. pop
+        let pop: Op<ResultModeGather, InMemoryDB> = Op::Pop;
+        println!("pop: {}", serde_json::to_string(&pop).unwrap());
+
+        // 6. idx with a field value key
+        use midnight_transient_crypto::curve::Fr;
+        let zero_fr = Fr::from_le_bytes(&[0u8]).unwrap();
+        let zero_value = Value::from(zero_fr);
+        let field_align = Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Field)]);
+        let key = midnight_onchain_vm::ops::Key::Value(AlignedValue {
+            value: zero_value,
+            alignment: field_align,
+        });
+
+        let idx: Op<ResultModeGather, InMemoryDB> = Op::Idx {
+            cached: false,
+            push_path: false,
+            path: vec![key].into_iter().collect(),
+        };
+        println!("idx: {}", serde_json::to_string(&idx).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod value_format_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn print_value_formats() {
+        // 0
+        let z = CString::new("0").unwrap();
+        let r = contract_big_int_to_value(z.as_ptr());
+        let s = unsafe { std::ffi::CStr::from_ptr(r).to_str().unwrap() };
+        println!("bigIntToValue(0): {}", s);
+        unsafe { contract_free_string(r as *mut c_char); }
+
+        // 1
+        let z = CString::new("1").unwrap();
+        let r = contract_big_int_to_value(z.as_ptr());
+        let s = unsafe { std::ffi::CStr::from_ptr(r).to_str().unwrap() };
+        println!("bigIntToValue(1): {}", s);
+        unsafe { contract_free_string(r as *mut c_char); }
+
+        // 42
+        let z = CString::new("2a").unwrap();
+        let r = contract_big_int_to_value(z.as_ptr());
+        let s = unsafe { std::ffi::CStr::from_ptr(r).to_str().unwrap() };
+        println!("bigIntToValue(42): {}", s);
+        unsafe { contract_free_string(r as *mut c_char); }
+    }
+
+    #[test]
+    #[test]
+    fn print_state_value_format() {
+        use midnight_onchain_state::state::StateValue;
+        use midnight_storage::db::InMemoryDB;
+        let null_sv: StateValue<InMemoryDB> = StateValue::Null;
+        println!("StateValue::Null: {}", serde_json::to_string(&null_sv).unwrap());
+        let arr_sv: StateValue<InMemoryDB> = StateValue::Array(vec![StateValue::Null].into());
+        println!("StateValue::Array[null]: {}", serde_json::to_string(&arr_sv).unwrap());
+    }
+}
