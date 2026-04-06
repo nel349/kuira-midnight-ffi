@@ -1161,7 +1161,9 @@ mod hash_debug_tests {
         // _publicKey_0(secretKey, posterCount) = persistentHash(vector3_bytes32, [prefix, sequence, sk])
         let mut prefix = vec![98u8, 98, 111, 97, 114, 100, 58, 112, 107, 58]; // "bboard:pk:"
         prefix.resize(32, 0);
-        let sequence: Vec<u8> = vec![0; 32]; // poster count = 0
+        // poster count = 1 (initialState increments from 0 via addi{1})
+        let mut sequence: Vec<u8> = vec![0; 32];
+        sequence[0] = 1; // LE encoding of 1
         let secret_key: Vec<u8> = (1..=32).collect(); // test secret key
 
         let json = format!(
