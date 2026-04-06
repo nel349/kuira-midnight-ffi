@@ -884,7 +884,6 @@ fn convert_verify_to_gather(
         Op::New => Op::New,
         Op::Log => Op::Log,
         Op::Root => Op::Root,
-        Op::Pop => Op::Pop,
         Op::Member => Op::Member,
         Op::Ckpt => Op::Ckpt,
         Op::Noop { n } => Op::Noop { n: *n },
@@ -1062,6 +1061,33 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     let mut bytes = Vec::new();
     midnight_serialize::tagged_serialize(&(&tx, &proving_keys), &mut bytes)
         .map_err(|e| format!("serialize: {:?}", e))?;
+
+    // Debug: round-trip and extract proof preimage to check public_transcript_inputs
+    {
+        type UnTx = Transaction<Signature, ProofPreimageMarker, midnight_transient_crypto::commitment::PedersenRandomness, InMemoryDB>;
+        type Payload = (UnTx, std::collections::HashMap<String, midnight_transient_crypto::proofs::ProvingKeyMaterial>);
+        let (tx2, _): Payload = midnight_serialize::tagged_deserialize(&mut &bytes[..])
+            .map_err(|e| format!("debug deser: {:?}", e))?;
+
+        if let Transaction::Standard(ref std_tx) = tx2 {
+            for intent_sp in std_tx.intents.values() {
+                for action_sp in intent_sp.actions.iter() {
+                    if let midnight_ledger::structure::ContractAction::Call(ref call_sp) = *action_sp {
+                        if let midnight_ledger::structure::ProofPreimageVersioned::V2(ref preimage) = call_sp.proof {
+                            let pti = &preimage.public_transcript_inputs;
+                            return Err(format!(
+                                "PREIMAGE_DEBUG: pti_len={}, pti[25]={:?}, pti[26]={:?}, pti[27]={:?}",
+                                pti.len(),
+                                pti.get(25).map(|f| format!("{:?}", f)),
+                                pti.get(26).map(|f| format!("{:?}", f)),
+                                pti.get(27).map(|f| format!("{:?}", f)),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     Ok(hex::encode(&bytes))
 }
@@ -1252,5 +1278,96 @@ mod hash_debug_tests {
         println!("First field chunk LE: first few bytes = {:02x?}", &parsed[0][..4]);
 
         unsafe { contract_free_string(result as *mut c_char); }
+    }
+}
+
+#[cfg(test)]
+mod prove_debug_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_prove_our_tx_locally() {
+        // Load the tx hex captured from Android
+        let tx_hex = include_str!("/tmp/android_tx.hex").trim();
+        println!("TX hex: {} chars = {} bytes", tx_hex.len(), tx_hex.len() / 2);
+
+        // Deserialize and inspect the proof preimage
+        {
+            let tx_bytes = hex::decode(tx_hex).unwrap();
+            use midnight_ledger::structure::{Transaction, ProofPreimageMarker, ContractAction};
+            use midnight_base_crypto::signatures::Signature;
+            use midnight_transient_crypto::commitment::PedersenRandomness;
+            use midnight_storage::db::InMemoryDB;
+
+            type UnTx = Transaction<Signature, ProofPreimageMarker, PedersenRandomness, InMemoryDB>;
+            type Payload = (UnTx, std::collections::HashMap<String, midnight_transient_crypto::proofs::ProvingKeyMaterial>);
+            let (tx, _): Payload = midnight_serialize::tagged_deserialize(&mut &tx_bytes[..]).unwrap();
+
+            if let Transaction::Standard(ref std_tx) = tx {
+                for intent in std_tx.intents.values() {
+                    for action in intent.actions.iter() {
+                        if let ContractAction::Call(ref call_sp) = *action {
+                            if let midnight_ledger::structure::ProofPreimageVersioned::V2(ref preimage) = call_sp.proof {
+                                let pti = &preimage.public_transcript_inputs;
+                                let pto = &preimage.public_transcript_outputs;
+                                let pi = &preimage.inputs;
+                                let pt = &preimage.private_transcript;
+                                println!("ProofPreimage:");
+                                println!("  inputs: {} elements", pi.len());
+                                println!("  private_transcript: {} elements", pt.len());
+                                println!("  public_transcript_inputs: {} elements", pti.len());
+                                println!("  public_transcript_outputs: {} elements", pto.len());
+                                println!("  key_location: {:?}", preimage.key_location);
+                                // Dump ALL pti
+                                for (i, fr) in pti.iter().enumerate() {
+                                    println!("  pti[{}] = {:?}", i, fr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Use the bboard keys from the source repo
+        let keys_dir = PathBuf::from("/Users/norman/Development/midnight/midnight-libraries/example-bboard/contract/src/managed/bboard");
+        
+        // Manually create a combined keys directory
+        let tmp_keys = PathBuf::from("/tmp/prove_test_keys");
+        std::fs::create_dir_all(&tmp_keys).unwrap();
+        
+        // Copy bzkir and keys
+        for name in ["post.prover", "post.verifier"] {
+            let src = keys_dir.join("keys").join(name);
+            let dst = tmp_keys.join(name);
+            if src.exists() && !dst.exists() { std::fs::copy(&src, &dst).unwrap(); }
+        }
+        let src = keys_dir.join("zkir/post.bzkir");
+        let dst = tmp_keys.join("post.bzkir");
+        if src.exists() && !dst.exists() { std::fs::copy(&src, &dst).unwrap(); }
+        
+        // Copy BLS params
+        for k in [13, 14, 15] {
+            let name = format!("bls_midnight_2p{}", k);
+            let src = PathBuf::from(format!("/tmp/bls_params/{}", name));
+            let dst = tmp_keys.join(&name);
+            if src.exists() && !dst.exists() { std::fs::copy(&src, &dst).unwrap(); }
+        }
+        
+        // Try proving
+        let keys_c = std::ffi::CString::new(tmp_keys.to_str().unwrap()).unwrap();
+        let tx_c = std::ffi::CString::new(tx_hex).unwrap();
+        
+        let result = unsafe { 
+            crate::prove_ffi::zkir_prove_transaction_local(tx_c.as_ptr(), keys_c.as_ptr())
+        };
+        
+        if result.is_null() {
+            println!("Proving returned null — check stderr for details");
+        } else {
+            let result_str = unsafe { std::ffi::CStr::from_ptr(result).to_str().unwrap() };
+            println!("Proving result: {} chars", result_str.len());
+        }
     }
 }
