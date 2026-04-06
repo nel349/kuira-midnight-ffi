@@ -631,9 +631,32 @@ fn parse_aligned_value(val: &serde_json::Value) -> Result<AlignedValue, String> 
         .map(|a| parse_alignment_segment(a))
         .collect::<Result<_, _>>()?;
 
-    // Construct directly — bypasses the serde try_from validation
+    // Truncate value atoms to match alignment sizes.
+    // JS compact-runtime encodes values via bigIntToValue (32-byte Fr) even for
+    // Bytes(N) alignments where N < 32. The Midnight VM internally truncates,
+    // but our manual construction bypasses that. Without truncation,
+    // field_repr_unchecked underflows on prepend_zeros (length/31 - actual/31).
+    let truncated_atoms: Vec<ValueAtom> = value_atoms.into_iter()
+        .zip(segments.iter().chain(std::iter::repeat(&AlignmentSegment::Atom(AlignmentAtom::Field))))
+        .map(|(atom, seg)| {
+            match seg {
+                AlignmentSegment::Atom(AlignmentAtom::Bytes { length }) => {
+                    let max_len = *length as usize;
+                    if atom.0.len() > max_len {
+                        ValueAtom(atom.0[..max_len].to_vec())
+                    } else {
+                        atom
+                    }
+                }
+                AlignmentSegment::Atom(AlignmentAtom::Compress) |
+                AlignmentSegment::Atom(AlignmentAtom::Field) => atom,
+                _ => atom,
+            }
+        })
+        .collect();
+
     Ok(AlignedValue {
-        value: Value(value_atoms),
+        value: Value(truncated_atoms),
         alignment: Alignment(segments),
     })
 }
