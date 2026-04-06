@@ -1156,6 +1156,46 @@ mod hash_debug_tests {
     use std::ffi::{CString, CStr};
 
     #[test]
+    fn test_op7_field_repr() {
+        // Reproduce op[7] from bboard post circuit:
+        // Push{storage:true, Cell(AlignedValue(Bytes(32), hash_bytes))}
+        use midnight_onchain_vm::result_mode::ResultModeVerify;
+        use midnight_base_crypto::fab::{AlignedValue, Value, ValueAtom, Alignment, AlignmentSegment, AlignmentAtom};
+        use midnight_transient_crypto::repr::FieldRepr;
+        use midnight_storage::arena::Sp;
+
+        // The hash output from our test
+        let hash_bytes: Vec<u8> = vec![
+            136,80,13,71,30,239,232,107,26,38,145,180,222,192,115,255,
+            207,48,109,135,132,108,250,150,111,140,69,164,86,162,243,44
+        ];
+
+        let av = AlignedValue {
+            value: Value(vec![ValueAtom(hash_bytes.clone())]),
+            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 32 })]),
+        };
+        let sv = midnight_onchain_state::state::StateValue::<InMemoryDB>::Cell(Sp::new(av));
+        let op: Op<ResultModeVerify, InMemoryDB> = Op::Push { storage: true, value: sv };
+
+        let mut elements: Vec<midnight_transient_crypto::curve::Fr> = Vec::new();
+        op.field_repr(&mut elements);
+
+        println!("Op[7] field_repr: {} elements", elements.len());
+        for (i, e) in elements.iter().enumerate() {
+            println!("  [{}] = {:?}", i, e);
+        }
+
+        // Position 4 (local) = position 27 (global, from position 23)
+        // This should be the first value chunk
+        assert_eq!(elements.len(), 6, "Push(Cell(Bytes(32))) should be 6 elements");
+
+        // Check specific values
+        println!("Element 3 (alignment Bytes length): {:?}", elements[3]);
+        println!("Element 4 (first value chunk): {:?}", elements[4]);
+        println!("Element 5 (second value chunk): {:?}", elements[5]);
+    }
+
+    #[test]
     fn test_bboard_public_key_hash() {
         // Reproduce the exact hash computation from bboard post circuit:
         // _publicKey_0(secretKey, posterCount) = persistentHash(vector3_bytes32, [prefix, sequence, sk])
