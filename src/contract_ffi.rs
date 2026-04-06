@@ -140,6 +140,13 @@ pub extern "C" fn contract_query(
             Err(e) => return to_c_string(&format!("{{\"error\":\"opcodes deserialize: {}\"}}", e)),
         };
 
+    // Debug: log state data size at this handle
+    {
+        let mut data_buf = Vec::new();
+        let _ = midnight_serialize::Serializable::serialize(&state.data, &mut data_buf);
+        eprintln!("[contract_query] h={} data_bytes={} ops_count={}", handle, data_buf.len(), ops.len());
+    }
+
     // Build QueryContext from state (same as ContractStateExt::query but preserves gas)
     let qc = QueryContext::<InMemoryDB> {
         state: state.data.clone(),
@@ -1380,6 +1387,67 @@ mod prove_debug_tests {
 mod addi_tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn test_full_bboard_flow() {
+        // Simulate the FULL bboard flow: initialState → createCircuitContext → post circuit
+
+        // Step 1: Create state with 4 nulls + operations (like initialState)
+        let handle = contract_state_create_with_nulls(4);
+        let op_post = CString::new("post").unwrap();
+        contract_state_set_operation(handle, op_post.as_ptr());
+        let op_td = CString::new("takeDown").unwrap();
+        contract_state_set_operation(handle, op_td.as_ptr());
+
+        // Step 2: initialState writes (7 queries)
+        // Write state[0] = Cell(enum=0, Bytes(1))
+        let q = CString::new(r#"[{"push":{"storage":false,"value":{"tag":"cell","content":{"value":[[]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}}},{"push":{"storage":true,"value":{"tag":"cell","content":{"value":[[]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}}},{"ins":{"cached":false,"n":1}}]"#).unwrap();
+        let r = contract_query(handle, q.as_ptr());
+        assert!(!r.is_null()); unsafe { contract_free_string(r as *mut c_char); }
+
+        // Write state[1] = Cell(None, complex)
+        let q = CString::new(r#"[{"push":{"storage":false,"value":{"tag":"cell","content":{"value":[[1]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}}},{"push":{"storage":true,"value":{"tag":"cell","content":{"value":[[]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}},{"tag":"atom","value":{"tag":"compress"}}]}}}},{"ins":{"cached":false,"n":1}}]"#).unwrap();
+        let r = contract_query(handle, q.as_ptr());
+        assert!(!r.is_null()); unsafe { contract_free_string(r as *mut c_char); }
+
+        // Write state[2] = Cell(0, Field) [poster count]
+        let q = CString::new(r#"[{"push":{"storage":false,"value":{"tag":"cell","content":{"value":[[2]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}}},{"push":{"storage":true,"value":{"tag":"cell","content":{"value":[[]],"alignment":[{"tag":"atom","value":{"tag":"field"}}]}}}},{"ins":{"cached":false,"n":1}}]"#).unwrap();
+        let r = contract_query(handle, q.as_ptr());
+        assert!(!r.is_null()); unsafe { contract_free_string(r as *mut c_char); }
+
+        // Write state[3] = Cell(zeros, Bytes(32)) [poster key]
+        let q = CString::new(r#"[{"push":{"storage":false,"value":{"tag":"cell","content":{"value":[[3]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}}},{"push":{"storage":true,"value":{"tag":"cell","content":{"value":[[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":32}}]}}}},{"ins":{"cached":false,"n":1}}]"#).unwrap();
+        let r = contract_query(handle, q.as_ptr());
+        assert!(!r.is_null()); unsafe { contract_free_string(r as *mut c_char); }
+
+        // Re-write state[0] again
+        let q = CString::new(r#"[{"push":{"storage":false,"value":{"tag":"cell","content":{"value":[[]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}}},{"push":{"storage":true,"value":{"tag":"cell","content":{"value":[[]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}}},{"ins":{"cached":false,"n":1}}]"#).unwrap();
+        let r = contract_query(handle, q.as_ptr());
+        assert!(!r.is_null()); unsafe { contract_free_string(r as *mut c_char); }
+
+        // Re-write state[1] again
+        let q = CString::new(r#"[{"push":{"storage":false,"value":{"tag":"cell","content":{"value":[[1]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}}},{"push":{"storage":true,"value":{"tag":"cell","content":{"value":[[]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}},{"tag":"atom","value":{"tag":"compress"}}]}}}},{"ins":{"cached":false,"n":1}}]"#).unwrap();
+        let r = contract_query(handle, q.as_ptr());
+        assert!(!r.is_null()); unsafe { contract_free_string(r as *mut c_char); }
+
+        // Increment state[2]: idx{pushPath:true, path:[2]} + addi{1} + ins{cached:true}
+        let q = CString::new(r#"[{"idx":{"cached":false,"pushPath":true,"path":[{"tag":"value","value":{"value":[[2]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}]}},{"addi":{"immediate":1}},{"ins":{"cached":true,"n":1}}]"#).unwrap();
+        let r = contract_query(handle, q.as_ptr());
+        let r_str = unsafe { std::ffi::CStr::from_ptr(r).to_str().unwrap() };
+        println!("Increment result: {}", r_str);
+        assert!(!r_str.contains("error"), "Increment failed: {}", r_str);
+        unsafe { contract_free_string(r as *mut c_char); }
+
+        // Step 3: Now read state[2] — should be 1
+        let q = CString::new(r#"[{"dup":{"n":0}},{"idx":{"cached":false,"pushPath":false,"path":[{"tag":"value","value":{"value":[[2]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}]}},{"popeq":{"cached":false,"result":null}}]"#).unwrap();
+        let r = contract_query(handle, q.as_ptr());
+        let r_str = unsafe { std::ffi::CStr::from_ptr(r).to_str().unwrap() };
+        println!("Read state[2] AFTER initialState: {}", r_str);
+
+        // Check the value is 1
+        assert!(r_str.contains("\"value\":[[1]]"), "Should have posterCount=1, got: {}", r_str);
+        unsafe { contract_free_string(r as *mut c_char); }
+    }
 
     #[test]
     fn test_addi_ins_increments_state() {
