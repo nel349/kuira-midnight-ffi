@@ -1482,3 +1482,40 @@ mod addi_tests {
     }
 }
 
+
+#[cfg(test)]
+mod scale_roundtrip_tests {
+    use super::*;
+    use midnight_base_crypto::fab::{AlignedValue, Value, ValueAtom, Alignment, AlignmentSegment, AlignmentAtom};
+
+    #[test]
+    fn test_popeq_scale_roundtrip() {
+        use midnight_onchain_vm::result_mode::ResultModeVerify;
+        
+        // Create a Popeq with result = [[1]] Bytes(8)
+        let av = AlignedValue {
+            value: Value(vec![ValueAtom(vec![1u8])]),
+            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 8 })]),
+        };
+        let op: Op<ResultModeVerify, InMemoryDB> = Op::Popeq { cached: true, result: av };
+        
+        // SCALE serialize
+        let mut buf = Vec::new();
+        midnight_serialize::Serializable::serialize(&op, &mut buf).unwrap();
+        println!("SCALE bytes: {} bytes = {:02x?}", buf.len(), &buf[..buf.len().min(30)]);
+        
+        // SCALE deserialize
+        let op2: Op<ResultModeVerify, InMemoryDB> = 
+            midnight_serialize::Deserializable::deserialize(&mut &buf[..], 0).unwrap();
+        
+        // Check the value survived
+        if let Op::Popeq { result, .. } = &op2 {
+            println!("After roundtrip: value = {:?}", result.value);
+            println!("After roundtrip: alignment = {:?}", result.alignment);
+            assert_eq!(result.value.0.len(), 1, "Should have 1 value atom");
+            assert_eq!(result.value.0[0].0, vec![1u8], "Value should be [1]");
+        } else {
+            panic!("Expected Popeq");
+        }
+    }
+}
