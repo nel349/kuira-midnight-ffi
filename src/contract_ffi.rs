@@ -227,8 +227,13 @@ pub extern "C" fn contract_persistent_hash_aligned(
         None => return std::ptr::null(),
     };
 
-    // Deserialize AlignedValue from JSON
-    let aligned: AlignedValue = match serde_json::from_str(json_str) {
+    // Parse AlignedValue manually — serde's try_from validation rejects valid
+    // Bytes(N) values (same bug as transcript ops, see parse_aligned_value)
+    let json_val: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => return to_c_string(&format!("{{\"error\":\"JSON parse: {}\"}}", e)),
+    };
+    let aligned: AlignedValue = match parse_aligned_value(&json_val) {
         Ok(v) => v,
         Err(e) => return to_c_string(&format!("{{\"error\":\"deserialize: {}\"}}", e)),
     };
@@ -1140,5 +1145,45 @@ mod value_format_tests {
         println!("StateValue::Null: {}", serde_json::to_string(&null_sv).unwrap());
         let arr_sv: StateValue<InMemoryDB> = StateValue::Array(vec![StateValue::Null].into());
         println!("StateValue::Array[null]: {}", serde_json::to_string(&arr_sv).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod hash_debug_tests {
+    use super::*;
+    use std::ffi::{CString, CStr};
+
+    #[test]
+    fn test_bboard_public_key_hash() {
+        // Reproduce the exact hash computation from bboard post circuit:
+        // _publicKey_0(secretKey, posterCount) = persistentHash(vector3_bytes32, [prefix, sequence, sk])
+        let mut prefix = vec![98u8, 98, 111, 97, 114, 100, 58, 112, 107, 58]; // "bboard:pk:"
+        prefix.resize(32, 0);
+        let sequence: Vec<u8> = vec![0; 32]; // poster count = 0
+        let secret_key: Vec<u8> = (1..=32).collect(); // test secret key
+
+        let json = format!(
+            r#"{{"value":[{},{},{}],"alignment":[{{"tag":"atom","value":{{"tag":"bytes","length":32}}}},{{"tag":"atom","value":{{"tag":"bytes","length":32}}}},{{"tag":"atom","value":{{"tag":"bytes","length":32}}}}]}}"#,
+            format!("[{}]", prefix.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")),
+            format!("[{}]", sequence.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")),
+            format!("[{}]", secret_key.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")),
+        );
+
+        let input = CString::new(json).unwrap();
+        let result = contract_persistent_hash_aligned(input.as_ptr());
+        assert!(!result.is_null());
+
+        let result_str = unsafe { CStr::from_ptr(result).to_str().unwrap() };
+        println!("bboard publicKey hash: {}", result_str);
+
+        // Parse the result — it's a Value (array of byte arrays)
+        let parsed: Vec<Vec<u8>> = serde_json::from_str(result_str).unwrap();
+        println!("Hash bytes: {:02x?}", &parsed[0][..8]);
+
+        // The first byte of the hash determines the field element at position 27
+        // in the prover's encoding. We expect 0x20 (32) from the ZKIR circuit.
+        println!("First field chunk LE: first few bytes = {:02x?}", &parsed[0][..4]);
+
+        unsafe { contract_free_string(result as *mut c_char); }
     }
 }
