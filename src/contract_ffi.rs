@@ -240,8 +240,10 @@ pub extern "C" fn contract_persistent_hash_aligned(
 
     // Use binary_repr + PersistentHashWriter — exactly what the WASM does
     let mut hasher = PersistentHashWriter::default();
-    ValueReprAlignedValue(aligned).binary_repr(&mut hasher);
+    ValueReprAlignedValue(aligned.clone()).binary_repr(&mut hasher);
     let hash_value = Value::from(hasher.finalize());
+
+    // Temporarily removed debug logging
 
     // Serialize result as JSON
     match serde_json::to_string(&hash_value) {
