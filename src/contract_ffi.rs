@@ -1074,33 +1074,6 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     midnight_serialize::tagged_serialize(&(&tx, &proving_keys), &mut bytes)
         .map_err(|e| format!("serialize: {:?}", e))?;
 
-    // Debug: round-trip and extract proof preimage to check public_transcript_inputs
-    {
-        type UnTx = Transaction<Signature, ProofPreimageMarker, midnight_transient_crypto::commitment::PedersenRandomness, InMemoryDB>;
-        type Payload = (UnTx, std::collections::HashMap<String, midnight_transient_crypto::proofs::ProvingKeyMaterial>);
-        let (tx2, _): Payload = midnight_serialize::tagged_deserialize(&mut &bytes[..])
-            .map_err(|e| format!("debug deser: {:?}", e))?;
-
-        if let Transaction::Standard(ref std_tx) = tx2 {
-            for intent_sp in std_tx.intents.values() {
-                for action_sp in intent_sp.actions.iter() {
-                    if let midnight_ledger::structure::ContractAction::Call(ref call_sp) = *action_sp {
-                        if let midnight_ledger::structure::ProofPreimageVersioned::V2(ref preimage) = call_sp.proof {
-                            let pti = &preimage.public_transcript_inputs;
-                            return Err(format!(
-                                "PREIMAGE_DEBUG: pti_len={}, pti[25]={:?}, pti[26]={:?}, pti[27]={:?}",
-                                pti.len(),
-                                pti.get(25).map(|f| format!("{:?}", f)),
-                                pti.get(26).map(|f| format!("{:?}", f)),
-                                pti.get(27).map(|f| format!("{:?}", f)),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     Ok(hex::encode(&bytes))
 }
 
