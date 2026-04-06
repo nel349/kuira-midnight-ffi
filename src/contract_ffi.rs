@@ -21,12 +21,22 @@ use midnight_onchain_vm::cost_model::{CostModel as RustCostModel, INITIAL_COST_M
 use midnight_onchain_vm::ops::Op;
 use midnight_onchain_vm::result_mode::ResultModeGather;
 
-/// Helper: convert a C string to a Rust &str
+/// Helper: convert a C string to a Rust &str.
+///
+/// # Safety
+/// The caller must ensure `ptr` points to a valid null-terminated C string
+/// that remains valid for the lifetime `'a`. The string must be valid UTF-8.
 unsafe fn c_str_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
     if ptr.is_null() {
         return None;
     }
+    // SAFETY: caller guarantees ptr is a valid, null-terminated C string from JNI
     CStr::from_ptr(ptr).to_str().ok()
+}
+
+/// Helper: lock the state pool, returning None on poisoned mutex.
+fn lock_state_pool() -> Option<std::sync::MutexGuard<'static, HashMap<u64, RustContractState<InMemoryDB>>>> {
+    STATE_POOL.lock().ok()
 }
 
 /// Helper: convert hex string to bytes
@@ -62,8 +72,13 @@ static STATE_POOL: once_cell::sync::Lazy<Mutex<HashMap<u64, RustContractState<In
 static NEXT_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Create a new contract state from SCALE hex, return a handle.
+///
+/// Supports both formats:
+/// - Tagged: indexer data with version header (e.g., `midnight:contract-state[v6]:...`)
+/// - Raw: internally serialized data without header
 #[no_mangle]
 pub extern "C" fn contract_state_create(state_hex: *const c_char) -> u64 {
+    // SAFETY: JNI guarantees state_hex is a valid null-terminated UTF-8 string
     let hex_str = match unsafe { c_str_to_str(state_hex) } {
         Some(s) => s,
         None => return 0,
@@ -72,21 +87,30 @@ pub extern "C" fn contract_state_create(state_hex: *const c_char) -> u64 {
         Some(b) => b,
         None => return 0,
     };
+
+    // Try tagged deserialization first (indexer data has version header),
+    // fall back to raw deserialization (internally serialized data).
     let state: RustContractState<InMemoryDB> =
-        match midnight_serialize::Deserializable::deserialize(&mut &bytes[..], 0) {
+        match midnight_serialize::tagged_deserialize(&mut &bytes[..]) {
             Ok(s) => s,
-            Err(_) => return 0,
+            Err(_) => {
+                match midnight_serialize::Deserializable::deserialize(&mut &bytes[..], 0) {
+                    Ok(s) => s,
+                    Err(_) => return 0,
+                }
+            }
         };
 
     let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    STATE_POOL.lock().unwrap().insert(handle, state);
+    let Some(mut pool) = lock_state_pool() else { return 0 };
+    pool.insert(handle, state);
     handle
 }
 
 /// Serialize a contract state to SCALE hex.
 #[no_mangle]
 pub extern "C" fn contract_state_serialize(handle: u64) -> *const c_char {
-    let mut pool = STATE_POOL.lock().unwrap();
+    let Some(pool) = lock_state_pool() else { return std::ptr::null() };
     let state = match pool.get(&handle) {
         Some(s) => s,
         None => return std::ptr::null(),
@@ -101,7 +125,9 @@ pub extern "C" fn contract_state_serialize(handle: u64) -> *const c_char {
 /// Free a contract state handle.
 #[no_mangle]
 pub extern "C" fn contract_state_free(handle: u64) {
-    STATE_POOL.lock().unwrap().remove(&handle);
+    if let Some(mut pool) = lock_state_pool() {
+        pool.remove(&handle);
+    }
 }
 
 // ── ContractState.query() ──
@@ -119,6 +145,7 @@ pub extern "C" fn contract_query(
 ) -> *const c_char {
     use midnight_onchain_runtime::context::QueryContext;
 
+    // SAFETY: JNI guarantees opcodes_json is a valid null-terminated UTF-8 string
     let opcodes_str = match unsafe { c_str_to_str(opcodes_json) } {
         Some(s) => s,
         None => return std::ptr::null(),
@@ -126,7 +153,9 @@ pub extern "C" fn contract_query(
 
     // Get state from pool
     let state = {
-        let pool = STATE_POOL.lock().unwrap();
+        let Some(pool) = lock_state_pool() else {
+            return to_c_string("{\"error\":\"state pool lock poisoned\"}");
+        };
         match pool.get(&handle).cloned() {
             Some(s) => s,
             None => return to_c_string("{\"error\":\"invalid state handle\"}"),
@@ -148,7 +177,11 @@ pub extern "C" fn contract_query(
         call_context: Default::default(),
     };
 
-    // Execute query — returns gas_cost
+    // Execute query — returns gas_cost.
+    // Uses INITIAL_COST_MODEL here because contract_query is for circuit execution
+    // (computing state reads/writes), not for transaction assembly. The gas value
+    // from this execution is passed back to JS but NOT embedded in the Transcript.
+    // The correct cost model is used in assemble_call_tx_impl via ledger_parameters_hex.
     match qc.query(&ops, None, &INITIAL_COST_MODEL) {
         Ok(results) => {
             // Build new ContractState from results
@@ -156,7 +189,9 @@ pub extern "C" fn contract_query(
                 data: results.context.state,
                 ..state
             };
-            STATE_POOL.lock().unwrap().insert(handle, new_state);
+            if let Some(mut pool) = lock_state_pool() {
+                pool.insert(handle, new_state);
+            }
 
             // Serialize events
             let events_json = match serde_json::to_string(&results.events) {
@@ -319,6 +354,7 @@ pub extern "C" fn contract_value_to_big_int(
 #[no_mangle]
 pub extern "C" fn contract_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
+        // SAFETY: ptr was created by CString::into_raw() in to_c_string/to_c_hex
         unsafe { let _ = CString::from_raw(ptr); }
     }
 }
@@ -415,7 +451,7 @@ mod tests {
 /// Clone a contract state handle (for saving initial state before queries).
 #[no_mangle]
 pub extern "C" fn contract_state_clone(handle: u64) -> u64 {
-    let pool = STATE_POOL.lock().unwrap();
+    let Some(pool) = lock_state_pool() else { return 0 };
     let state = match pool.get(&handle) {
         Some(s) => s.clone(),
         None => return 0,
@@ -423,7 +459,8 @@ pub extern "C" fn contract_state_clone(handle: u64) -> u64 {
     drop(pool);
 
     let new_handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    STATE_POOL.lock().unwrap().insert(new_handle, state);
+    let Some(mut pool) = lock_state_pool() else { return 0 };
+    pool.insert(new_handle, state);
     new_handle
 }
 
@@ -448,7 +485,8 @@ pub extern "C" fn contract_state_create_with_nulls(num_slots: u32) -> u64 {
     state.data = charged;
 
     let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    STATE_POOL.lock().unwrap().insert(handle, state);
+    let Some(mut pool) = lock_state_pool() else { return 0 };
+    pool.insert(handle, state);
     handle
 }
 
@@ -459,12 +497,13 @@ pub extern "C" fn contract_state_set_operation(
     handle: u64,
     operation_name: *const c_char,
 ) {
+    // SAFETY: JNI guarantees operation_name is a valid null-terminated UTF-8 string
     let name = match unsafe { c_str_to_str(operation_name) } {
         Some(s) => s,
         None => return,
     };
 
-    let mut pool = STATE_POOL.lock().unwrap();
+    let Some(mut pool) = lock_state_pool() else { return };
     if let Some(state) = pool.get_mut(&handle) {
         use midnight_onchain_state::state::{ContractOperation, EntryPointBuf};
         let ep = EntryPointBuf::from(name.as_bytes());
@@ -894,7 +933,10 @@ fn convert_verify_to_gather(
         Op::Rem { cached } => Op::Rem { cached: *cached },
         Op::Addi { immediate } => Op::Addi { immediate: *immediate },
         Op::Subi { immediate } => Op::Subi { immediate: *immediate },
-        _ => Op::Noop { n: 0 }, // Unknown ops → noop (shouldn't happen)
+        other => {
+            eprintln!("WARNING: convert_verify_to_gather encountered unknown op: {:?}", other);
+            Op::Noop { n: 0 }
+        }
     }).collect()
 }
 
@@ -964,6 +1006,26 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     // 5. Compute correct gas by re-executing transcript ops against initial state.
     //    The prover embeds gas into the binding_input hash — zeroed gas = proof rejection.
     //    We use QueryContext::query() (not ContractStateExt::query()) to preserve gas.
+    //
+    //    CRITICAL: Must use the same cost model the node uses (from ledger parameters),
+    //    NOT INITIAL_COST_MODEL. The node uses transcript.gas as the gas LIMIT during
+    //    re-execution. If we compute gas with a cheaper cost model, the node's re-execution
+    //    with its real (more expensive) cost model exceeds our gas limit → OutOfGas rejection.
+    let cost_model = {
+        let ledger_params_hex = params["ledger_parameters_hex"].as_str();
+        if let Some(hex_str) = ledger_params_hex {
+            let bytes = hex_to_bytes(hex_str)
+                .ok_or("invalid ledger_parameters_hex")?;
+            let lp: midnight_ledger::structure::LedgerParameters =
+                midnight_serialize::tagged_deserialize(&mut &bytes[..])
+                    .map_err(|e| format!("ledger params deserialize: {:?}", e))?;
+            lp.cost_model.runtime_cost_model
+        } else {
+            // Fallback to initial cost model (only correct on a fresh chain)
+            INITIAL_COST_MODEL.clone()
+        }
+    };
+
     let (gas, effects) = {
         use midnight_onchain_runtime::context::QueryContext;
 
@@ -987,7 +1049,7 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
             call_context: Default::default(),
         };
 
-        match qc.query(&gather_ops, None, &INITIAL_COST_MODEL) {
+        match qc.query(&gather_ops, None, &cost_model) {
             Ok(results) => {
                 (results.gas_cost, results.context.effects)
             }
@@ -1176,6 +1238,164 @@ mod value_format_tests {
         println!("StateValue::Null: {}", serde_json::to_string(&null_sv).unwrap());
         let arr_sv: StateValue<InMemoryDB> = StateValue::Array(vec![StateValue::Null].into());
         println!("StateValue::Array[null]: {}", serde_json::to_string(&arr_sv).unwrap());
+    }
+
+    #[test]
+    fn roundtrip_assembled_tx() {
+        // Assemble a minimal TX and verify it can be deserialized
+        use midnight_serialize::{tagged_serialize, tagged_deserialize};
+        use midnight_ledger::structure::{Transaction, ProofPreimageMarker};
+        use midnight_base_crypto::signatures::Signature;
+        use midnight_transient_crypto::commitment::PedersenRandomness;
+        use midnight_transient_crypto::proofs::ProvingKeyMaterial;
+        use midnight_storage::db::InMemoryDB;
+
+        type Tx = Transaction<Signature, ProofPreimageMarker, PedersenRandomness, InMemoryDB>;
+        type Payload = (Tx, std::collections::HashMap<String, ProvingKeyMaterial>);
+
+        // Build a minimal TX via the assembler
+        let json_str = r#"{
+            "network_id": "undeployed",
+            "contract_address": "0000000000000000000000000000000000000000000000000000000000000000",
+            "entry_point": "post",
+            "state_handle": 0,
+            "initial_state_handle": 0,
+            "proof_data": {
+                "input": { "value": [[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]], "alignment": [{"tag":"atom","value":{"tag":"field"}}] },
+                "output": { "value": [[]], "alignment": [{"tag":"atom","value":{"tag":"field"}}] },
+                "public_transcript": [],
+                "private_transcript_outputs": []
+            }
+        }"#;
+
+        // We can't easily call the FFI with dummy state handles,
+        // but we can test serialization roundtrip of the Transaction type.
+        // Let's create a minimal transaction and test roundtrip.
+        use midnight_ledger::structure::Intent;
+        let ttl = midnight_base_crypto::time::Timestamp::from_secs(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() + 3600
+        );
+        let intent = Intent::<Signature, ProofPreimageMarker, _, InMemoryDB>::empty(
+            &mut rand::rngs::OsRng, ttl,
+        );
+        let mut intents_map = midnight_storage::storage::HashMap::<u16, _, InMemoryDB>::default();
+        intents_map = intents_map.insert(1u16, intent);
+        let tx = Tx::from_intents("undeployed", intents_map);
+
+        let keys: std::collections::HashMap<String, ProvingKeyMaterial> = std::collections::HashMap::new();
+
+        let mut bytes = Vec::new();
+        tagged_serialize(&(&tx, &keys), &mut bytes).expect("serialize should succeed");
+        println!("Serialized TX: {} bytes", bytes.len());
+        println!("First 100 bytes as ASCII: {}", String::from_utf8_lossy(&bytes[..100.min(bytes.len())]));
+
+        // Deserialize roundtrip
+        let (_tx2, _keys2): Payload = tagged_deserialize(&mut &bytes[..])
+            .expect("roundtrip deserialize should succeed");
+        println!("Roundtrip deserialization succeeded!");
+
+        // Write to temp file so we can send to proof server via curl
+        let tmp = "/tmp/test_tx_payload.bin";
+        std::fs::write(tmp, &bytes).expect("write temp file");
+        println!("Wrote {} bytes to {}", bytes.len(), tmp);
+        println!("Test with: curl -s -o /dev/null -w '%{{http_code}}' --data-binary @{} http://localhost:6300/prove-tx", tmp);
+    }
+
+    #[test]
+    #[ignore = "diagnostic test with hardcoded TX hex"]
+    fn deserialize_android_tx() {
+        // The exact hex produced by our Android pipeline
+        use midnight_serialize::tagged_deserialize;
+        use midnight_ledger::structure::{Transaction, ProofPreimageMarker};
+        use midnight_base_crypto::signatures::Signature;
+        use midnight_transient_crypto::commitment::PedersenRandomness;
+        use midnight_transient_crypto::proofs::ProvingKeyMaterial;
+        use midnight_storage::db::InMemoryDB;
+
+        type Tx = Transaction<Signature, ProofPreimageMarker, PedersenRandomness, InMemoryDB>;
+        type Payload = (Tx, std::collections::HashMap<String, ProvingKeyMaterial>);
+
+        let hex = "6d69646e696768743a287472616e73616374696f6e5b76395d287369676e61747572655b76315d2c70726f6f662d707265696d6167652c656d6265646465642d66725b76315d292c6d617028737472696e672c70726f76696e672d6461746129293abc00080100000c004001040408010404080c190000040c08010400100c004001041408010400081700041c080104000c000201042408010404280c190000042c08010400100c010108043408010400080301043c0c0f000104400801040090600188500d471eefe86b1a2691b4dec073ffcf306d87846cfa966f8c45a456a2f32c200104480c0f0101044c0801040008010104540c0f00010458080104007882015848656c6c6f2066726f6d2070726f6f662073657276657221c2014004600c0f0101046408010400084001046c0c0f0001047008010404540c0f01010478080104000c1a00010480080104000400408810182030384450845c6884747c8488080238081c8c08043c000802032c88888888888888888890943802ebdb8d032082a3699905d103000498d1054b45940479a61bb954f9de4245736d29e2e0e5e4970dba47a18651466cf9ba9110706f737400017310a509fb05fd13ddbd55674a6b691e63429dc2d540cb0c81a683d1599f0fd05b0104733a3d58801ec8e5f08ba6355825427cc8de2637d8650c9b714343a102c9e0441408806f0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fd8c0410104040030040400c0410104040834042004400404040c44040480b06f88500d471eefe86b1a2691b4dec073ffcf306d87846cfa966f8c45a456a2f345024004040404440408047300000000fffffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed7304733a3d58801ec8e5f08ba6355825427cc8de2637d8650c9b714343a102c9e04414450240040404004404040404450208000400017310a509fb05fd13ddbd55674a6b691e63429dc2d540cb0c81a683d1599f0fd05b7305fce0c88d353873d630e963365feabc60ae6abcbd4fdbed527aa546ccf79e4f10706f7374049c040004a008010404a4a401010103b116d469736fa7bca403635850cb2d5d830f34765aeb8fe7eb08480e7517a468e4c3f0650d0800a80004ac08010404b0900304408047dc540c94ceb704a23875c11273e16bb0b8a87aed84de911f2133568115f25408b488b80028756e6465706c6f79656401736fa7bca403635850cb2d5d830f34765aeb8fe7eb08480e7517a468e4c3f0650d00";
+
+        let bytes = hex::decode(hex).expect("hex decode");
+        println!("TX bytes: {}", bytes.len());
+
+        match tagged_deserialize::<Payload>(&mut &bytes[..]) {
+            Ok((tx, keys)) => {
+                println!("Deserialization succeeded!");
+                println!("Keys count: {}", keys.len());
+                let calls: Vec<_> = tx.calls().collect();
+                println!("Calls count: {}", calls.len());
+
+                // Re-serialize and compare — if they differ, our serialization has issues
+                let mut reserialized = Vec::new();
+                midnight_serialize::tagged_serialize(&(&tx, &keys), &mut reserialized).unwrap();
+                if bytes == reserialized {
+                    println!("ROUNDTRIP MATCH: {} bytes", bytes.len());
+                } else {
+                    println!("ROUNDTRIP MISMATCH: original={} reserialized={}", bytes.len(), reserialized.len());
+                    for i in 0..bytes.len().min(reserialized.len()) {
+                        if bytes[i] != reserialized[i] {
+                            println!("First diff at byte {}: orig=0x{:02x} reser=0x{:02x}", i, bytes[i], reserialized[i]);
+                            break;
+                        }
+                    }
+                    // Save reserialized for proof server test
+                    std::fs::write("/tmp/reserialized_tx.bin", &reserialized).unwrap();
+                    println!("Saved reserialized to /tmp/reserialized_tx.bin");
+                }
+            }
+            Err(e) => {
+                println!("Deserialization FAILED: {:?}", e);
+                panic!("Cannot deserialize TX: {:?}", e);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires /tmp/ledger_params.hex from indexer query"]
+    fn compare_cost_models() {
+        use midnight_ledger::structure::{LedgerParameters, INITIAL_TRANSACTION_COST_MODEL};
+
+        let params_hex = std::fs::read_to_string("/tmp/ledger_params.hex")
+            .expect("read ledger params hex (run indexer query first)");
+        let params_hex = params_hex.trim();
+        let params_bytes = hex::decode(params_hex).expect("hex decode");
+
+        let params: LedgerParameters = midnight_serialize::tagged_deserialize(&mut &params_bytes[..])
+            .expect("deserialize ledger params");
+
+        let node_cost = &params.cost_model.runtime_cost_model;
+        let our_cost = &INITIAL_COST_MODEL;
+        let initial_cost = &INITIAL_TRANSACTION_COST_MODEL.runtime_cost_model;
+
+        println!("Node cost model == INITIAL_COST_MODEL: {}", node_cost == our_cost);
+        println!("Node cost model == INITIAL_TRANSACTION_COST_MODEL.runtime: {}", node_cost == initial_cost);
+
+        println!("\nNode cost model:    {:?}", node_cost);
+        println!("\nInitial cost model: {:?}", our_cost);
+    }
+
+    #[test]
+    fn print_transaction_tag() {
+        use midnight_serialize::Tagged;
+        use midnight_ledger::structure::{Transaction, ProofPreimageMarker};
+        use midnight_base_crypto::signatures::Signature;
+        use midnight_transient_crypto::commitment::PedersenRandomness;
+        use midnight_transient_crypto::proofs::ProvingKeyMaterial;
+        use midnight_storage::db::InMemoryDB;
+
+        type Tx = Transaction<Signature, ProofPreimageMarker, PedersenRandomness, InMemoryDB>;
+        type Payload = (Tx, std::collections::HashMap<String, ProvingKeyMaterial>);
+
+        let tag = <Payload as Tagged>::tag();
+        println!("Transaction tuple tag: {}", tag);
+
+        let tx_tag = <Tx as Tagged>::tag();
+        println!("Transaction alone tag: {}", tx_tag);
     }
 }
 
