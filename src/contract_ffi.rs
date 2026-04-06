@@ -158,6 +158,11 @@ pub extern "C" fn contract_query(
             };
             STATE_POOL.lock().unwrap().insert(handle, new_state);
 
+            // Debug: log Read events
+            for ev in &results.events {
+                eprintln!("[contract_query h={}] event: {:?}", handle, ev);
+            }
+
             // Serialize events
             let events_json = match serde_json::to_string(&results.events) {
                 Ok(s) => s,
