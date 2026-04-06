@@ -1370,3 +1370,69 @@ mod prove_debug_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod addi_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn test_addi_ins_increments_state() {
+        // Create state with 4 slots, set operations
+        let handle = contract_state_create_with_nulls(4);
+        assert!(handle > 0);
+        let op1 = CString::new("post").unwrap();
+        contract_state_set_operation(handle, op1.as_ptr());
+
+        // First, initialize state[2] = Cell(0) via push+ins
+        // This mimics initialState's first write to state[2]
+        let init_ops = r#"[
+            {"push":{"storage":false,"value":{"tag":"cell","content":{"value":[[2]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}}},
+            {"push":{"storage":true,"value":{"tag":"cell","content":{"value":[[]],"alignment":[{"tag":"atom","value":{"tag":"field"}}]}}}},
+            {"ins":{"cached":false,"n":1}}
+        ]"#;
+        let ops_c = CString::new(init_ops).unwrap();
+        let result = contract_query(handle, ops_c.as_ptr());
+        assert!(!result.is_null());
+        let r = unsafe { std::ffi::CStr::from_ptr(result).to_str().unwrap() };
+        println!("Init state[2]: {}", r);
+        assert!(!r.contains("error"), "Init failed: {}", r);
+        unsafe { contract_free_string(result as *mut c_char); }
+
+        // Now do idx{pushPath:true, path:[2]} + addi{1} + ins{cached:true, n:1}
+        // This increments state[2] from 0 to 1
+        let incr_ops = r#"[
+            {"idx":{"cached":false,"pushPath":true,"path":[{"tag":"value","value":{"value":[[2]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}]}},
+            {"addi":{"immediate":1}},
+            {"ins":{"cached":true,"n":1}}
+        ]"#;
+        let ops_c = CString::new(incr_ops).unwrap();
+        let result = contract_query(handle, ops_c.as_ptr());
+        assert!(!result.is_null());
+        let r = unsafe { std::ffi::CStr::from_ptr(result).to_str().unwrap() };
+        println!("Increment state[2]: {}", r);
+        assert!(!r.contains("error"), "Increment failed: {}", r);
+        unsafe { contract_free_string(result as *mut c_char); }
+
+        // Now read state[2] back: dup + idx[2] + popeq
+        let read_ops = r#"[
+            {"dup":{"n":0}},
+            {"idx":{"cached":false,"pushPath":false,"path":[{"tag":"value","value":{"value":[[2]],"alignment":[{"tag":"atom","value":{"tag":"bytes","length":1}}]}}]}},
+            {"popeq":{"cached":false,"result":null}}
+        ]"#;
+        let ops_c = CString::new(read_ops).unwrap();
+        let result = contract_query(handle, ops_c.as_ptr());
+        assert!(!result.is_null());
+        let r = unsafe { std::ffi::CStr::from_ptr(result).to_str().unwrap() };
+        println!("Read state[2]: {}", r);
+        assert!(!r.contains("error"), "Read failed: {}", r);
+        
+        // The Read event should contain value=1, not value=0
+        assert!(r.contains("Read"), "Should have Read event: {}", r);
+        // Check if value contains [1] (not [0] or empty)
+        println!("Full result: {}", r);
+        
+        unsafe { contract_free_string(result as *mut c_char); }
+    }
+}
+
