@@ -928,6 +928,13 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
         .ok_or("missing state_handle")?;
     let initial_state_handle = params["initial_state_handle"].as_u64()
         .ok_or("missing initial_state_handle")?;
+    // TTL: seconds since epoch. Default: current time + 1 hour
+    let ttl_secs = params["ttl_secs"].as_u64().unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() + 3600
+    });
 
     let proof_data = &params["proof_data"];
 
@@ -1043,7 +1050,7 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     };
 
     // 8. Build Intent with the contract call
-    let ttl = Timestamp::MAX;
+    let ttl = Timestamp::from_secs(ttl_secs);
     let intent = Intent::<Signature, ProofPreimageMarker, _, InMemoryDB>::empty(
         &mut OsRng, ttl,
     ).add_call::<ProofPreimage>(prototype);
