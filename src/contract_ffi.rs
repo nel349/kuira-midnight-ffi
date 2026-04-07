@@ -1481,5 +1481,6 @@ mod value_format_tests {
         let tx_tag = <Tx as Tagged>::tag();
         println!("Transaction alone tag: {}", tx_tag);
     }
+
 }
 
