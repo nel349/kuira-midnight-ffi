@@ -139,6 +139,7 @@ extern uint64_t contract_state_create_with_nulls(uint32_t num_slots);
 extern void contract_state_set_operation(uint64_t handle, const char* name);
 extern const char* contract_state_serialize(uint64_t handle);
 extern void contract_state_free(uint64_t handle);
+extern const char* contract_state_read_fields(uint64_t handle);
 extern const char* contract_query(uint64_t handle, const char* opcodes_json);
 extern const char* contract_persistent_hash(const char* input_hex);
 extern const char* contract_persistent_hash_aligned(const char* aligned_value_json);
@@ -2639,6 +2640,21 @@ JNIEXPORT void JNICALL
 Java_com_midnight_kuira_core_compact_ContractRuntime_nativeStateFree(
     JNIEnv* env, jclass clazz, jlong handle) {
     contract_state_free((uint64_t)handle);
+}
+
+/*
+ * Read contract state fields as JSON.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeStateReadFields(
+    JNIEnv* env, jclass clazz, jlong handle) {
+
+    const char* result = contract_state_read_fields((uint64_t)handle);
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    contract_free_string((char*)result);
+    return jresult;
 }
 
 /*

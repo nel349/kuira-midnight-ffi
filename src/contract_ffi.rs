@@ -122,6 +122,90 @@ pub extern "C" fn contract_state_serialize(handle: u64) -> *const c_char {
     to_c_hex(&out)
 }
 
+/// Read contract state fields as JSON.
+///
+/// Walks the StateValue tree and serializes to a human-readable JSON structure:
+/// - Null → null
+/// - Cell(AlignedValue) → { "type": "cell", "bytes": [hex], "text": "..." }
+/// - Array([...]) → [ item0, item1, ... ]
+///
+/// The "text" field is included when the cell bytes are valid UTF-8.
+/// Returns JSON string, or {"error": "..."} on failure.
+#[no_mangle]
+pub extern "C" fn contract_state_read_fields(handle: u64) -> *const c_char {
+    use midnight_onchain_state::state::StateValue;
+
+    let Some(pool) = lock_state_pool() else {
+        return to_c_string("{\"error\":\"state pool lock poisoned\"}");
+    };
+    let state = match pool.get(&handle) {
+        Some(s) => s,
+        None => return to_c_string("{\"error\":\"invalid state handle\"}"),
+    };
+
+    fn state_value_to_json(sv: &StateValue<InMemoryDB>) -> serde_json::Value {
+        match sv {
+            StateValue::Null => serde_json::Value::Null,
+            StateValue::Cell(aligned) => {
+                // Extract raw bytes from the AlignedValue
+                let bytes: Vec<u8> = aligned.value.0.iter()
+                    .flat_map(|atom| atom.0.iter().copied())
+                    .collect();
+                let hex = hex::encode(&bytes);
+
+                let mut obj = serde_json::Map::new();
+                obj.insert("type".to_string(), "cell".into());
+                obj.insert("hex".to_string(), hex.into());
+
+                // Try to decode as UTF-8 text (raw bytes)
+                if let Ok(text) = String::from_utf8(bytes.clone()) {
+                    if text.len() > 0 && text.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                        obj.insert("text".to_string(), text.into());
+                    }
+                }
+
+                // Try to decode as UTF-8 text (skip leading 0x01 Option prefix)
+                if !obj.contains_key("text") && bytes.len() > 1 && bytes[0] == 0x01 {
+                    if let Ok(text) = String::from_utf8(bytes[1..].to_vec()) {
+                        if text.len() > 0 && text.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                            obj.insert("text".to_string(), text.into());
+                        }
+                    }
+                }
+
+                // Decode as number — works for any byte length
+                let mut n: u128 = 0;
+                let num_bytes = bytes.len().min(16);
+                let is_small = bytes.len() <= 16 || bytes[16..].iter().all(|&x| x == 0);
+                if is_small && !bytes.is_empty() {
+                    for (i, &byte) in bytes.iter().enumerate().take(num_bytes) {
+                        n |= (byte as u128) << (8 * i);
+                    }
+                    if n <= i64::MAX as u128 {
+                        obj.insert("number".to_string(), (n as i64).into());
+                    }
+                }
+
+                serde_json::Value::Object(obj)
+            }
+            StateValue::Array(items) => {
+                let arr: Vec<serde_json::Value> = items.iter()
+                    .map(|item| state_value_to_json(&*item))
+                    .collect();
+                serde_json::Value::Array(arr)
+            }
+            _ => serde_json::json!({"type": "unknown"}),
+        }
+    }
+
+    let state_ref = state.data.get_ref();
+    let json = state_value_to_json(state_ref);
+    match serde_json::to_string(&json) {
+        Ok(s) => to_c_string(&s),
+        Err(e) => to_c_string(&format!("{{\"error\":\"serialize: {}\"}}", e)),
+    }
+}
+
 /// Free a contract state handle.
 #[no_mangle]
 pub extern "C" fn contract_state_free(handle: u64) {
