@@ -2555,7 +2555,15 @@ Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeBuildShi
 /*
  * Prove a transaction locally using cached proving keys.
  * Same input/output format as the proof server.
+ *
+ * Two JNI entry points for the same function:
+ * - core.crypto.proving.LocalProver (original package, kept for wallet compatibility)
+ * - core.compact.proving.LocalProver (SDK package, used by compact-engine)
  */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_proving_LocalProver_nativeProveTransactionLocal(
+    JNIEnv* env, jclass clazz, jstring unprovenTxHex, jstring keysDir);
+
 JNIEXPORT jstring JNICALL
 Java_com_midnight_kuira_core_crypto_proving_LocalProver_nativeProveTransactionLocal(
     JNIEnv* env, jclass clazz, jstring unprovenTxHex, jstring keysDir) {
@@ -2591,6 +2599,16 @@ Java_com_midnight_kuira_core_crypto_proving_LocalProver_nativeProveTransactionLo
 
     LOGI("Local proving succeeded");
     return jresult;
+}
+
+/*
+ * SDK package alias for local proving (delegates to same implementation).
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_proving_LocalProver_nativeProveTransactionLocal(
+    JNIEnv* env, jclass clazz, jstring unprovenTxHex, jstring keysDir) {
+    return Java_com_midnight_kuira_core_crypto_proving_LocalProver_nativeProveTransactionLocal(
+        env, clazz, unprovenTxHex, keysDir);
 }
 
 /*
