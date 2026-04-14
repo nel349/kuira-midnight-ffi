@@ -1,0 +1,7 @@
+[env]
+# Points the ledger's test-utilities harness at the proving/verifying key
+# material shipped inside midnight-libraries. Required for tests that call
+# reward_night / tx_prove / apply (which resolve the dust SPEND_VK via
+# test_resolver). Only affects `cargo test`; production FFI builds don't
+# use test_resolver.
+MIDNIGHT_LEDGER_TEST_STATIC_DIR = { value = "../../../../midnight/midnight-libraries/midnight-ledger/ledger/static", relative = true }

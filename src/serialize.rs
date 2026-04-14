@@ -91,11 +91,12 @@ pub extern "C" fn serialize_unshielded_transaction_with_dust(
     current_time_ms: i64,
     ttl: u64,
     binding_randomness_hex: *const c_char,
+    network_id: *const c_char,
 ) -> *mut c_char {
     // Safety checks
     if inputs_hex.is_null() || outputs_hex.is_null() || signatures_hex.is_null() ||
        dust_state_ptr.is_null() || seed_ptr.is_null() || dust_utxos_json.is_null() ||
-       binding_randomness_hex.is_null() {
+       binding_randomness_hex.is_null() || network_id.is_null() {
         log_error!("[Kuira FFI] Null pointer passed to serialize_unshielded_transaction_with_dust");
         return std::ptr::null_mut();
     }
@@ -142,6 +143,14 @@ pub extern "C" fn serialize_unshielded_transaction_with_dust(
         Ok(s) => s,
         Err(e) => {
             log_error!("[Kuira FFI] Invalid UTF-8 in binding_commitment: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let network_id_str = match unsafe { CStr::from_ptr(network_id).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            log_error!("[Kuira FFI] Invalid UTF-8 in network_id: {}", e);
             return std::ptr::null_mut();
         }
     };
@@ -231,7 +240,8 @@ pub extern "C" fn serialize_unshielded_transaction_with_dust(
         signatures_str,
         Some((dust_spends, timestamp)),
         ttl,
-        binding_randomness_str.to_string()
+        binding_randomness_str.to_string(),
+        network_id_str,
     ) {
         Ok(hex) => {
             log_info!("[Kuira FFI] Serialization succeeded! Hex length: {}", hex.len());
@@ -288,9 +298,10 @@ pub extern "C" fn serialize_unshielded_transaction(
     dust_actions_hex: *const c_char,
     ttl: u64,
     binding_randomness_hex: *const c_char,
+    network_id: *const c_char,
 ) -> *mut c_char {
     // Safety checks
-    if inputs_hex.is_null() || outputs_hex.is_null() || signatures_hex.is_null() || dust_actions_hex.is_null() || binding_randomness_hex.is_null() {
+    if inputs_hex.is_null() || outputs_hex.is_null() || signatures_hex.is_null() || dust_actions_hex.is_null() || binding_randomness_hex.is_null() || network_id.is_null() {
         eprintln!("[Kuira FFI] Null pointer passed to serialize_unshielded_transaction");
         return std::ptr::null_mut();
     }
@@ -336,8 +347,16 @@ pub extern "C" fn serialize_unshielded_transaction(
         }
     };
 
+    let network_id_str = match unsafe { CStr::from_ptr(network_id).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[Kuira FFI] Invalid UTF-8 in network_id: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
     // Build and serialize Intent with dust actions
-    match build_and_serialize_intent(inputs_str, outputs_str, signatures_str, dust_actions_str, ttl, binding_randomness_str.to_string()) {
+    match build_and_serialize_intent(inputs_str, outputs_str, signatures_str, dust_actions_str, ttl, binding_randomness_str.to_string(), network_id_str) {
         Ok(hex) => {
             match CString::new(hex) {
                 Ok(c_str) => c_str.into_raw(),
@@ -392,6 +411,7 @@ pub fn build_and_serialize_intent(
     dust_actions_json: &str,
     ttl_ms: u64,
     binding_randomness_hex: String,
+    network_id: &str,
 ) -> Result<String, String> {
     // Parse JSON inputs
     let json_inputs: Vec<JsonUtxoSpend> = serde_json::from_str(inputs_json)
@@ -548,7 +568,7 @@ pub fn build_and_serialize_intent(
     let intents_map = StorageHashMap::default().insert(1u16, intent);
 
     let transaction = Transaction::Standard(StandardTransaction {
-        network_id: "undeployed".into(),
+        network_id: network_id.into(),
         intents: intents_map,
         guaranteed_coins: None,
         fallible_coins: StorageHashMap::default(),
@@ -581,6 +601,7 @@ pub fn build_and_serialize_intent_with_dust(
     dust_spends_opt: Option<(Vec<midnight_ledger::dust::DustSpend<ProofPreimageMarker, DefaultDB>>, Timestamp)>,
     ttl_ms: u64,
     binding_randomness_hex: String,
+    network_id: &str,
 ) -> Result<String, String> {
     // Parse JSON inputs (same as build_and_serialize_intent)
     let json_inputs: Vec<JsonUtxoSpend> = serde_json::from_str(inputs_json)
@@ -715,7 +736,7 @@ pub fn build_and_serialize_intent_with_dust(
 
     // Create base transaction with ONLY the unshielded offer intent
     let mut base_transaction = Transaction::new(
-        "undeployed",
+        network_id,
         base_intents_map,
         None,  // No guaranteed_coins
         midnight_storage::storage::HashMap::new(),  // No fallible_coins
@@ -763,7 +784,7 @@ pub fn build_and_serialize_intent_with_dust(
         // Create dust transaction with ONLY the dust intent
         // This matches Lace: `const feeTransaction = Transaction.fromPartsRandomized(network, undefined, undefined, intent);`
         let dust_transaction = Transaction::new(
-            "undeployed",
+            network_id,
             dust_intents_map,
             None,  // No guaranteed_coins
             midnight_storage::storage::HashMap::new(),  // No fallible_coins
@@ -1152,6 +1173,7 @@ pub extern "C" fn build_dust_registration_transaction(
     ttl_millis: u64,
     current_time_millis: i64,
     utxos_json: *const c_char,
+    network_id: *const c_char,
 ) -> *mut c_char {
     // Validate inputs
     if night_private_key_ptr.is_null() {
@@ -1162,7 +1184,7 @@ pub extern "C" fn build_dust_registration_transaction(
         log_error!("[Kuira FFI] build_dust_registration_transaction: key must be 32 bytes, got {}", night_private_key_len);
         return std::ptr::null_mut();
     }
-    if dust_public_key_hex.is_null() || allow_fee_payment_str.is_null() || utxos_json.is_null() {
+    if dust_public_key_hex.is_null() || allow_fee_payment_str.is_null() || utxos_json.is_null() || network_id.is_null() {
         log_error!("[Kuira FFI] build_dust_registration_transaction: null string parameter");
         return std::ptr::null_mut();
     }
@@ -1200,6 +1222,15 @@ pub extern "C" fn build_dust_registration_transaction(
         }
     };
 
+    let network_id_str = match unsafe { CStr::from_ptr(network_id).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            key_buf.zeroize();
+            log_error!("[Kuira FFI] Invalid UTF-8 in network_id: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
     let result = build_dust_registration_transaction_impl(
         &key_buf,
         dust_pk_str,
@@ -1207,6 +1238,7 @@ pub extern "C" fn build_dust_registration_transaction(
         ttl_millis,
         current_time_millis,
         utxos_str,
+        network_id_str,
     );
 
     // SECURITY: Always zeroize key buffer before returning
@@ -1236,6 +1268,7 @@ fn build_dust_registration_transaction_impl(
     ttl_millis: u64,
     current_time_millis: i64,
     utxos_json: &str,
+    network_id: &str,
 ) -> Result<String, String> {
     use midnight_ledger::dust::{DustRegistration, DustActions, DustPublicKey};
     use midnight_storage::storage::Array as StorageArray;
@@ -1433,7 +1466,7 @@ fn build_dust_registration_transaction_impl(
     intents_map = intents_map.insert(segment_id, signed_intent);
 
     let transaction = Transaction::new(
-        "undeployed",
+        network_id,
         intents_map,
         None,
         midnight_storage::storage::HashMap::new(),  // No fallible_coins
@@ -1470,6 +1503,7 @@ mod tests {
         let signatures = CString::new("[]").unwrap();
         let dust_actions = CString::new("").unwrap();
         let binding = CString::new("0500000000000000000000000000000000000000000000000000000000000000").unwrap();
+        let network_id = CString::new("undeployed").unwrap();
 
         let hex_ptr = serialize_unshielded_transaction(
             inputs.as_ptr(),
@@ -1477,7 +1511,8 @@ mod tests {
             signatures.as_ptr(),
             dust_actions.as_ptr(),
             1704067200000,
-            binding.as_ptr()
+            binding.as_ptr(),
+            network_id.as_ptr(),
         );
 
         assert!(!hex_ptr.is_null());
@@ -1532,6 +1567,7 @@ mod tests {
             ttl_millis,
             current_time_millis,
             utxos_json,
+            "undeployed",
         );
 
         let hex = result.expect("Dust registration transaction build should succeed");
@@ -1729,6 +1765,7 @@ mod tests {
             1737658800000,
             1737658700000,
             utxos_json,
+            "undeployed",
         );
         assert!(result.is_err(), "Should fail on invalid dust public key hex");
     }
@@ -1754,6 +1791,7 @@ mod tests {
             1737658800000,
             1737658700000,
             utxos_json,
+            "undeployed",
         );
         assert!(result.is_err(), "Should fail with empty UTXOs");
         assert!(result.unwrap_err().contains("At least one NIGHT UTXO"));
@@ -1783,6 +1821,7 @@ mod tests {
             ttl_millis,
             ctime_millis,
             utxos_json,
+            "undeployed",
         ).expect("Should succeed");
 
         // Deserialize and verify timestamps
@@ -1802,6 +1841,155 @@ mod tests {
         let dust_actions = intent.dust_actions.as_ref().unwrap();
         let expected_ctime = Timestamp::from_secs((ctime_millis / 1000) as u64);
         assert_eq!(dust_actions.ctime, expected_ctime, "ctime should match input");
+    }
+
+    /// Runs the whole dust-registration path the Android app uses (build → sign →
+    /// serialize) and hands the resulting transaction to `well_formed()` against a
+    /// LedgerState that holds the registering NIGHT UTXO. This is the same call the
+    /// node makes during mempool admission — a pass here means the node will accept
+    /// the tx; any `MalformedTransaction::*` here reproduces the exact error code
+    /// the node would have returned (e.g. 170 InvalidDustSpendProof).
+    ///
+    /// Uses `midnight_ledger::test_utilities::TestState` (dev-dep only) so we never
+    /// have to go through the proof server / node / Docker stack to iterate.
+    #[tokio::test]
+    async fn test_dust_registration_passes_well_formed() {
+        use midnight_ledger::test_utilities::TestState;
+        use midnight_ledger::verify::WellFormedStrictness;
+        use midnight_ledger::structure::Transaction as LedgerTx;
+        use midnight_ledger::dust::{DustPublicKey, INITIAL_DUST_PARAMETERS};
+        use midnight_serialize::Serializable;
+        use rand::{SeedableRng, rngs::StdRng};
+        use midnight_storage::db::InMemoryDB;
+
+        // 1. Seeded TestState — network_id is "local-test" (what TestState::new hardcodes).
+        let mut rng = StdRng::seed_from_u64(0xDEADBEEF);
+        let mut state: TestState<InMemoryDB> = TestState::new(&mut rng);
+
+        // 2. Fund the test wallet with a NIGHT UTXO and age it to dust-cap so
+        //    there's enough generationless dust to cover the registration fee.
+        const NIGHT_VAL: u128 = 1_000_000;
+        state.reward_night(&mut rng, NIGHT_VAL).await;
+        state.fast_forward(INITIAL_DUST_PARAMETERS.time_to_cap());
+
+        // 3. Extract the funded UTXO's identity (intent_hash + output_no + ctime) —
+        //    this is what Android pulls from the indexer and hands to the FFI.
+        let utxo_entry = state.ledger.utxo.utxos.iter().next().unwrap();
+        let utxo = &utxo_entry.0;
+        let utxo_meta = &utxo_entry.1;
+        let utxo_intent_hash_hex = {
+            let mut buf = Vec::new();
+            utxo.intent_hash.serialize(&mut buf).unwrap();
+            hex::encode(&buf)
+        };
+        let utxo_ctime_secs = utxo_meta.ctime.to_secs();
+
+        // 4. Serialize the night signing key and dust public key in the exact
+        //    format the FFI expects (matches DustRegistrationBuilder.build).
+        let mut night_key_bytes = Vec::new();
+        state.night_key.serialize(&mut night_key_bytes).unwrap();
+        let night_key_arr: [u8; 32] = night_key_bytes.as_slice().try_into().unwrap();
+
+        let dust_pk_hex = {
+            let pk = DustPublicKey::from(state.dust_key.clone());
+            let mut buf = Vec::new();
+            pk.serialize(&mut buf).unwrap();
+            hex::encode(&buf)
+        };
+
+        let utxos_json = format!(
+            r#"[{{"value":"{NIGHT_VAL}","intent_hash":"{utxo_intent_hash_hex}","output_no":{},"ctime":{utxo_ctime_secs}}}]"#,
+            utxo.output_no
+        );
+
+        // 5. Build the same transaction the Android flow builds.
+        let current_time_ms = (state.time.to_secs() as i64) * 1000;
+        let ttl_ms = (current_time_ms as u64) + 60_000; // 60s future
+
+        let tx_hex = build_dust_registration_transaction_impl(
+            &night_key_arr,
+            &dust_pk_hex,
+            "0",
+            ttl_ms,
+            current_time_ms,
+            &utxos_json,
+            "local-test", // matches TestState's LedgerState network_id
+        )
+        .expect("FFI should produce a serialized tx");
+
+        // 6. Round-trip back into a typed Transaction and run the node's own
+        //    gate: tx.well_formed(&ledger_state, strictness, tblock).
+        let tx_bytes = hex::decode(&tx_hex).unwrap();
+        let (tx, _proof_data): (
+            LedgerTx<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>,
+            std::collections::HashMap<String, ProvingKeyMaterial>,
+        ) = tagged_deserialize(&tx_bytes[..]).unwrap();
+
+        let strictness = WellFormedStrictness::default();
+        let verified = tx.well_formed(&state.ledger, strictness, state.time);
+
+        match verified {
+            Ok(_) => eprintln!("✅ tx passed well_formed — node would accept."),
+            Err(e) => panic!(
+                "well_formed rejected our dust registration tx.\n\
+                 This reproduces the node's rejection locally.\n\
+                 Error variant: {e:?}\n\
+                 Hex (first 200): {}",
+                &tx_hex[..tx_hex.len().min(200)]
+            ),
+        }
+    }
+
+    /// Phase 8B.x: network_id is a parameter, not hardcoded "undeployed".
+    /// This test pins down what actually gets embedded in the Transaction wire
+    /// format — if it drifts from the caller's input, multi-network support is
+    /// broken at the Rust boundary and the node will reject with `InvalidNetworkId`.
+    #[test]
+    fn test_build_dust_registration_network_id_round_trips() {
+        use midnight_ledger::dust::{DustSecretKey, DustPublicKey, Seed};
+        use midnight_serialize::Serializable;
+        use midnight_ledger::structure::Transaction as LedgerTx;
+
+        let night_private_key: [u8; 32] = [42u8; 32];
+        let seed: Seed = [7u8; 32];
+        let dust_sk = DustSecretKey::derive_secret_key(&seed);
+        let dust_pk = DustPublicKey::from(dust_sk);
+        let mut pk_bytes = Vec::new();
+        dust_pk.serialize(&mut pk_bytes).unwrap();
+        let dust_pk_hex = hex::encode(&pk_bytes);
+
+        let utxos_json = r#"[{"value":"1000000","intent_hash":"ab6642ef7dd8420c4673a56c57da96adeeedfc5a98140c8a42500b8369464fed","output_no":0,"ctime":1737054000}]"#;
+
+        // Cover every production network identifier, including the two that were
+        // impossible to hit while the FFI hardcoded "undeployed".
+        for expected in ["undeployed", "preprod", "preview", "mainnet"] {
+            let hex_str = build_dust_registration_transaction_impl(
+                &night_private_key,
+                &dust_pk_hex,
+                "0",
+                1800000000000u64,
+                1737658700000i64,
+                utxos_json,
+                expected,
+            )
+            .unwrap_or_else(|e| panic!("Should succeed for {expected}: {e}"));
+
+            let tx_bytes = hex::decode(&hex_str).unwrap();
+            let (tx, _): (
+                LedgerTx<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>,
+                std::collections::HashMap<String, ProvingKeyMaterial>,
+            ) = tagged_deserialize(&tx_bytes[..]).unwrap();
+
+            match tx {
+                LedgerTx::Standard(stx) => {
+                    assert_eq!(
+                        stx.network_id, expected,
+                        "Transaction.network_id must match caller's input"
+                    );
+                }
+                other => panic!("Expected Standard transaction, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1840,7 +2028,8 @@ mod tests {
             signatures_json,
             dust_actions_json,
             ttl_ms,
-            binding_commitment
+            binding_commitment,
+            "undeployed",
         );
 
         match result {

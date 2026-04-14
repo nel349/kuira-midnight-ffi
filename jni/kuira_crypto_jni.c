@@ -160,8 +160,8 @@ extern int32_t verify_signature(const uint8_t* public_key_ptr, const uint8_t* me
 
 /* Transaction serialization (Phase 2E) */
 extern char* serialize_unshielded_transaction_stub(uint64_t ttl);
-extern char* serialize_unshielded_transaction(const char* inputs_hex, const char* outputs_hex, const char* signatures_hex, const char* dust_actions_hex, uint64_t ttl, const char* binding_commitment_hex);
-extern char* serialize_unshielded_transaction_with_dust(const char* inputs_hex, const char* outputs_hex, const char* signatures_hex, const void* dust_state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* dust_utxos_json, int64_t current_time_ms, uint64_t ttl, const char* binding_commitment_hex);
+extern char* serialize_unshielded_transaction(const char* inputs_hex, const char* outputs_hex, const char* signatures_hex, const char* dust_actions_hex, uint64_t ttl, const char* binding_commitment_hex, const char* network_id);
+extern char* serialize_unshielded_transaction_with_dust(const char* inputs_hex, const char* outputs_hex, const char* signatures_hex, const void* dust_state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* dust_utxos_json, int64_t current_time_ms, uint64_t ttl, const char* binding_commitment_hex, const char* network_id);
 extern void free_serialized_transaction(char* ptr);
 
 /* Signing message generation (Phase 2E) */
@@ -178,7 +178,7 @@ extern char* get_transaction_hash(const char* sealed_tx_hex);
 extern char* calculate_transaction_fee(const char* tx_hex, const char* params_hex, uint32_t fee_blocks_margin);
 
 /* Dust registration transaction builder (serialize.rs) */
-extern char* build_dust_registration_transaction(const uint8_t* night_private_key_ptr, size_t night_private_key_len, const char* dust_public_key_hex, const char* allow_fee_payment_str, uint64_t ttl_millis, int64_t current_time_millis, const char* utxos_json);
+extern char* build_dust_registration_transaction(const uint8_t* night_private_key_ptr, size_t night_private_key_len, const char* dust_public_key_hex, const char* allow_fee_payment_str, uint64_t ttl_millis, int64_t current_time_millis, const char* utxos_json, const char* network_id);
 
 /* JNI function implementations */
 
@@ -728,10 +728,11 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerialize
     jstring signatures_json,
     jstring dust_actions_json,
     jlong ttl,
-    jstring binding_commitment_hex)
+    jstring binding_commitment_hex,
+    jstring network_id)
 {
     /* Validate inputs */
-    if (inputs_json == NULL || outputs_json == NULL || signatures_json == NULL || dust_actions_json == NULL || binding_commitment_hex == NULL) {
+    if (inputs_json == NULL || outputs_json == NULL || signatures_json == NULL || dust_actions_json == NULL || binding_commitment_hex == NULL || network_id == NULL) {
         LOGE("nativeSerializeTransaction: null parameter");
         return NULL;
     }
@@ -782,8 +783,19 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerialize
         return NULL;
     }
 
+    const char* network_id_c = (*env)->GetStringUTFChars(env, network_id, NULL);
+    if (network_id_c == NULL) {
+        LOGE("nativeSerializeTransaction: GetStringUTFChars failed for network_id");
+        (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+        (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+        (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
+        (*env)->ReleaseStringUTFChars(env, dust_actions_json, dust_actions_c);
+        (*env)->ReleaseStringUTFChars(env, binding_commitment_hex, binding_commitment_c);
+        return NULL;
+    }
+
     /* Call Rust FFI with dust actions */
-    char* hex_str = serialize_unshielded_transaction(inputs_c, outputs_c, signatures_c, dust_actions_c, (uint64_t)ttl, binding_commitment_c);
+    char* hex_str = serialize_unshielded_transaction(inputs_c, outputs_c, signatures_c, dust_actions_c, (uint64_t)ttl, binding_commitment_c, network_id_c);
 
     /* Release Java string buffers */
     (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
@@ -791,6 +803,7 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerialize
     (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
     (*env)->ReleaseStringUTFChars(env, dust_actions_json, dust_actions_c);
     (*env)->ReleaseStringUTFChars(env, binding_commitment_hex, binding_commitment_c);
+    (*env)->ReleaseStringUTFChars(env, network_id, network_id_c);
 
     if (hex_str == NULL) {
         LOGE("nativeSerializeTransaction: Rust FFI returned null");
@@ -844,12 +857,13 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerialize
     jstring dust_utxos_json,
     jlong current_time_ms,
     jlong ttl,
-    jstring binding_commitment_hex)
+    jstring binding_commitment_hex,
+    jstring network_id)
 {
     /* Validate inputs */
     if (inputs_json == NULL || outputs_json == NULL || signatures_json == NULL ||
         dust_state_ptr == 0 || seed == NULL || dust_utxos_json == NULL ||
-        binding_commitment_hex == NULL) {
+        binding_commitment_hex == NULL || network_id == NULL) {
         LOGE("nativeSerializeTransactionWithDust: null parameter");
         return NULL;
     }
@@ -918,6 +932,18 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerialize
         return NULL;
     }
 
+    const char* network_id_c = (*env)->GetStringUTFChars(env, network_id, NULL);
+    if (network_id_c == NULL) {
+        LOGE("nativeSerializeTransactionWithDust: GetStringUTFChars failed for network_id");
+        (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+        (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+        (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
+        (*env)->ReleaseStringUTFChars(env, dust_utxos_json, dust_utxos_c);
+        (*env)->ReleaseStringUTFChars(env, binding_commitment_hex, binding_commitment_c);
+        (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+        return NULL;
+    }
+
     /* Call Rust FFI with real dust state */
     char* hex_str = serialize_unshielded_transaction_with_dust(
         inputs_c,
@@ -929,7 +955,8 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerialize
         dust_utxos_c,
         current_time_ms,
         (uint64_t)ttl,
-        binding_commitment_c
+        binding_commitment_c,
+        network_id_c
     );
 
     /* Zeroize sensitive data */
@@ -941,6 +968,7 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeSerialize
     (*env)->ReleaseStringUTFChars(env, signatures_json, signatures_c);
     (*env)->ReleaseStringUTFChars(env, dust_utxos_json, dust_utxos_c);
     (*env)->ReleaseStringUTFChars(env, binding_commitment_hex, binding_commitment_c);
+    (*env)->ReleaseStringUTFChars(env, network_id, network_id_c);
     (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
 
     if (hex_str == NULL) {
@@ -1950,7 +1978,8 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
     jstring allow_fee_payment,
     jlong ttl_millis,
     jlong current_time_millis,
-    jstring utxos_json
+    jstring utxos_json,
+    jstring network_id
 ) {
     /* Validate inputs */
     if (night_private_key == NULL) {
@@ -1970,6 +1999,11 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
 
     if (utxos_json == NULL) {
         LOGE("nativeBuildDustRegistrationTransaction: utxos_json is null");
+        return NULL;
+    }
+
+    if (network_id == NULL) {
+        LOGE("nativeBuildDustRegistrationTransaction: network_id is null");
         return NULL;
     }
 
@@ -2016,6 +2050,16 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
         return NULL;
     }
 
+    const char* network_id_c = (*env)->GetStringUTFChars(env, network_id, NULL);
+    if (network_id_c == NULL) {
+        LOGE("nativeBuildDustRegistrationTransaction: GetStringUTFChars failed for network_id");
+        (*env)->ReleaseStringUTFChars(env, utxos_json, utxos_c);
+        (*env)->ReleaseStringUTFChars(env, allow_fee_payment, fee_c);
+        (*env)->ReleaseStringUTFChars(env, dust_public_key_hex, dust_pk_c);
+        secure_memzero(key_buf, 32);
+        return NULL;
+    }
+
     /* Call Rust FFI */
     char* tx_hex = build_dust_registration_transaction(
         key_buf,
@@ -2024,7 +2068,8 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
         fee_c,
         (uint64_t)ttl_millis,
         (int64_t)current_time_millis,
-        utxos_c
+        utxos_c,
+        network_id_c
     );
 
     /* SECURITY: Zeroize key after use */
@@ -2034,6 +2079,7 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
     (*env)->ReleaseStringUTFChars(env, dust_public_key_hex, dust_pk_c);
     (*env)->ReleaseStringUTFChars(env, allow_fee_payment, fee_c);
     (*env)->ReleaseStringUTFChars(env, utxos_json, utxos_c);
+    (*env)->ReleaseStringUTFChars(env, network_id, network_id_c);
 
     if (tx_hex == NULL) {
         LOGE("nativeBuildDustRegistrationTransaction: Rust FFI returned NULL");
