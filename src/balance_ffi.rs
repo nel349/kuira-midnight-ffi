@@ -756,6 +756,58 @@ mod preprod_diagnostic {
         // - Timing/ctime mismatch
     }
 
+    /// CRITICAL TEST: does serialize/deserialize preserve the Merkle tree roots?
+    /// Our Android streaming replay does: replay 500 events -> serialize -> save
+    /// -> deserialize -> replay next 500 -> serialize -> save -> ...
+    /// If serialization corrupts the tree, this would explain error 170 on PREPROD.
+    #[tokio::test]
+    async fn test_serialize_deserialize_preserves_roots() {
+        use midnight_ledger::test_utilities::TestState;
+        use midnight_storage::db::InMemoryDB;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(0x42);
+        let mut state = TestState::<InMemoryDB>::new(&mut rng);
+        state.give_fee_token(&mut rng, 1).await;
+
+        let original_com = state.dust.commitment_root();
+        let original_gen = state.dust.generation_root();
+
+        eprintln!("Original roots:");
+        eprintln!("  Commitment: {:?}", original_com);
+        eprintln!("  Generation: {:?}", original_gen);
+
+        // Serialize the state (same as DustRepository.saveState via DustLocalState.serialize())
+        let mut serialized = Vec::new();
+        midnight_serialize::Serializable::serialize(&state.dust, &mut serialized)
+            .expect("serialize should succeed");
+        eprintln!("  Serialized size: {} bytes", serialized.len());
+
+        // Deserialize (same as DustRepository.loadState)
+        let deserialized: DustLocalState<InMemoryDB> =
+            midnight_serialize::Deserializable::deserialize(&mut &serialized[..], 0)
+                .expect("deserialize should succeed");
+
+        let deser_com = deserialized.commitment_root();
+        let deser_gen = deserialized.generation_root();
+
+        eprintln!("After serialize/deserialize:");
+        eprintln!("  Commitment: {:?}", deser_com);
+        eprintln!("  Generation: {:?}", deser_gen);
+
+        assert_eq!(original_com, deser_com,
+            "Commitment root must survive serialize/deserialize round-trip");
+        assert_eq!(original_gen, deser_gen,
+            "Generation root must survive serialize/deserialize round-trip");
+
+        // Also test: can we still spend from the deserialized state?
+        let utxo = deserialized.utxos().next().unwrap();
+        let spend_result = deserialized.spend(&state.dust_key, &utxo, 42, state.time);
+        assert!(spend_result.is_ok(), "Spend after deserialize should work: {:?}", spend_result.err());
+
+        eprintln!("Spend after deserialize: SUCCESS");
+    }
+
     /// Test: verify replay is deterministic (same events -> same roots).
     #[tokio::test]
     async fn test_replay_is_deterministic() {

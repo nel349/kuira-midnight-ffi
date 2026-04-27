@@ -19,7 +19,7 @@ use midnight_ledger::dust::{
 use midnight_ledger::events::Event;
 use midnight_base_crypto::time::Timestamp;
 use midnight_storage::db::InMemoryDB;
-use midnight_serialize::{Serializable, Deserializable};
+use midnight_serialize::{Serializable, Deserializable, tagged_deserialize};
 
 // Android logging macro
 #[cfg(target_os = "android")]
@@ -483,20 +483,22 @@ pub extern "C" fn dust_replay_events(
             }
         };
 
-        // Split events by "midnight:event[v9]:" prefix
-        // Each event from GraphQL has this prefix + SCALE-encoded Event
-        const EVENT_PREFIX: &str = "6d69646e696768743a6576656e745b76395d3a"; // "midnight:event[v9]:"
+        // Split events by "midnight:event[v" tag prefix (hex-encoded ASCII).
+        // Each event from the indexer is tagged SCALE: "midnight:event[v9]:<scale_data>"
+        // Use the same tagged_deserialize that the WASM SDK uses (not manual tag stripping).
+        const TAG_PREFIX_HEX: &str = "6d69646e696768743a6576656e745b76"; // "midnight:event[v"
 
         let event_hex_strings: Vec<&str> = events_hex_str
-            .split(EVENT_PREFIX)
+            .split(TAG_PREFIX_HEX)
             .filter(|s| !s.is_empty())
             .collect();
 
-        // Deserialize each event individually
+        // Deserialize each event using tagged_deserialize (matches WASM SDK's Event.deserialize)
         let mut events: Vec<Event<InMemoryDB>> = Vec::new();
-        for (i, event_hex) in event_hex_strings.iter().enumerate() {
-            // Decode hex to bytes
-            let event_bytes = match hex::decode(event_hex) {
+        for (i, event_hex_suffix) in event_hex_strings.iter().enumerate() {
+            // Reconstruct the full tagged hex: prefix + suffix
+            let full_hex = format!("{}{}", TAG_PREFIX_HEX, event_hex_suffix);
+            let event_bytes = match hex::decode(&full_hex) {
                 Ok(b) => b,
                 Err(e) => {
                     android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Error decoding event {} hex: {}", i, e);
@@ -504,8 +506,8 @@ pub extern "C" fn dust_replay_events(
                 }
             };
 
-            // Deserialize single Event
-            let event: Event<InMemoryDB> = match <Event<InMemoryDB> as Deserializable>::deserialize(&mut &event_bytes[..], 0) {
+            // Use tagged_deserialize (same as WASM SDK's from_value_ser)
+            let event: Event<InMemoryDB> = match midnight_serialize::tagged_deserialize(&event_bytes[..]) {
                 Ok(e) => e,
                 Err(e) => {
                     android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Error deserializing event {}: {} (bytes_len={})", i, e, event_bytes.len());
