@@ -55,6 +55,9 @@ pub mod prove_ffi;
 // Contract operations FFI (Phase 6)
 pub mod contract_ffi;
 
+// Transaction balancing FFI (SDK — balance proven tx with dust)
+pub mod balance_ffi;
+
 // Key validity tests
 #[cfg(test)]
 mod test_key_validity;

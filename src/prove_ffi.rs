@@ -58,13 +58,13 @@ const LOG_ERROR: std::os::raw::c_int = 6;
 
 /// Resolves proving keys from local filesystem + transaction-specific HashMap.
 /// Matches the proof server's Resolver::new() pattern.
-struct LocalFileResolver {
+pub struct LocalFileResolver {
     keys_dir: PathBuf,
     tx_keys: HashMap<String, ProvingKeyMaterial>,
 }
 
 impl LocalFileResolver {
-    fn new(keys_dir: PathBuf, tx_keys: HashMap<String, ProvingKeyMaterial>) -> Self {
+    pub fn new(keys_dir: PathBuf, tx_keys: HashMap<String, ProvingKeyMaterial>) -> Self {
         Self { keys_dir, tx_keys }
     }
 

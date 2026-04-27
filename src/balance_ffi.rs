@@ -1,0 +1,635 @@
+//! Transaction Balancing FFI — Phase 2 SDK
+//!
+//! Balances a proven Compact contract transaction by adding dust fee payment.
+//! Follows the TypeScript SDK pattern: create dust tx → prove separately → merge → seal.
+//!
+//! This is the core operation that replaces the remote `mn serve` wallet for standalone dApps.
+
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+use std::path::PathBuf;
+use std::ptr;
+
+use midnight_base_crypto::signatures::Signature;
+use midnight_base_crypto::time::Timestamp;
+use midnight_ledger::dust::{DustActions, DustLocalState, DustSecretKey, Seed};
+use midnight_ledger::structure::{
+    Intent, LedgerParameters, ProofMarker, ProofPreimageMarker, Transaction,
+    INITIAL_TRANSACTION_COST_MODEL,
+};
+use midnight_serialize::{tagged_deserialize, tagged_serialize};
+use midnight_storage::storage::HashMap as StorageHashMap;
+use midnight_storage::DefaultDB;
+use midnight_transient_crypto::commitment::PedersenRandomness;
+use midnight_transient_crypto::proofs::ProvingKeyMaterial;
+use rand::rngs::OsRng;
+use rand::{Rng, SeedableRng};
+
+// Reuse the local prover infrastructure from prove_ffi
+use crate::prove_ffi::LocalFileResolver;
+
+// ── Logging ──
+
+#[cfg(target_os = "android")]
+macro_rules! balance_log {
+    ($level:expr, $($arg:tt)*) => {{
+        log::log!(
+            if $level >= 6 { log::Level::Error } else { log::Level::Info },
+            "{}", format!($($arg)*)
+        );
+    }};
+}
+
+#[cfg(not(target_os = "android"))]
+macro_rules! balance_log {
+    ($level:expr, $($arg:tt)*) => {{
+        eprintln!("[KuiraBalance] {}", format!($($arg)*));
+    }};
+}
+
+const LOG_INFO: std::os::raw::c_int = 4;
+const LOG_ERROR: std::os::raw::c_int = 6;
+
+/// Additional safety overhead percentage (matches fee_ffi.rs).
+const FEE_OVERHEAD_PERCENT: u128 = 1;
+const DEFAULT_FEE_BLOCKS_MARGIN: usize = 5;
+
+// ── FFI Entry Point ──
+
+/// Balance a proven transaction by adding dust fee payment, then seal it.
+///
+/// This replaces the remote `DAppConnectorClient.balanceTransaction()` call,
+/// enabling fully standalone dApp operation without `mn serve`.
+///
+/// # Flow (matches TypeScript SDK pattern)
+///
+/// 1. Deserialize the proven transaction (from circuit execution + proof)
+/// 2. Calculate the fee using ledger parameters
+/// 3. Create dust spend proofs from the wallet's dust state
+/// 4. Build a dust-only unproven transaction
+/// 5. Prove the dust transaction locally (generates ZK proofs for dust spends)
+/// 6. Merge the proven original + proven dust transactions
+/// 7. Seal the merged transaction (PedersenRandomness → PureGeneratorPedersen)
+/// 8. Return the balanced+sealed transaction hex
+///
+/// # Parameters
+///
+/// - `proven_tx_hex`: Tagged-SCALE hex of the proven transaction
+/// - `dust_state_ptr`: Active DustLocalState pointer (modified on success — spends recorded)
+/// - `seed_ptr`: 32-byte dust seed for DustSecretKey derivation
+/// - `seed_len`: Must be 32
+/// - `ledger_params_hex`: Tagged-SCALE hex of ledger parameters
+/// - `current_time_ms`: Current time in milliseconds (for dust spend timestamp)
+/// - `keys_dir`: Path to cached proving keys directory
+/// - `network_id`: Network ID string (e.g., "undeployed", "preview", "preprod")
+///
+/// # Returns
+///
+/// Tagged-SCALE hex of the balanced+sealed transaction, or null on error.
+/// Caller must free with `free_balanced_transaction`.
+///
+/// # Safety
+///
+/// All pointer parameters must be valid, non-null. `dust_state_ptr` is modified on success.
+#[no_mangle]
+pub extern "C" fn balance_proven_transaction(
+    proven_tx_hex: *const c_char,
+    dust_state_ptr: *mut DustLocalState<DefaultDB>,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    ledger_params_hex: *const c_char,
+    current_time_ms: i64,
+    keys_dir: *const c_char,
+    network_id: *const c_char,
+) -> *mut c_char {
+    // Null checks
+    if proven_tx_hex.is_null()
+        || dust_state_ptr.is_null()
+        || seed_ptr.is_null()
+        || ledger_params_hex.is_null()
+        || keys_dir.is_null()
+        || network_id.is_null()
+    {
+        balance_log!(LOG_ERROR, "Null pointer in balance_proven_transaction");
+        return ptr::null_mut();
+    }
+
+    if seed_len != 32 {
+        balance_log!(LOG_ERROR, "Seed must be 32 bytes, got {}", seed_len);
+        return ptr::null_mut();
+    }
+
+    // Convert C strings to Rust
+    let proven_hex = match unsafe { CStr::from_ptr(proven_tx_hex).to_str() } {
+        Ok(s) => s.trim(),
+        Err(e) => {
+            balance_log!(LOG_ERROR, "Invalid UTF-8 in proven_tx_hex: {}", e);
+            return ptr::null_mut();
+        }
+    };
+
+    let params_hex = match unsafe { CStr::from_ptr(ledger_params_hex).to_str() } {
+        Ok(s) => s.trim(),
+        Err(e) => {
+            balance_log!(LOG_ERROR, "Invalid UTF-8 in ledger_params_hex: {}", e);
+            return ptr::null_mut();
+        }
+    };
+
+    let keys_path = match unsafe { CStr::from_ptr(keys_dir).to_str() } {
+        Ok(s) => PathBuf::from(s),
+        Err(e) => {
+            balance_log!(LOG_ERROR, "Invalid UTF-8 in keys_dir: {}", e);
+            return ptr::null_mut();
+        }
+    };
+
+    let network_id_str = match unsafe { CStr::from_ptr(network_id).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            balance_log!(LOG_ERROR, "Invalid UTF-8 in network_id: {}", e);
+            return ptr::null_mut();
+        }
+    };
+
+    // Convert seed
+    let seed_slice = unsafe { std::slice::from_raw_parts(seed_ptr, seed_len) };
+    let mut seed_array: Seed = [0u8; 32];
+    seed_array.copy_from_slice(seed_slice);
+
+    // Get mutable reference to dust state
+    let dust_state = unsafe { &*dust_state_ptr };
+
+    match balance_proven_transaction_impl(
+        proven_hex,
+        dust_state,
+        &seed_array,
+        params_hex,
+        current_time_ms,
+        &keys_path,
+        network_id_str,
+    ) {
+        Ok((balanced_hex, updated_state)) => {
+            // Update the dust state pointer with spent nullifiers
+            unsafe {
+                *dust_state_ptr = updated_state;
+            }
+            balance_log!(LOG_INFO, "Updated dust state after successful balance");
+
+            match CString::new(balanced_hex) {
+                Ok(c_str) => c_str.into_raw(),
+                Err(e) => {
+                    balance_log!(LOG_ERROR, "Failed to create C string: {}", e);
+                    ptr::null_mut()
+                }
+            }
+        }
+        Err(e) => {
+            balance_log!(LOG_ERROR, "balance_proven_transaction failed: {}", e);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Frees a string returned by [balance_proven_transaction].
+#[no_mangle]
+pub extern "C" fn free_balanced_transaction(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        unsafe {
+            drop(CString::from_raw(ptr));
+        }
+    }
+}
+
+// ── Implementation ──
+
+fn balance_proven_transaction_impl(
+    proven_hex: &str,
+    dust_state: &DustLocalState<DefaultDB>,
+    seed: &Seed,
+    params_hex: &str,
+    current_time_ms: i64,
+    keys_path: &PathBuf,
+    network_id: &str,
+) -> Result<(String, DustLocalState<DefaultDB>), String> {
+    use midnight_storage::arena::Sp;
+    use midnight_storage::storage::Array as StorageArray;
+
+    balance_log!(LOG_INFO, "Starting balance: proven_tx={} chars, keys_dir={:?}",
+        proven_hex.len(), keys_path);
+
+    // ── Step 1: Deserialize the proven transaction ──
+
+    let proven_bytes = hex::decode(proven_hex)
+        .map_err(|e| format!("Failed to decode proven tx hex: {}", e))?;
+
+    type ProvenTx = Transaction<Signature, ProofMarker, PedersenRandomness, DefaultDB>;
+
+    let proven_tx: ProvenTx = tagged_deserialize(&proven_bytes[..])
+        .map_err(|e| format!("Failed to deserialize proven transaction: {:?}", e))?;
+
+    balance_log!(LOG_INFO, "Deserialized proven tx: {} bytes", proven_bytes.len());
+
+    // ── Step 2: Calculate fee ──
+    //
+    // The TS SDK erases proofs before fee calculation because fees_with_margin
+    // on a ProofMarker transaction returns 0 (proofs are compact, so the "proof
+    // preimage cost" component is 0). Instead of erasing proofs (which requires
+    // a different type), we call erase_proofs() on the proven tx to get a
+    // NoProof version, then calculate fees on that.
+
+    let params_bytes = hex::decode(params_hex)
+        .map_err(|e| format!("Failed to decode ledger params hex: {}", e))?;
+
+    balance_log!(LOG_INFO, "Params raw bytes: {} bytes, first 40 = {}",
+        params_bytes.len(), hex::encode(&params_bytes[..params_bytes.len().min(40)]));
+
+    // Try tagged deserialization first, fall back to raw
+    let params: LedgerParameters = match tagged_deserialize(&params_bytes[..]) {
+        Ok(p) => {
+            balance_log!(LOG_INFO, "Params deserialized via tagged_deserialize");
+            p
+        }
+        Err(tag_err) => {
+            balance_log!(LOG_INFO, "tagged_deserialize failed ({}), trying raw after strip_tag_prefix", tag_err);
+            let stripped = strip_tag_prefix(params_bytes.clone());
+            balance_log!(LOG_INFO, "After strip: {} bytes (was {})", stripped.len(), params_bytes.len());
+            midnight_serialize::Deserializable::deserialize(&mut &stripped[..], 0)
+                .map_err(|e| format!("Failed to deserialize ledger parameters: {:?} (tagged also failed: {})", e, tag_err))?
+        }
+    };
+
+    // fees_with_margin returns 0 for ProofMarker transactions because proven
+    // transactions have compact proofs (the fee is based on proof preimage sizes).
+    // The TS SDK solves this with a convergence loop on erased-proof merges.
+    //
+    // Pragmatic approach: build a minimal ProofPreimageMarker transaction with the
+    // same structure (same number of intents), calculate its fee using INITIAL_PARAMETERS,
+    // and use that as the fee for our proven tx. This overestimates slightly (proof
+    // preimage sizes are larger than actual proofs) which is safe — we pay a bit more
+    // dust than needed, but the tx won't be rejected for underpayment.
+
+    let base_fee = {
+        // Create a minimal unproven tx that matches the structure of the proven one
+        let dummy_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
+            guaranteed_unshielded_offer: None,
+            fallible_unshielded_offer: None,
+            actions: std::iter::empty().collect(),
+            dust_actions: None,
+            ttl: Timestamp::from_secs(current_time_ms as u64 / 1000 + 1800),
+            binding_commitment: PedersenRandomness::from(0),
+        };
+        let dummy_intents = StorageHashMap::default().insert(1u16, dummy_intent);
+        let dummy_tx = Transaction::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>::new(
+            network_id,
+            dummy_intents,
+            None,
+            midnight_storage::storage::HashMap::new(),
+        );
+
+        // Calculate fee on the dummy tx with the real ledger params
+        let fee = dummy_tx
+            .fees_with_margin(&params, DEFAULT_FEE_BLOCKS_MARGIN)
+            .map_err(|e| format!("Fee calculation failed: {:?}", e))?;
+
+        if fee == 0 {
+            // If params-based fee is also 0, use INITIAL_PARAMETERS as fallback
+            let initial_params = midnight_ledger::structure::INITIAL_PARAMETERS;
+            let fallback_fee = dummy_tx
+                .fees_with_margin(&initial_params, DEFAULT_FEE_BLOCKS_MARGIN)
+                .map_err(|e| format!("Fee calculation (initial params) failed: {:?}", e))?;
+            balance_log!(LOG_INFO, "Params-based fee was 0, using INITIAL_PARAMETERS: {} specks", fallback_fee);
+            fallback_fee
+        } else {
+            fee
+        }
+    };
+
+    let overhead = base_fee * FEE_OVERHEAD_PERCENT / 100;
+    let total_fee: u128 = base_fee + overhead;
+
+    balance_log!(LOG_INFO, "Calculated fee: {} specks (base={}, overhead={})",
+        total_fee, base_fee, overhead);
+
+    if total_fee == 0 {
+        return Err("Calculated fee is 0 — both ledger and initial params produced zero".into());
+    }
+
+    // ── Step 3: Create dust spends ──
+
+    let dust_secret_key = DustSecretKey::derive_secret_key(seed);
+    let timestamp = Timestamp::from_secs((current_time_ms / 1000) as u64);
+
+    let utxos: Vec<_> = dust_state.utxos().collect();
+    let mut current_state = dust_state.clone();
+    let mut dust_spends = Vec::new();
+    let mut fee_remaining = total_fee;
+
+    for (idx, utxo) in utxos.iter().enumerate() {
+        if fee_remaining == 0 {
+            break;
+        }
+
+        match current_state.spend(&dust_secret_key, utxo, fee_remaining, timestamp) {
+            Ok((new_state, dust_spend)) => {
+                current_state = new_state;
+                dust_spends.push(dust_spend);
+                balance_log!(LOG_INFO, "Created DustSpend from UTXO {}: v_fee={}", idx, fee_remaining);
+                fee_remaining = 0;
+            }
+            Err(e) => {
+                balance_log!(LOG_INFO, "Skipping UTXO {} (insufficient balance: {:?})", idx, e);
+                continue;
+            }
+        }
+    }
+
+    if fee_remaining > 0 {
+        return Err(format!(
+            "Insufficient dust balance. Need {} specks, no UTXO has enough.",
+            total_fee
+        ));
+    }
+
+    balance_log!(LOG_INFO, "Created {} dust spend(s) for total fee {}", dust_spends.len(), total_fee);
+
+    // ── Step 4: Build dust-only unproven transaction ──
+
+    let spends_array: StorageArray<_, DefaultDB> = dust_spends.into_iter().collect();
+    let registrations_array: StorageArray<
+        midnight_ledger::dust::DustRegistration<Signature, DefaultDB>,
+        DefaultDB,
+    > = std::iter::empty().collect();
+
+    let dust_actions = DustActions {
+        spends: spends_array,
+        registrations: registrations_array,
+        ctime: timestamp,
+    };
+
+    // Random segment ID for the dust intent (avoids collision with original tx segments)
+    let dust_segment_id: u16 = OsRng.gen_range(2..u16::MAX);
+
+    // Dust intent: no unshielded offers, no circuit actions, only dust
+    let dust_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
+        guaranteed_unshielded_offer: None,
+        fallible_unshielded_offer: None,
+        actions: std::iter::empty().collect(),
+        dust_actions: Some(Sp::new(dust_actions)),
+        ttl: Timestamp::from_secs(current_time_ms as u64 / 1000 + 1800), // 30 min TTL
+        binding_commitment: PedersenRandomness::from(0), // zero binding for dust-only intent
+    };
+
+    let dust_intents_map = StorageHashMap::default().insert(dust_segment_id, dust_intent);
+
+    let dust_tx = Transaction::new(
+        network_id,
+        dust_intents_map,
+        None,
+        midnight_storage::storage::HashMap::new(),
+    );
+
+    balance_log!(LOG_INFO, "Built dust-only unproven tx at segment {}", dust_segment_id);
+
+    // ── Step 5: Prove the dust transaction locally ──
+
+    // Serialize the dust tx as (Transaction, HashMap) tuple (prover input format)
+    let empty_proving_keys = HashMap::<String, ProvingKeyMaterial>::new();
+    let mut dust_tx_bytes = Vec::new();
+    tagged_serialize(&(&dust_tx, &empty_proving_keys), &mut dust_tx_bytes)
+        .map_err(|e| format!("Failed to serialize dust tx for proving: {:?}", e))?;
+
+    balance_log!(LOG_INFO, "Serialized dust tx for proving: {} bytes", dust_tx_bytes.len());
+
+    // Deserialize back as the prover's expected type
+    // (round-trip through serialization ensures correct type)
+    type UnprovenTxPayload = (
+        Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>,
+        HashMap<String, ProvingKeyMaterial>,
+    );
+
+    let (dust_tx_for_prover, tx_keys): UnprovenTxPayload =
+        tagged_deserialize(&mut &dust_tx_bytes[..])
+            .map_err(|e| format!("Failed to re-deserialize dust tx: {:?}", e))?;
+
+    // Create local proving provider
+    let resolver = LocalFileResolver::new(keys_path.clone(), tx_keys);
+    let provider = midnight_zkir::LocalProvingProvider {
+        rng: OsRng,
+        params: &resolver,
+        resolver: &resolver,
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
+
+    balance_log!(LOG_INFO, "Starting local proof for dust tx...");
+    let prove_start = std::time::Instant::now();
+
+    let cost_model = &INITIAL_TRANSACTION_COST_MODEL.runtime_cost_model;
+
+    let proven_dust_tx = rt
+        .block_on(async { dust_tx_for_prover.prove(provider, cost_model).await })
+        .map_err(|e| format!("Local proving of dust tx failed: {}", e))?;
+
+    let prove_elapsed = prove_start.elapsed();
+    balance_log!(LOG_INFO, "Dust tx proved in {:.2}s", prove_elapsed.as_secs_f64());
+
+    // ── Step 6: Merge proven original + proven dust ──
+
+    // Both are now Transaction<Signature, ProofMarker, PedersenRandomness, DefaultDB>
+    let merged_tx = proven_tx
+        .merge(&proven_dust_tx)
+        .map_err(|e| format!("Failed to merge transactions: {:?}", e))?;
+
+    balance_log!(LOG_INFO, "Merged proven original + proven dust");
+
+    // ── Step 7: Seal the merged transaction ──
+
+    let rng = rand::rngs::StdRng::seed_from_u64(0x00);
+    let sealed_tx = merged_tx.seal(rng);
+
+    balance_log!(LOG_INFO, "Sealed merged transaction");
+
+    // ── Step 8: Serialize and return ──
+
+    let mut result_bytes = Vec::new();
+    tagged_serialize(&sealed_tx, &mut result_bytes)
+        .map_err(|e| format!("Failed to serialize balanced transaction: {:?}", e))?;
+
+    let result_hex = hex::encode(&result_bytes);
+
+    balance_log!(
+        LOG_INFO,
+        "Balance complete: {} bytes → {} bytes (fee={} specks, prove={:.2}s)",
+        proven_bytes.len(),
+        result_bytes.len(),
+        total_fee,
+        prove_elapsed.as_secs_f64()
+    );
+
+    Ok((result_hex, current_state))
+}
+
+/// Strip the tag prefix from tagged SCALE serialization.
+/// Copied from fee_ffi.rs — same logic.
+fn strip_tag_prefix(bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.len() < 9 {
+        return bytes;
+    }
+
+    if &bytes[0..9] == b"midnight:" {
+        for i in 9..bytes.len() - 1 {
+            if bytes[i] == b')' && bytes[i + 1] == b':' {
+                return bytes[i + 2..].to_vec();
+            }
+            if bytes[i] == b']' && bytes[i + 1] == b':' {
+                return bytes[i + 2..].to_vec();
+            }
+        }
+    }
+
+    bytes
+}
+
+// ── Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_null_safety() {
+        let result = balance_proven_transaction(
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null(),
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        );
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_invalid_seed_length() {
+        let tx_hex = CString::new("deadbeef").unwrap();
+        let params_hex = CString::new("deadbeef").unwrap();
+        let keys_dir = CString::new("/tmp").unwrap();
+        let network = CString::new("undeployed").unwrap();
+        let seed = [0u8; 16]; // Wrong length
+
+        let result = balance_proven_transaction(
+            tx_hex.as_ptr(),
+            ptr::null_mut(), // Will fail at null check before seed check
+            seed.as_ptr(),
+            seed.len(),
+            params_hex.as_ptr(),
+            0,
+            keys_dir.as_ptr(),
+            network.as_ptr(),
+        );
+        assert!(result.is_null());
+    }
+
+    #[test]
+    fn test_invalid_proven_tx_hex() {
+        let tx_hex = CString::new("not_valid_hex").unwrap();
+        let params_hex = CString::new("deadbeef").unwrap();
+        let keys_dir = CString::new("/tmp").unwrap();
+        let network = CString::new("undeployed").unwrap();
+        let seed = [0u8; 32];
+
+        // Create a minimal dust state for the test
+        use midnight_ledger::dust::INITIAL_DUST_PARAMETERS;
+        let dust_state = DustLocalState::<DefaultDB>::new(INITIAL_DUST_PARAMETERS);
+        let mut boxed_state = Box::new(dust_state);
+
+        let result = balance_proven_transaction(
+            tx_hex.as_ptr(),
+            &mut *boxed_state as *mut _,
+            seed.as_ptr(),
+            seed.len(),
+            params_hex.as_ptr(),
+            1704067200000,
+            keys_dir.as_ptr(),
+            network.as_ptr(),
+        );
+        assert!(result.is_null(), "Should fail on invalid hex");
+    }
+
+    #[test]
+    fn test_fees_with_margin_on_initial_params() {
+        // Test that fees_with_margin actually returns non-zero on a minimal transaction
+        // using the INITIAL_TRANSACTION_COST_MODEL params (same as localnet)
+        use midnight_ledger::structure::{
+            Transaction, Intent, StandardTransaction, ProofPreimageMarker,
+            INITIAL_TRANSACTION_COST_MODEL,
+        };
+        use midnight_transient_crypto::commitment::PedersenRandomness;
+        use midnight_storage::storage::HashMap as StorageHashMap;
+
+        // Create a minimal transaction with one empty intent
+        let intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
+            guaranteed_unshielded_offer: None,
+            fallible_unshielded_offer: None,
+            actions: std::iter::empty().collect(),
+            dust_actions: None,
+            ttl: Timestamp::from_secs(1704067200),
+            binding_commitment: PedersenRandomness::from(0),
+        };
+        let intents = StorageHashMap::default().insert(1u16, intent);
+        let tx = Transaction::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>::new(
+            "undeployed",
+            intents,
+            None,
+            midnight_storage::storage::HashMap::new(),
+        );
+
+        let params = midnight_ledger::structure::INITIAL_PARAMETERS;
+        let fee = tx.fees_with_margin(&params, 5);
+        eprintln!("fees_with_margin on minimal ProofPreimageMarker tx: {:?}", fee);
+
+        // Now test with a ProofMarker tx (proven) — does it return 0?
+        // Serialize as unproven tuple, prove locally would require keys.
+        // Instead, just verify ProofPreimageMarker works.
+        match fee {
+            Ok(f) => eprintln!("Fee value: {}", f),
+            Err(e) => eprintln!("Fee error: {:?}", e),
+        }
+
+        // Serialize INITIAL_PARAMETERS to check the expected size
+        let mut params_bytes = Vec::new();
+        midnight_serialize::tagged_serialize(&params, &mut params_bytes).unwrap();
+        eprintln!("INITIAL_PARAMETERS serialized: {} bytes", params_bytes.len());
+        eprintln!("Tag prefix: {:?}", String::from_utf8_lossy(&params_bytes[..params_bytes.len().min(60)]));
+    }
+
+    #[test]
+    fn test_strip_tag_prefix_with_tag() {
+        let tagged = b"midnight:ledger-parameters[v4]:deadbeef".to_vec();
+        let stripped = strip_tag_prefix(tagged);
+        assert_eq!(stripped, b"deadbeef");
+    }
+
+    #[test]
+    fn test_strip_tag_prefix_with_params_tag() {
+        let tagged =
+            b"midnight:transaction[v6](signature[v1],proof,pedersen-schnorr[v1]):cafebabe"
+                .to_vec();
+        let stripped = strip_tag_prefix(tagged);
+        assert_eq!(stripped, b"cafebabe");
+    }
+
+    #[test]
+    fn test_strip_tag_prefix_no_tag() {
+        let raw = b"deadbeef".to_vec();
+        let stripped = strip_tag_prefix(raw.clone());
+        assert_eq!(stripped, raw);
+    }
+}

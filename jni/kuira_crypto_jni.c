@@ -180,6 +180,10 @@ extern char* calculate_transaction_fee(const char* tx_hex, const char* params_he
 /* Dust registration transaction builder (serialize.rs) */
 extern char* build_dust_registration_transaction(const uint8_t* night_private_key_ptr, size_t night_private_key_len, const char* dust_public_key_hex, const char* allow_fee_payment_str, uint64_t ttl_millis, int64_t current_time_millis, const char* utxos_json, const char* network_id);
 
+/* Transaction balancing — balance proven tx with dust fees (balance_ffi.rs) */
+extern char* balance_proven_transaction(const char* proven_tx_hex, void* dust_state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* ledger_params_hex, int64_t current_time_ms, const char* keys_dir, const char* network_id);
+extern void free_balanced_transaction(char* ptr);
+
 /* JNI function implementations */
 
 /**
@@ -2853,6 +2857,132 @@ Java_com_midnight_kuira_core_compact_ContractRuntime_nativeAssembleContractCallT
     jstring jresult = (*env)->NewStringUTF(env, result);
     contract_free_string((char*)result);
     return jresult;
+}
+
+/**
+ * Balance a proven transaction with dust fee payment (SDK — balance_ffi.rs)
+ *
+ * Takes a proven (but unsealed) Compact contract transaction, adds dust fees
+ * via local proving, seals it, and returns the balanced+sealed transaction.
+ * Replaces the remote DAppConnectorClient.balanceTransaction() call.
+ *
+ * JNI signature matches:
+ *   package com.midnight.kuira.sdk
+ *   object TransactionBalancerNative {
+ *       external fun nativeBalanceProvenTransaction(
+ *           provenTxHex: String,
+ *           dustStatePtr: Long,
+ *           seed: ByteArray,
+ *           ledgerParamsHex: String,
+ *           currentTimeMs: Long,
+ *           keysDir: String,
+ *           networkId: String
+ *       ): String?
+ *   }
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_sdk_TransactionBalancerNative_nativeBalanceProvenTransaction(
+    JNIEnv* env,
+    jobject obj,
+    jstring proven_tx_hex,
+    jlong dust_state_ptr,
+    jbyteArray seed,
+    jstring ledger_params_hex,
+    jlong current_time_ms,
+    jstring keys_dir,
+    jstring network_id)
+{
+    /* Validate inputs */
+    if (proven_tx_hex == NULL || dust_state_ptr == 0 || seed == NULL ||
+        ledger_params_hex == NULL || keys_dir == NULL || network_id == NULL) {
+        LOGE("nativeBalanceProvenTransaction: null parameter");
+        return NULL;
+    }
+
+    /* Get seed bytes */
+    jsize seed_len = (*env)->GetArrayLength(env, seed);
+    if (seed_len != 32) {
+        LOGE("nativeBalanceProvenTransaction: seed must be 32 bytes, got %d", (int)seed_len);
+        return NULL;
+    }
+
+    jbyte* seed_bytes = (*env)->GetByteArrayElements(env, seed, NULL);
+    if (seed_bytes == NULL) {
+        LOGE("nativeBalanceProvenTransaction: GetByteArrayElements failed for seed");
+        return NULL;
+    }
+
+    /* Convert Java strings to C strings */
+    const char* proven_c = (*env)->GetStringUTFChars(env, proven_tx_hex, NULL);
+    if (proven_c == NULL) {
+        (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+        return NULL;
+    }
+
+    const char* params_c = (*env)->GetStringUTFChars(env, ledger_params_hex, NULL);
+    if (params_c == NULL) {
+        (*env)->ReleaseStringUTFChars(env, proven_tx_hex, proven_c);
+        (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+        return NULL;
+    }
+
+    const char* keys_c = (*env)->GetStringUTFChars(env, keys_dir, NULL);
+    if (keys_c == NULL) {
+        (*env)->ReleaseStringUTFChars(env, proven_tx_hex, proven_c);
+        (*env)->ReleaseStringUTFChars(env, ledger_params_hex, params_c);
+        (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+        return NULL;
+    }
+
+    const char* network_c = (*env)->GetStringUTFChars(env, network_id, NULL);
+    if (network_c == NULL) {
+        (*env)->ReleaseStringUTFChars(env, proven_tx_hex, proven_c);
+        (*env)->ReleaseStringUTFChars(env, ledger_params_hex, params_c);
+        (*env)->ReleaseStringUTFChars(env, keys_dir, keys_c);
+        (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+        return NULL;
+    }
+
+    /* Call Rust FFI */
+    char* result_hex = balance_proven_transaction(
+        proven_c,
+        (void*)dust_state_ptr,
+        (const uint8_t*)seed_bytes,
+        (size_t)seed_len,
+        params_c,
+        current_time_ms,
+        keys_c,
+        network_c
+    );
+
+    /* Zeroize sensitive data */
+    secure_memzero(seed_bytes, seed_len);
+
+    /* Release Java string buffers */
+    (*env)->ReleaseStringUTFChars(env, proven_tx_hex, proven_c);
+    (*env)->ReleaseStringUTFChars(env, ledger_params_hex, params_c);
+    (*env)->ReleaseStringUTFChars(env, keys_dir, keys_c);
+    (*env)->ReleaseStringUTFChars(env, network_id, network_c);
+    (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+
+    if (result_hex == NULL) {
+        LOGE("nativeBalanceProvenTransaction: Rust FFI returned null");
+        return NULL;
+    }
+
+    /* Convert C string to Java string */
+    jstring result = (*env)->NewStringUTF(env, result_hex);
+
+    /* Free Rust-allocated string */
+    free_balanced_transaction(result_hex);
+
+    if (result == NULL) {
+        LOGE("nativeBalanceProvenTransaction: NewStringUTF failed");
+        return NULL;
+    }
+
+    LOGI("Proven transaction balanced and sealed successfully");
+    return result;
 }
 
 JNIEXPORT jint JNICALL
