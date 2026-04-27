@@ -397,7 +397,7 @@ fn balance_proven_transaction_impl(
         actions: std::iter::empty().collect(),
         dust_actions: Some(Sp::new(dust_actions)),
         ttl: Timestamp::from_secs(timestamp_secs + 1800), // 30 min TTL
-        binding_commitment: PedersenRandomness::from(0), // zero binding for dust-only intent
+        binding_commitment: OsRng.gen(), // random binding (matches facade's Intent::new)
     };
 
     let dust_intents_map = StorageHashMap::default().insert(dust_segment_id, dust_intent);
