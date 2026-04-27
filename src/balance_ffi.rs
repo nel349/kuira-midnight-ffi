@@ -412,28 +412,11 @@ fn balance_proven_transaction_impl(
     balance_log!(LOG_INFO, "Built dust-only unproven tx at segment {}", dust_segment_id);
 
     // ── Step 5: Prove the dust transaction locally ──
+    // Prove the dust tx directly (no serialize/deserialize round-trip).
+    // The prover resolves keys from the file system, no tx-embedded keys needed.
 
-    // Serialize the dust tx as (Transaction, HashMap) tuple (prover input format)
-    let empty_proving_keys = HashMap::<String, ProvingKeyMaterial>::new();
-    let mut dust_tx_bytes = Vec::new();
-    tagged_serialize(&(&dust_tx, &empty_proving_keys), &mut dust_tx_bytes)
-        .map_err(|e| format!("Failed to serialize dust tx for proving: {:?}", e))?;
-
-    balance_log!(LOG_INFO, "Serialized dust tx for proving: {} bytes", dust_tx_bytes.len());
-
-    // Deserialize back as the prover's expected type
-    // (round-trip through serialization ensures correct type)
-    type UnprovenTxPayload = (
-        Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>,
-        HashMap<String, ProvingKeyMaterial>,
-    );
-
-    let (dust_tx_for_prover, tx_keys): UnprovenTxPayload =
-        tagged_deserialize(&mut &dust_tx_bytes[..])
-            .map_err(|e| format!("Failed to re-deserialize dust tx: {:?}", e))?;
-
-    // Create local proving provider
-    let resolver = LocalFileResolver::new(keys_path.clone(), tx_keys);
+    let empty_keys = HashMap::<String, ProvingKeyMaterial>::new();
+    let resolver = LocalFileResolver::new(keys_path.clone(), empty_keys);
     let provider = midnight_zkir::LocalProvingProvider {
         rng: OsRng,
         params: &resolver,
@@ -451,7 +434,7 @@ fn balance_proven_transaction_impl(
     let cost_model = &INITIAL_TRANSACTION_COST_MODEL.runtime_cost_model;
 
     let proven_dust_tx = rt
-        .block_on(async { dust_tx_for_prover.prove(provider, cost_model).await })
+        .block_on(async { dust_tx.prove(provider, cost_model).await })
         .map_err(|e| format!("Local proving of dust tx failed: {}", e))?;
 
     let prove_elapsed = prove_start.elapsed();
