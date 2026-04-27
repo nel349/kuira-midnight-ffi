@@ -492,8 +492,6 @@ pub extern "C" fn dust_replay_events(
             .filter(|s| !s.is_empty())
             .collect();
 
-        android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Split into {} event hex strings", event_hex_strings.len());
-
         // Deserialize each event individually
         let mut events: Vec<Event<InMemoryDB>> = Vec::new();
         for (i, event_hex) in event_hex_strings.iter().enumerate() {
@@ -519,8 +517,6 @@ pub extern "C" fn dust_replay_events(
             events.push(event);
         }
 
-        android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Successfully deserialized {} events", events.len());
-
         // Get current state
         let state = &*state_ptr;
 
@@ -532,8 +528,6 @@ pub extern "C" fn dust_replay_events(
                 return ptr::null_mut();
             }
         };
-
-        android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Successfully replayed events!");
 
         // Return new state (boxed)
         Box::into_raw(Box::new(new_state))
