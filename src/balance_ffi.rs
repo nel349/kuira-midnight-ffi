@@ -24,7 +24,7 @@ use midnight_storage::DefaultDB;
 use midnight_transient_crypto::commitment::PedersenRandomness;
 use midnight_transient_crypto::proofs::ProvingKeyMaterial;
 use rand::rngs::OsRng;
-use rand::{Rng, SeedableRng};
+use rand::Rng;
 
 // Reuse the local prover infrastructure from prove_ffi
 use crate::prove_ffi::LocalFileResolver;
@@ -121,6 +121,7 @@ pub extern "C" fn balance_proven_transaction(
     }
 
     // Convert C strings to Rust
+    // SAFETY: All pointers validated non-null above. JNI guarantees valid C strings.
     let proven_hex = match unsafe { CStr::from_ptr(proven_tx_hex).to_str() } {
         Ok(s) => s.trim(),
         Err(e) => {
@@ -154,11 +155,13 @@ pub extern "C" fn balance_proven_transaction(
     };
 
     // Convert seed
+    // SAFETY: seed_ptr validated non-null, seed_len validated == 32 above.
     let seed_slice = unsafe { std::slice::from_raw_parts(seed_ptr, seed_len) };
     let mut seed_array: Seed = [0u8; 32];
     seed_array.copy_from_slice(seed_slice);
 
-    // Get mutable reference to dust state
+    // SAFETY: dust_state_ptr validated non-null. Immutable borrow is safe because
+    // the impl function clones the state before mutation.
     let dust_state = unsafe { &*dust_state_ptr };
 
     match balance_proven_transaction_impl(
@@ -171,7 +174,8 @@ pub extern "C" fn balance_proven_transaction(
         network_id_str,
     ) {
         Ok((balanced_hex, updated_state)) => {
-            // Update the dust state pointer with spent nullifiers
+            // SAFETY: dust_state_ptr validated non-null at entry. The old state was
+            // only borrowed immutably (then cloned in impl), so this write is safe.
             unsafe {
                 *dust_state_ptr = updated_state;
             }
@@ -319,7 +323,9 @@ fn balance_proven_transaction_impl(
     // ── Step 3: Create dust spends ──
 
     let dust_secret_key = DustSecretKey::derive_secret_key(seed);
-    let timestamp = Timestamp::from_secs((current_time_ms / 1000) as u64);
+    let timestamp_secs = u64::try_from(current_time_ms / 1000)
+        .map_err(|_| format!("Negative timestamp: {}", current_time_ms))?;
+    let timestamp = Timestamp::from_secs(timestamp_secs);
 
     let utxos: Vec<_> = dust_state.utxos().collect();
     let mut current_state = dust_state.clone();
@@ -333,6 +339,19 @@ fn balance_proven_transaction_impl(
 
         match current_state.spend(&dust_secret_key, utxo, fee_remaining, timestamp) {
             Ok((new_state, dust_spend)) => {
+                // Diagnostic: log the Merkle roots used in the proof
+                if let Some(com_root) = current_state.commitment_root() {
+                    balance_log!(LOG_INFO, "Commitment root BEFORE spend: {:?}", com_root);
+                } else {
+                    balance_log!(LOG_ERROR, "Commitment root is None (tree not rehashed!)");
+                }
+                if let Some(gen_root) = current_state.generation_root() {
+                    balance_log!(LOG_INFO, "Generation root BEFORE spend: {:?}", gen_root);
+                } else {
+                    balance_log!(LOG_ERROR, "Generation root is None (tree not rehashed!)");
+                }
+                balance_log!(LOG_INFO, "Dust ctime (timestamp_secs): {}", timestamp_secs);
+                balance_log!(LOG_INFO, "UTXO count: {}, events replayed to state", utxos.len());
                 current_state = new_state;
                 dust_spends.push(dust_spend);
                 balance_log!(LOG_INFO, "Created DustSpend from UTXO {}: v_fee={}", idx, fee_remaining);
@@ -377,7 +396,7 @@ fn balance_proven_transaction_impl(
         fallible_unshielded_offer: None,
         actions: std::iter::empty().collect(),
         dust_actions: Some(Sp::new(dust_actions)),
-        ttl: Timestamp::from_secs(current_time_ms as u64 / 1000 + 1800), // 30 min TTL
+        ttl: Timestamp::from_secs(timestamp_secs + 1800), // 30 min TTL
         binding_commitment: PedersenRandomness::from(0), // zero binding for dust-only intent
     };
 
@@ -449,8 +468,7 @@ fn balance_proven_transaction_impl(
 
     // ── Step 7: Seal the merged transaction ──
 
-    let rng = rand::rngs::StdRng::seed_from_u64(0x00);
-    let sealed_tx = merged_tx.seal(rng);
+    let sealed_tx = merged_tx.seal(OsRng);
 
     balance_log!(LOG_INFO, "Sealed merged transaction");
 
