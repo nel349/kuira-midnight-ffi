@@ -457,18 +457,24 @@ fn balance_proven_transaction_impl(
     let prove_elapsed = prove_start.elapsed();
     balance_log!(LOG_INFO, "Dust tx proved in {:.2}s", prove_elapsed.as_secs_f64());
 
-    // ── Step 6: Merge proven original + proven dust ──
+    // ── Step 6: Seal each transaction BEFORE merging ──
+    // CRITICAL: Must match the facade's order: prove -> seal (bind) -> merge.
+    // Sealing before merge means each transaction gets its own random binding.
+    // Merging before seal would sum PedersenRandomness then seal the sum,
+    // which produces a different commitment than seal-then-merge.
 
-    // Both are now Transaction<Signature, ProofMarker, PedersenRandomness, DefaultDB>
-    let merged_tx = proven_tx
-        .merge(&proven_dust_tx)
-        .map_err(|e| format!("Failed to merge transactions: {:?}", e))?;
+    let sealed_original = proven_tx.seal(OsRng);
+    let sealed_dust = proven_dust_tx.seal(OsRng);
 
-    balance_log!(LOG_INFO, "Merged proven original + proven dust");
+    balance_log!(LOG_INFO, "Sealed both transactions individually");
 
-    // ── Step 7: Seal the merged transaction ──
+    // ── Step 7: Merge sealed transactions ──
 
-    let sealed_tx = merged_tx.seal(OsRng);
+    let sealed_tx = sealed_original
+        .merge(&sealed_dust)
+        .map_err(|e| format!("Failed to merge sealed transactions: {:?}", e))?;
+
+    balance_log!(LOG_INFO, "Merged sealed original + sealed dust");
 
     balance_log!(LOG_INFO, "Sealed merged transaction");
 
