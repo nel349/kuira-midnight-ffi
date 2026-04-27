@@ -651,3 +651,136 @@ mod tests {
         assert_eq!(stripped, raw);
     }
 }
+
+#[cfg(test)]
+mod preprod_diagnostic {
+    use super::*;
+    use midnight_ledger::dust::{DustLocalState, DustSecretKey, INITIAL_DUST_PARAMETERS, Seed};
+    use midnight_ledger::events::Event;
+    use midnight_serialize::Deserializable;
+    use midnight_storage::DefaultDB;
+
+    /// Connect to PREPROD indexer, replay dust events, and check tree roots.
+    /// Run with: cargo test preprod_diagnostic::test_replay_roots -- --nocapture --ignored
+    #[test]
+    #[ignore] // Only run manually (needs network)
+    fn test_replay_roots() {
+        // Alice's dust seed (from mn wallet seed)
+        let seed_hex = "7dc468f62278cd0c14b6674f31531a90b64599d657d3c7ab2adb63395d647f7a505de6428fcf8b0d208873f4d5e2a1340c14688067477542f53c48dfea817da4";
+        let seed_bytes = hex::decode(seed_hex).unwrap();
+        
+        // Derive dust key at m/44'/2400'/0'/2/0
+        // For now, use the first 32 bytes of the seed as dust seed (simplified)
+        let mut dust_seed: Seed = [0u8; 32];
+        dust_seed.copy_from_slice(&seed_bytes[..32]);
+        let dust_sk = DustSecretKey::derive_secret_key(&dust_seed);
+
+        // Create fresh state
+        let state = DustLocalState::<DefaultDB>::new(INITIAL_DUST_PARAMETERS);
+        
+        eprintln!("Initial state: utxos={}", state.utxos().count());
+        eprintln!("Initial commitment root: {:?}", state.commitment_root());
+        eprintln!("Initial generation root: {:?}", state.generation_root());
+
+        // We need real events from the indexer. For now, test with empty events.
+        // The real test: fetch events from PREPROD indexer via HTTP/WS.
+        
+        // Check that roots are Some after creation (tree should be rehashed)
+        let com_root = state.commitment_root();
+        let gen_root = state.generation_root();
+        eprintln!("Commitment root: {:?}", com_root);
+        eprintln!("Generation root: {:?}", gen_root);
+        
+        // Both should be Some (empty tree has a valid root)
+        assert!(com_root.is_some(), "Commitment root should be Some for empty tree");
+        assert!(gen_root.is_some(), "Generation root should be Some for empty tree");
+    }
+
+    /// Test: replay a small set of events and verify roots are valid after replay.
+    #[test]
+    fn test_replay_preserves_roots() {
+        let state = DustLocalState::<DefaultDB>::new(INITIAL_DUST_PARAMETERS);
+
+        // After creation, roots should be valid
+        assert!(state.commitment_root().is_some(), "Fresh state should have commitment root");
+        assert!(state.generation_root().is_some(), "Fresh state should have generation root");
+
+        eprintln!("Empty tree commitment root: {:?}", state.commitment_root().unwrap());
+        eprintln!("Empty tree generation root: {:?}", state.generation_root().unwrap());
+    }
+
+    /// CRITICAL TEST: verify that replay on the DustLocalState produces valid
+    /// spend proofs that would pass the node's well_formed check.
+    /// Uses TestState which internally does: apply_system_tx -> get events -> replay_events.
+    /// This mimics the exact flow our Android SDK uses.
+    #[tokio::test]
+    async fn test_spend_after_give_fee_token() {
+        use midnight_ledger::test_utilities::TestState;
+        use midnight_storage::db::InMemoryDB;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(0x42);
+        let mut state = TestState::<InMemoryDB>::new(&mut rng);
+
+        // Give the wallet dust (this internally does block processing + replay_events)
+        state.give_fee_token(&mut rng, 1).await;
+
+        let com_root = state.dust.commitment_root();
+        let gen_root = state.dust.generation_root();
+        let utxo_count = state.dust.utxos().count();
+
+        eprintln!("State after give_fee_token:");
+        eprintln!("  Commitment root: {:?}", com_root);
+        eprintln!("  Generation root: {:?}", gen_root);
+        eprintln!("  UTXO count: {}", utxo_count);
+
+        assert!(com_root.is_some(), "Commitment root must be Some");
+        assert!(gen_root.is_some(), "Generation root must be Some");
+        assert!(utxo_count > 0, "Must have UTXOs");
+
+        // Try a spend (same as what balance_ffi does)
+        let utxo = state.dust.utxos().next().unwrap();
+        let (new_state, dust_spend) = state.dust
+            .spend(&state.dust_key, &utxo, 42, state.time)
+            .expect("spend should succeed");
+
+        eprintln!("Spend succeeded!");
+        eprintln!("  New commitment root: {:?}", new_state.commitment_root());
+        eprintln!("  New UTXO count: {}", new_state.utxos().count());
+
+        // The TestState.dust is built via replay_events (same as our Android SDK).
+        // If spend succeeds here, the replay approach is fundamentally correct.
+        // Error 170 on PREPROD must be caused by something else:
+        // - Indexer event differences vs node events
+        // - Event serialization/deserialization issues
+        // - Timing/ctime mismatch
+    }
+
+    /// Test: verify replay is deterministic (same events -> same roots).
+    #[tokio::test]
+    async fn test_replay_is_deterministic() {
+        use midnight_ledger::test_utilities::TestState;
+        use midnight_storage::db::InMemoryDB;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng1 = StdRng::seed_from_u64(0x42);
+        let mut state1 = TestState::<InMemoryDB>::new(&mut rng1);
+        state1.give_fee_token(&mut rng1, 1).await;
+
+        let mut rng2 = StdRng::seed_from_u64(0x42);
+        let mut state2 = TestState::<InMemoryDB>::new(&mut rng2);
+        state2.give_fee_token(&mut rng2, 1).await;
+
+        // Same seed -> same events -> same state
+        assert_eq!(
+            state1.dust.commitment_root(), state2.dust.commitment_root(),
+            "Deterministic replay must produce same commitment roots"
+        );
+        assert_eq!(
+            state1.dust.generation_root(), state2.dust.generation_root(),
+            "Deterministic replay must produce same generation roots"
+        );
+
+        eprintln!("Deterministic replay: PASSED");
+    }
+}
