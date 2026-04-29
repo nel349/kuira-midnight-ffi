@@ -1234,20 +1234,23 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
 pub extern "C" fn contract_assemble_deploy_tx(
     params_json: *const c_char,
 ) -> *const c_char {
+    // SAFETY: params_json comes from JNI GetStringUTFChars, guaranteed valid C string.
     let json_str = match unsafe { c_str_to_str(params_json) } {
         Some(s) => s,
         None => return std::ptr::null(),
     };
 
     match assemble_deploy_tx_impl(json_str) {
-        Ok(hex) => to_c_string(&hex),
+        Ok(json) => to_c_string(&json),
         Err(e) => to_c_string(&format!("{{\"error\":\"{}\"}}", e.replace('"', "\\\""))),
     }
 }
 
+/// Returns JSON: `{"tx_hex":"...", "contract_address":"..."}`
 fn assemble_deploy_tx_impl(json_str: &str) -> Result<String, String> {
-    use midnight_ledger::structure::ContractDeploy;
-    use midnight_ledger::structure::{Transaction, Intent, ProofPreimageMarker};
+    use midnight_ledger::structure::{
+        ContractDeploy, Transaction, Intent, ProofPreimageMarker,
+    };
     use midnight_base_crypto::signatures::Signature;
     use midnight_base_crypto::time::Timestamp;
     use midnight_transient_crypto::proofs::ProvingKeyMaterial;
@@ -1260,40 +1263,38 @@ fn assemble_deploy_tx_impl(json_str: &str) -> Result<String, String> {
         .ok_or("missing network_id")?;
     let state_handle = params["state_handle"].as_u64()
         .ok_or("missing state_handle")?;
+
+    const DEFAULT_TTL_SECS: u64 = 3600;
     let ttl_secs = params["ttl_secs"].as_u64().unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() + 3600
+            .as_secs() + DEFAULT_TTL_SECS
     });
 
-    // Get the contract state from the pool (produced by constructor)
+    // Take the contract state from the pool (constructor won't need it again)
     let initial_state = {
-        let pool = STATE_POOL.lock().map_err(|e| format!("lock: {}", e))?;
-        pool.get(&state_handle)
+        let mut pool = STATE_POOL.lock().map_err(|e| format!("lock: {}", e))?;
+        pool.remove(&state_handle)
             .ok_or(format!("invalid state_handle: {}", state_handle))?
-            .clone()
     };
 
-    // Build deploy action (nonce generated randomly)
     let deploy = ContractDeploy::new(&mut OsRng, initial_state);
 
-    // Derive contract address from the deploy (hash of initial_state + nonce)
+    // Contract address = hash(initial_state + nonce). Deterministic per deploy.
     let addr = deploy.address();
     let mut addr_bytes = Vec::new();
     midnight_serialize::Serializable::serialize(&addr, &mut addr_bytes)
         .map_err(|e| format!("address serialize: {:?}", e))?;
     let address_hex = hex::encode(&addr_bytes);
 
-    // Build Intent with the deploy action
     let ttl = Timestamp::from_secs(ttl_secs);
     let intent = Intent::<Signature, ProofPreimageMarker, _, InMemoryDB>::empty(
         &mut OsRng, ttl,
     ).add_deploy(deploy);
 
-    // Build Transaction
-    let mut intents_map = midnight_storage::storage::HashMap::<u16, _, InMemoryDB>::default();
-    intents_map = intents_map.insert(1u16, intent);
+    let intents_map = midnight_storage::storage::HashMap::<u16, _, InMemoryDB>::default()
+        .insert(1u16, intent);
     let tx = Transaction::new(
         network_id,
         intents_map,
@@ -1301,14 +1302,12 @@ fn assemble_deploy_tx_impl(json_str: &str) -> Result<String, String> {
         midnight_storage::storage::HashMap::new(),
     );
 
-    // Serialize as (Transaction, ProvingKeys) tuple (same format as call)
     let proving_keys: std::collections::HashMap<String, ProvingKeyMaterial> =
         std::collections::HashMap::new();
     let mut bytes = Vec::new();
     midnight_serialize::tagged_serialize(&(&tx, &proving_keys), &mut bytes)
         .map_err(|e| format!("serialize: {:?}", e))?;
 
-    // Return JSON with both the tx hex and the contract address
     Ok(format!(
         "{{\"tx_hex\":\"{}\",\"contract_address\":\"{}\"}}",
         hex::encode(&bytes),
@@ -1580,5 +1579,91 @@ mod value_format_tests {
         println!("Transaction alone tag: {}", tx_tag);
     }
 
+    #[test]
+    fn test_assemble_deploy_tx() {
+        use midnight_onchain_state::state::ContractState as RustContractState;
+        use midnight_ledger::structure::{Transaction, ProofPreimageMarker};
+        use midnight_base_crypto::signatures::Signature;
+        use midnight_transient_crypto::commitment::PedersenRandomness;
+        use midnight_transient_crypto::proofs::ProvingKeyMaterial;
+        use midnight_serialize::Tagged;
+
+        // Create a minimal empty contract state and put it in the pool
+        let state = RustContractState::<InMemoryDB>::default();
+        let handle = {
+            let mut pool = STATE_POOL.lock().unwrap();
+            let h = pool.keys().max().unwrap_or(&0) + 1;
+            pool.insert(h, state);
+            h
+        };
+
+        // Call deploy assembler
+        let params = format!(
+            r#"{{"network_id":"undeployed","state_handle":{}}}"#,
+            handle
+        );
+        let params_c = CString::new(params).unwrap();
+        let result_ptr = contract_assemble_deploy_tx(params_c.as_ptr());
+        assert!(!result_ptr.is_null(), "deploy assembler returned null");
+
+        let result_str = unsafe { std::ffi::CStr::from_ptr(result_ptr).to_str().unwrap() };
+        println!("Deploy result: {}", &result_str[..result_str.len().min(200)]);
+
+        // Parse the JSON result
+        let result: serde_json::Value = serde_json::from_str(result_str).unwrap();
+        assert!(result.get("error").is_none(), "deploy returned error: {}", result_str);
+
+        let tx_hex = result["tx_hex"].as_str().unwrap();
+        let contract_address = result["contract_address"].as_str().unwrap();
+
+        assert!(!tx_hex.is_empty(), "tx_hex is empty");
+        assert!(!contract_address.is_empty(), "contract_address is empty");
+        assert!(contract_address.len() == 64, "address should be 32 bytes = 64 hex chars, got {}", contract_address.len());
+
+        println!("Deploy tx hex: {} chars", tx_hex.len());
+        println!("Contract address: {}", contract_address);
+
+        // Verify the tx can be deserialized back
+        let tx_bytes = hex::decode(tx_hex).unwrap();
+        let _payload: (
+            Transaction<Signature, ProofPreimageMarker, PedersenRandomness, InMemoryDB>,
+            std::collections::HashMap<String, ProvingKeyMaterial>,
+        ) = midnight_serialize::tagged_deserialize(&tx_bytes[..])
+            .expect("deploy tx should deserialize");
+
+        println!("✅ Deploy tx roundtrips correctly");
+
+        unsafe { contract_free_string(result_ptr as *mut c_char); }
+
+        // Verify the state handle was consumed (removed from pool)
+        let pool = STATE_POOL.lock().unwrap();
+        assert!(!pool.contains_key(&handle), "state_handle should be consumed after deploy");
+    }
+
+    #[test]
+    fn test_deploy_tx_invalid_handle() {
+        let params = r#"{"network_id":"undeployed","state_handle":999999}"#;
+        let params_c = CString::new(params).unwrap();
+        let result_ptr = contract_assemble_deploy_tx(params_c.as_ptr());
+        assert!(!result_ptr.is_null());
+
+        let result_str = unsafe { std::ffi::CStr::from_ptr(result_ptr).to_str().unwrap() };
+        assert!(result_str.contains("error"), "invalid handle should return error: {}", result_str);
+
+        unsafe { contract_free_string(result_ptr as *mut c_char); }
+    }
+
+    #[test]
+    fn test_deploy_tx_missing_fields() {
+        let params = r#"{"network_id":"undeployed"}"#;
+        let params_c = CString::new(params).unwrap();
+        let result_ptr = contract_assemble_deploy_tx(params_c.as_ptr());
+        assert!(!result_ptr.is_null());
+
+        let result_str = unsafe { std::ffi::CStr::from_ptr(result_ptr).to_str().unwrap() };
+        assert!(result_str.contains("error"), "missing state_handle should error: {}", result_str);
+
+        unsafe { contract_free_string(result_ptr as *mut c_char); }
+    }
 }
 
