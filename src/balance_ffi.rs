@@ -173,13 +173,13 @@ pub extern "C" fn balance_proven_transaction(
         &keys_path,
         network_id_str,
     ) {
-        Ok((balanced_hex, updated_state)) => {
-            // SAFETY: dust_state_ptr validated non-null at entry. The old state was
-            // only borrowed immutably (then cloned in impl), so this write is safe.
-            unsafe {
-                *dust_state_ptr = updated_state;
-            }
-            balance_log!(LOG_INFO, "Updated dust state after successful balance");
+        Ok((balanced_hex, _updated_state)) => {
+            // Do NOT write the post-spend state back to the pointer.
+            // The caller (DustSyncManager) caches the original state for reuse
+            // across transactions. Writing back corrupts the Merkle tree roots
+            // for subsequent spends. The node's root history keeps old roots
+            // valid for 1+ hours, so reusing the original state is safe.
+            balance_log!(LOG_INFO, "Balance complete, original state preserved");
 
             match CString::new(balanced_hex) {
                 Ok(c_str) => c_str.into_raw(),
@@ -264,61 +264,34 @@ fn balance_proven_transaction_impl(
         }
     };
 
-    // fees_with_margin returns 0 for ProofMarker transactions because proven
-    // transactions have compact proofs (the fee is based on proof preimage sizes).
-    // The TS SDK solves this with a convergence loop on erased-proof merges.
-    //
-    // Pragmatic approach: build a minimal ProofPreimageMarker transaction with the
-    // same structure (same number of intents), calculate its fee using INITIAL_PARAMETERS,
-    // and use that as the fee for our proven tx. This overestimates slightly (proof
-    // preimage sizes are larger than actual proofs) which is safe — we pay a bit more
-    // dust than needed, but the tx won't be rejected for underpayment.
+    // Calculate fee from ledger params. If fee is 0 (common on testnets where
+    // fees are disabled), skip dust balancing entirely — just seal and return
+    // the proven tx as-is. The facade does the same: zero fee = no dust spends.
+    let erased_tx = proven_tx.erase_proofs();
+    let base_fee = erased_tx
+        .fees_with_margin(&params, DEFAULT_FEE_BLOCKS_MARGIN)
+        .map_err(|e| format!("Fee calculation failed: {:?}", e))?;
 
-    let base_fee = {
-        // Create a minimal unproven tx that matches the structure of the proven one
-        let dummy_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
-            guaranteed_unshielded_offer: None,
-            fallible_unshielded_offer: None,
-            actions: std::iter::empty().collect(),
-            dust_actions: None,
-            ttl: Timestamp::from_secs(current_time_ms as u64 / 1000 + 1800),
-            binding_commitment: PedersenRandomness::from(0),
-        };
-        let dummy_intents = StorageHashMap::default().insert(1u16, dummy_intent);
-        let dummy_tx = Transaction::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>::new(
-            network_id,
-            dummy_intents,
-            None,
-            midnight_storage::storage::HashMap::new(),
-        );
+    balance_log!(LOG_INFO, "Fee from ledger params: {} specks", base_fee);
 
-        // Calculate fee on the dummy tx with the real ledger params
-        let fee = dummy_tx
-            .fees_with_margin(&params, DEFAULT_FEE_BLOCKS_MARGIN)
-            .map_err(|e| format!("Fee calculation failed: {:?}", e))?;
+    if base_fee == 0 {
+        // Zero fees on this network — no dust payment needed.
+        // Just seal the proven tx and return it.
+        balance_log!(LOG_INFO, "Zero fee network — sealing proven tx without dust");
+        let sealed_tx = proven_tx.seal(OsRng);
 
-        if fee == 0 {
-            // If params-based fee is also 0, use INITIAL_PARAMETERS as fallback
-            let initial_params = midnight_ledger::structure::INITIAL_PARAMETERS;
-            let fallback_fee = dummy_tx
-                .fees_with_margin(&initial_params, DEFAULT_FEE_BLOCKS_MARGIN)
-                .map_err(|e| format!("Fee calculation (initial params) failed: {:?}", e))?;
-            balance_log!(LOG_INFO, "Params-based fee was 0, using INITIAL_PARAMETERS: {} specks", fallback_fee);
-            fallback_fee
-        } else {
-            fee
-        }
-    };
+        let mut result_bytes = Vec::new();
+        tagged_serialize(&sealed_tx, &mut result_bytes)
+            .map_err(|e| format!("Failed to serialize sealed transaction: {:?}", e))?;
+        let result_hex = hex::encode(&result_bytes);
+        return Ok((result_hex, dust_state.clone()));
+    }
 
     let overhead = base_fee * FEE_OVERHEAD_PERCENT / 100;
     let total_fee: u128 = base_fee + overhead;
 
     balance_log!(LOG_INFO, "Calculated fee: {} specks (base={}, overhead={})",
         total_fee, base_fee, overhead);
-
-    if total_fee == 0 {
-        return Err("Calculated fee is 0 — both ledger and initial params produced zero".into());
-    }
 
     // ── Step 3: Create dust spends ──
 

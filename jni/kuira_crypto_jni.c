@@ -1752,6 +1752,75 @@ Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustReplayEvents(
 }
 
 /**
+ * Replays dust events from a file in a single pass (avoids JVM heap OOM).
+ *
+ * Events are streamed to a temp file by Kotlin, then Rust reads the file
+ * in native memory and replays all events in one replay_events call.
+ */
+extern void* dust_replay_events_from_file(const void* state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* file_path);
+
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustReplayEventsFromFile(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr,
+    jbyteArray seed_array,
+    jstring file_path
+) {
+    if (state_ptr == 0) {
+        LOGE("nativeDustReplayEventsFromFile: state_ptr is 0");
+        return 0;
+    }
+    if (seed_array == NULL) {
+        LOGE("nativeDustReplayEventsFromFile: seed_array is NULL");
+        return 0;
+    }
+    if (file_path == NULL) {
+        LOGE("nativeDustReplayEventsFromFile: file_path is NULL");
+        return 0;
+    }
+
+    jsize seed_len = (*env)->GetArrayLength(env, seed_array);
+    if (seed_len != 32) {
+        LOGE("nativeDustReplayEventsFromFile: invalid seed length %d", seed_len);
+        return 0;
+    }
+
+    uint8_t seed_buf[32];
+    (*env)->GetByteArrayRegion(env, seed_array, 0, 32, (jbyte*)seed_buf);
+    if ((*env)->ExceptionCheck(env)) {
+        LOGE("nativeDustReplayEventsFromFile: exception during GetByteArrayRegion");
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        secure_memzero(seed_buf, 32);
+        return 0;
+    }
+
+    const char* path_c = (*env)->GetStringUTFChars(env, file_path, NULL);
+    if (path_c == NULL) {
+        LOGE("nativeDustReplayEventsFromFile: GetStringUTFChars failed");
+        secure_memzero(seed_buf, 32);
+        return 0;
+    }
+
+    LOGD("nativeDustReplayEventsFromFile: replaying from file %s", path_c);
+
+    void* state = (void*)(uintptr_t)state_ptr;
+    void* new_state = dust_replay_events_from_file(state, seed_buf, 32, path_c);
+
+    secure_memzero(seed_buf, 32);
+    (*env)->ReleaseStringUTFChars(env, file_path, path_c);
+
+    if (new_state == NULL) {
+        LOGE("nativeDustReplayEventsFromFile: Rust FFI returned NULL");
+        return 0;
+    }
+
+    LOGD("nativeDustReplayEventsFromFile: success, new_state=%p", new_state);
+    return (jlong)(uintptr_t)new_state;
+}
+
+/**
  * Calculates transaction fee using midnight-ledger (Phase 2E)
  *
  * JNI signature matches:

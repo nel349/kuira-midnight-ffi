@@ -1218,6 +1218,104 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     Ok(hex::encode(&bytes))
 }
 
+/// Assemble a contract DEPLOY transaction from constructor output.
+///
+/// Input JSON:
+/// {
+///   "network_id": "preprod",
+///   "state_handle": 42       // handle from constructor's initialState()
+/// }
+///
+/// Output: hex-encoded SCALE serialized (Transaction, HashMap<String, ProvingKeyMaterial>) tuple,
+///         or JSON error: {"error": "..."}
+///
+/// The contract address is derived deterministically from the initial state hash.
+#[no_mangle]
+pub extern "C" fn contract_assemble_deploy_tx(
+    params_json: *const c_char,
+) -> *const c_char {
+    let json_str = match unsafe { c_str_to_str(params_json) } {
+        Some(s) => s,
+        None => return std::ptr::null(),
+    };
+
+    match assemble_deploy_tx_impl(json_str) {
+        Ok(hex) => to_c_string(&hex),
+        Err(e) => to_c_string(&format!("{{\"error\":\"{}\"}}", e.replace('"', "\\\""))),
+    }
+}
+
+fn assemble_deploy_tx_impl(json_str: &str) -> Result<String, String> {
+    use midnight_ledger::structure::ContractDeploy;
+    use midnight_ledger::structure::{Transaction, Intent, ProofPreimageMarker};
+    use midnight_base_crypto::signatures::Signature;
+    use midnight_base_crypto::time::Timestamp;
+    use midnight_transient_crypto::proofs::ProvingKeyMaterial;
+    use rand::rngs::OsRng;
+
+    let params: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| format!("JSON parse: {}", e))?;
+
+    let network_id = params["network_id"].as_str()
+        .ok_or("missing network_id")?;
+    let state_handle = params["state_handle"].as_u64()
+        .ok_or("missing state_handle")?;
+    let ttl_secs = params["ttl_secs"].as_u64().unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() + 3600
+    });
+
+    // Get the contract state from the pool (produced by constructor)
+    let initial_state = {
+        let pool = STATE_POOL.lock().map_err(|e| format!("lock: {}", e))?;
+        pool.get(&state_handle)
+            .ok_or(format!("invalid state_handle: {}", state_handle))?
+            .clone()
+    };
+
+    // Build deploy action (nonce generated randomly)
+    let deploy = ContractDeploy::new(&mut OsRng, initial_state);
+
+    // Derive contract address from the deploy (hash of initial_state + nonce)
+    let addr = deploy.address();
+    let mut addr_bytes = Vec::new();
+    midnight_serialize::Serializable::serialize(&addr, &mut addr_bytes)
+        .map_err(|e| format!("address serialize: {:?}", e))?;
+    let address_hex = hex::encode(&addr_bytes);
+
+    // Build Intent with the deploy action
+    let ttl = Timestamp::from_secs(ttl_secs);
+    let intent = Intent::<Signature, ProofPreimageMarker, _, InMemoryDB>::empty(
+        &mut OsRng, ttl,
+    ).add_deploy(deploy);
+
+    // Build Transaction
+    let mut intents_map = midnight_storage::storage::HashMap::<u16, _, InMemoryDB>::default();
+    intents_map = intents_map.insert(1u16, intent);
+    let tx = Transaction::new(
+        network_id,
+        intents_map,
+        None,
+        midnight_storage::storage::HashMap::new(),
+    );
+
+    // Serialize as (Transaction, ProvingKeys) tuple (same format as call)
+    let proving_keys: std::collections::HashMap<String, ProvingKeyMaterial> =
+        std::collections::HashMap::new();
+    let mut bytes = Vec::new();
+    midnight_serialize::tagged_serialize(&(&tx, &proving_keys), &mut bytes)
+        .map_err(|e| format!("serialize: {:?}", e))?;
+
+    // Return JSON with both the tx hex and the contract address
+    Ok(format!(
+        "{{\"tx_hex\":\"{}\",\"contract_address\":\"{}\"}}",
+        hex::encode(&bytes),
+        address_hex,
+    ))
+}
+
 #[cfg(test)]
 mod value_format_tests {
     use super::*;
