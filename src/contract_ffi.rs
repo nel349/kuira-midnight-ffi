@@ -1247,13 +1247,27 @@ pub extern "C" fn contract_assemble_deploy_tx(
 }
 
 /// Returns JSON: `{"tx_hex":"...", "contract_address":"..."}`
+///
+/// Input JSON now supports optional `verifier_keys` map to register circuit
+/// operations during deploy (avoids separate maintenance transactions):
+/// ```json
+/// {
+///   "network_id": "undeployed",
+///   "state_handle": 42,
+///   "verifier_keys": {
+///     "post": "hex_encoded_verifier_key_bytes",
+///     "takeDown": "hex_encoded_verifier_key_bytes"
+///   }
+/// }
+/// ```
 fn assemble_deploy_tx_impl(json_str: &str) -> Result<String, String> {
     use midnight_ledger::structure::{
         ContractDeploy, Transaction, Intent, ProofPreimageMarker,
     };
     use midnight_base_crypto::signatures::Signature;
     use midnight_base_crypto::time::Timestamp;
-    use midnight_transient_crypto::proofs::ProvingKeyMaterial;
+    use midnight_transient_crypto::proofs::{ProvingKeyMaterial, VerifierKey};
+    use midnight_onchain_state::state::{ContractOperation, EntryPointBuf};
     use rand::rngs::OsRng;
 
     let params: serde_json::Value = serde_json::from_str(json_str)
@@ -1273,11 +1287,28 @@ fn assemble_deploy_tx_impl(json_str: &str) -> Result<String, String> {
     });
 
     // Take the contract state from the pool (constructor won't need it again)
-    let initial_state = {
+    let mut initial_state = {
         let mut pool = STATE_POOL.lock().map_err(|e| format!("lock: {}", e))?;
         pool.remove(&state_handle)
             .ok_or(format!("invalid state_handle: {}", state_handle))?
     };
+
+    // Register circuit verifier keys in the contract state so the contract
+    // is immediately callable after deploy (no separate maintenance tx needed).
+    if let Some(vk_map) = params["verifier_keys"].as_object() {
+        let mut ops = initial_state.operations.clone();
+        for (circuit_name, vk_hex_val) in vk_map {
+            let vk_hex = vk_hex_val.as_str()
+                .ok_or(format!("verifier_keys.{} must be a hex string", circuit_name))?;
+            let vk_bytes = hex::decode(vk_hex)
+                .map_err(|e| format!("verifier_keys.{} hex decode: {}", circuit_name, e))?;
+            let vk: VerifierKey = midnight_serialize::tagged_deserialize(&vk_bytes[..])
+                .map_err(|e| format!("verifier_keys.{} deserialize: {:?}", circuit_name, e))?;
+            let ep = EntryPointBuf::from(circuit_name.as_bytes());
+            ops = ops.insert(ep, ContractOperation::new(Some(vk)));
+        }
+        initial_state.operations = ops;
+    }
 
     let deploy = ContractDeploy::new(&mut OsRng, initial_state);
 
