@@ -135,7 +135,7 @@ extern void free_proven_string(char* ptr);
 
 /* Contract runtime (Phase 6) */
 extern uint64_t contract_state_create(const char* state_hex);
-extern uint64_t contract_state_create_with_nulls(uint32_t num_slots);
+extern uint64_t contract_state_create_with_nulls(const char* structure_json);
 extern void contract_state_set_operation(uint64_t handle, const char* name);
 extern const char* contract_state_serialize(uint64_t handle);
 extern void contract_state_free(uint64_t handle);
@@ -147,6 +147,7 @@ extern const char* contract_big_int_to_value(const char* bigint_str);
 extern const char* contract_value_to_big_int(const char* value_json);
 extern void contract_free_string(char* ptr);
 extern const char* contract_assemble_call_tx(const char* params_json);
+extern const char* contract_assemble_deploy_tx(const char* params_json);
 extern uint64_t contract_state_clone(uint64_t handle);
 
 /* Transaction signing (Phase 2D-FFI) */
@@ -2735,8 +2736,13 @@ Java_com_midnight_kuira_core_compact_proving_LocalProver_nativeProveTransactionL
  */
 JNIEXPORT jlong JNICALL
 Java_com_midnight_kuira_core_compact_ContractRuntime_nativeStateCreateWithNulls(
-    JNIEnv* env, jclass clazz, jint numSlots) {
-    return (jlong)contract_state_create_with_nulls((uint32_t)numSlots);
+    JNIEnv* env, jclass clazz, jstring structureJson) {
+    if (structureJson == NULL) return 0;
+    const char* json = (*env)->GetStringUTFChars(env, structureJson, NULL);
+    if (json == NULL) return 0;
+    uint64_t handle = contract_state_create_with_nulls(json);
+    (*env)->ReleaseStringUTFChars(env, structureJson, json);
+    return (jlong)handle;
 }
 
 /*
@@ -2919,6 +2925,29 @@ Java_com_midnight_kuira_core_compact_ContractRuntime_nativeAssembleContractCallT
     if (params_c == NULL) return NULL;
 
     const char* result = contract_assemble_call_tx(params_c);
+    (*env)->ReleaseStringUTFChars(env, paramsJson, params_c);
+
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    contract_free_string((char*)result);
+    return jresult;
+}
+
+/*
+ * Assemble a contract DEPLOY transaction from constructor output.
+ * Takes JSON with state_handle + network_id, returns JSON with tx_hex + contract_address.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeAssembleDeployTx(
+    JNIEnv* env, jclass clazz, jstring paramsJson) {
+
+    if (paramsJson == NULL) return NULL;
+
+    const char* params_c = (*env)->GetStringUTFChars(env, paramsJson, NULL);
+    if (params_c == NULL) return NULL;
+
+    const char* result = contract_assemble_deploy_tx(params_c);
     (*env)->ReleaseStringUTFChars(env, paramsJson, params_c);
 
     if (result == NULL) return NULL;

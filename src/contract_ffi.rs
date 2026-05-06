@@ -551,20 +551,31 @@ pub extern "C" fn contract_state_clone(handle: u64) -> u64 {
 /// Create a ContractState with an array of N null slots.
 /// Returns a handle for subsequent query() calls.
 #[no_mangle]
-pub extern "C" fn contract_state_create_with_nulls(num_slots: u32) -> u64 {
+pub extern "C" fn contract_state_create_with_nulls(structure_json: *const c_char) -> u64 {
     use midnight_onchain_state::state::{
         ContractState as RustCS, ChargedState as RustChargedState,
-        StateValue as RustSV, ContractOperation as RustCO,
+        StateValue as RustSV,
     };
     use midnight_storage::db::InMemoryDB;
 
-    // Build array of N null StateValues
-    let items: Vec<RustSV<InMemoryDB>> = (0..num_slots)
-        .map(|_| RustSV::Null)
-        .collect();
-    let array = RustSV::Array(items.into());
-    let charged = RustChargedState::new(array);
+    // SAFETY: JNI guarantees structure_json is a valid null-terminated UTF-8 string
+    let input = match unsafe { c_str_to_str(structure_json) } {
+        Some(s) => s,
+        None => return 0,
+    };
 
+    // Parse structure descriptor and build nested state
+    let state_value = if let Ok(descriptor) = serde_json::from_str::<serde_json::Value>(input) {
+        build_state_from_descriptor::<InMemoryDB>(&descriptor)
+    } else if let Ok(num) = input.parse::<u32>() {
+        // Backward compat: plain number = flat array of N nulls
+        let items: Vec<RustSV<InMemoryDB>> = (0..num).map(|_| RustSV::Null).collect();
+        RustSV::Array(items.into())
+    } else {
+        RustSV::Array(Vec::new().into())
+    };
+
+    let charged = RustChargedState::new(state_value);
     let mut state = RustCS::default();
     state.data = charged;
 
@@ -572,6 +583,54 @@ pub extern "C" fn contract_state_create_with_nulls(num_slots: u32) -> u64 {
     let Some(mut pool) = lock_state_pool() else { return 0 };
     pool.insert(handle, state);
     handle
+}
+
+/// Build a Rust StateValue from a JSON structure descriptor.
+/// Format: null → Null, {"array": [item, ...]} → Array of items recursively
+/// Build a Rust StateValue from a JSON structure descriptor.
+/// Format: null → Null, {"array": [item, ...]} → Array of items recursively
+/// Safety: max 64 items per array, max 4 nesting depth to prevent OOM
+fn build_state_from_descriptor<D: midnight_storage::db::DB>(
+    desc: &serde_json::Value,
+) -> midnight_onchain_state::state::StateValue<D> {
+    build_state_recursive::<D>(desc, 0)
+}
+
+fn build_state_recursive<D: midnight_storage::db::DB>(
+    desc: &serde_json::Value,
+    depth: usize,
+) -> midnight_onchain_state::state::StateValue<D> {
+    use midnight_onchain_state::state::StateValue as SV;
+
+    if depth > 4 {
+        return SV::Null; // Prevent unbounded recursion
+    }
+
+    match desc {
+        serde_json::Value::Null => SV::Null,
+        serde_json::Value::Object(obj) => {
+            if let Some(items) = obj.get("array") {
+                if let serde_json::Value::Array(arr) = items {
+                    let count = arr.len().min(64); // Cap at 64 items
+                    let built: Vec<SV<D>> = arr.iter().take(count)
+                        .map(|item| build_state_recursive(item, depth + 1))
+                        .collect();
+                    SV::Array(built.into())
+                } else {
+                    SV::Null
+                }
+            } else {
+                SV::Null
+            }
+        }
+        // Number = flat array of N nulls (legacy)
+        serde_json::Value::Number(n) => {
+            let count = n.as_u64().unwrap_or(0).min(64) as usize;
+            let items: Vec<SV<D>> = (0..count).map(|_| SV::Null).collect();
+            SV::Array(items.into())
+        }
+        _ => SV::Null,
+    }
 }
 
 /// Set an operation on a contract state (by handle).
@@ -602,7 +661,8 @@ mod state_tests {
 
     #[test]
     fn test_create_state_with_nulls() {
-        let handle = contract_state_create_with_nulls(4);
+        let json = CString::new("4").unwrap();
+        let handle = contract_state_create_with_nulls(json.as_ptr());
         assert!(handle > 0);
 
         // Set operations
@@ -1698,3 +1758,82 @@ mod value_format_tests {
     }
 }
 
+
+#[cfg(test)]
+mod state_structure_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn flat_number_creates_array_of_nulls() {
+        let json = CString::new("4").unwrap();
+        let handle = contract_state_create_with_nulls(json.as_ptr());
+        assert!(handle > 0, "Should create a valid handle");
+
+        // Verify it's queryable
+        let pool = lock_state_pool().unwrap();
+        let state = pool.get(&handle).unwrap();
+        match state.data.get_ref() {
+            midnight_onchain_state::state::StateValue::Array(arr) => {
+                assert_eq!(arr.len(), 4, "Should have 4 items");
+            }
+            other => panic!("Expected Array, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn nested_structure_creates_nested_arrays() {
+        // Penalty contract state: Array([Array([Null x 10]), Array([])])
+        let json = CString::new(r#"{"array":[{"array":[null,null,null,null,null,null,null,null,null,null]},{"array":[]}]}"#).unwrap();
+        let handle = contract_state_create_with_nulls(json.as_ptr());
+        assert!(handle > 0, "Should create a valid handle");
+
+        let pool = lock_state_pool().unwrap();
+        let state = pool.get(&handle).unwrap();
+        match state.data.get_ref() {
+            midnight_onchain_state::state::StateValue::Array(arr) => {
+                assert_eq!(arr.len(), 2, "Outer array should have 2 items");
+                match arr.get(0) {
+                    Some(midnight_onchain_state::state::StateValue::Array(inner)) => {
+                        assert_eq!(inner.len(), 10, "Inner array should have 10 items");
+                    }
+                    other => panic!("Expected inner Array, got {:?}", other.map(std::mem::discriminant)),
+                }
+            }
+            other => panic!("Expected Array, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn null_structure_creates_null() {
+        let json = CString::new("null").unwrap();
+        let handle = contract_state_create_with_nulls(json.as_ptr());
+        assert!(handle > 0);
+
+        let pool = lock_state_pool().unwrap();
+        let state = pool.get(&handle).unwrap();
+        match state.data.get_ref() {
+            midnight_onchain_state::state::StateValue::Null => {} // correct
+            other => panic!("Expected Null, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn oversized_array_capped_at_64() {
+        // Try 100 items — should be capped at 64
+        let items: Vec<&str> = (0..100).map(|_| "null").collect();
+        let json_str = format!(r#"{{"array":[{}]}}"#, items.join(","));
+        let json = CString::new(json_str).unwrap();
+        let handle = contract_state_create_with_nulls(json.as_ptr());
+        assert!(handle > 0);
+
+        let pool = lock_state_pool().unwrap();
+        let state = pool.get(&handle).unwrap();
+        match state.data.get_ref() {
+            midnight_onchain_state::state::StateValue::Array(arr) => {
+                assert_eq!(arr.len(), 64, "Should be capped at 64");
+            }
+            other => panic!("Expected Array, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+}
