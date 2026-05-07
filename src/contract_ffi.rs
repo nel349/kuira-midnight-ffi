@@ -2043,3 +2043,103 @@ mod persistent_commit_tests {
         unsafe { contract_free_string(result_ptr as *mut c_char); }
     }
 }
+
+#[cfg(test)]
+mod persistent_commit_crosscheck {
+    use super::*;
+    use std::ffi::CString;
+    use midnight_base_crypto::hash::{persistent_commit, HashOutput, PersistentHashWriter};
+    use midnight_base_crypto::fab::{AlignedValue, Value, ValueAtom, Alignment, AlignmentSegment, AlignmentAtom};
+    use midnight_base_crypto::repr::BinaryHashRepr;
+
+    /// Cross-check: our FFI persistentCommit vs direct Rust persistent_commit
+    /// They MUST produce identical output for the same input.
+    #[test]
+    fn ffi_matches_direct_rust_persistent_commit() {
+        let opening_bytes: Vec<u8> = (0..32).map(|i| (i * 5 + 3) as u8).collect();
+        let value_bytes: Vec<u8> = vec![10, 20, 30];
+
+        // 1. Direct Rust: persistent_commit(value, opening)
+        let mut opening_arr = [0u8; 32];
+        opening_arr.copy_from_slice(&opening_bytes);
+        let opening = HashOutput(opening_arr);
+
+        let aligned = AlignedValue {
+            value: Value(vec![ValueAtom(value_bytes.clone())]),
+            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 3 })]),
+        };
+
+        // persistent_commit uses: opening.binary_repr || value.binary_repr
+        let mut hasher = PersistentHashWriter::default();
+        opening.binary_repr(&mut hasher);
+        ValueReprAlignedValue(aligned.clone()).binary_repr(&mut hasher);
+        let direct_hash = hasher.finalize();
+        let direct_value = midnight_base_crypto::fab::Value::from(direct_hash);
+        let direct_json = serde_json::to_string(&direct_value).unwrap();
+        println!("Direct Rust result: {}", direct_json);
+
+        // 2. FFI: contract_persistent_commit_aligned
+        let ffi_input = serde_json::json!({
+            "value": {
+                "value": [value_bytes],
+                "alignment": [{"tag": "atom", "value": {"tag": "bytes", "length": 3}}]
+            },
+            "opening": opening_bytes
+        });
+        let ffi_json = CString::new(ffi_input.to_string()).unwrap();
+        let ffi_ptr = contract_persistent_commit_aligned(ffi_json.as_ptr());
+        let ffi_result = unsafe { std::ffi::CStr::from_ptr(ffi_ptr).to_str().unwrap().to_string() };
+        println!("FFI result: {}", ffi_result);
+
+        unsafe { contract_free_string(ffi_ptr as *mut c_char); }
+
+        // They must match exactly
+        assert_eq!(direct_json, ffi_result, "FFI and direct Rust must produce identical output");
+    }
+
+    /// Test with the same pattern the penalty contract uses:
+    /// persistentCommit of a BatchPreimage (5 Uint<8> choices) with a 32-byte nonce
+    #[test]
+    fn ffi_matches_for_batch_preimage() {
+        // BatchPreimage: 5 x Uint<8> values
+        let choices: Vec<Vec<u8>> = vec![
+            vec![0], vec![1], vec![2], vec![0], vec![1]
+        ];
+        let nonce: Vec<u8> = (100..132).collect(); // 32-byte nonce
+
+        // The alignment for Uint<8> is Bytes(1)
+        let alignments: Vec<serde_json::Value> = (0..5).map(|_| {
+            serde_json::json!({"tag": "atom", "value": {"tag": "bytes", "length": 1}})
+        }).collect();
+
+        let ffi_input = serde_json::json!({
+            "value": {
+                "value": choices,
+                "alignment": alignments
+            },
+            "opening": nonce
+        });
+
+        let ffi_json = CString::new(ffi_input.to_string()).unwrap();
+        let ffi_ptr = contract_persistent_commit_aligned(ffi_json.as_ptr());
+        assert!(!ffi_ptr.is_null());
+
+        let ffi_result = unsafe { std::ffi::CStr::from_ptr(ffi_ptr).to_str().unwrap().to_string() };
+        println!("Batch preimage commit: {}", ffi_result);
+
+        // Must be a valid array, not error
+        let parsed: serde_json::Value = serde_json::from_str(&ffi_result).unwrap();
+        assert!(parsed.is_array(), "Expected array result, got: {}", ffi_result);
+
+        // Verify determinism
+        let ffi_json2 = CString::new(ffi_input.to_string()).unwrap();
+        let ffi_ptr2 = contract_persistent_commit_aligned(ffi_json2.as_ptr());
+        let ffi_result2 = unsafe { std::ffi::CStr::from_ptr(ffi_ptr2).to_str().unwrap().to_string() };
+        assert_eq!(ffi_result, ffi_result2, "Must be deterministic");
+
+        unsafe {
+            contract_free_string(ffi_ptr as *mut c_char);
+            contract_free_string(ffi_ptr2 as *mut c_char);
+        }
+    }
+}
