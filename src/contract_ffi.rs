@@ -371,6 +371,61 @@ pub extern "C" fn contract_persistent_hash_aligned(
     }
 }
 
+/// Compute persistent commit: SHA-256(opening || binary_repr(value)).
+/// Same as persistentHash but with a 32-byte opening prepended.
+/// Input: JSON {"value": <aligned_value>, "opening": [32 bytes as array]}
+/// Output: JSON Value (hash output)
+#[no_mangle]
+pub extern "C" fn contract_persistent_commit_aligned(
+    input_json: *const c_char,
+) -> *const c_char {
+    let json_str = match unsafe { c_str_to_str(input_json) } {
+        Some(s) => s,
+        None => return std::ptr::null(),
+    };
+
+    let json_val: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => return to_c_string(&format!("{{\"error\":\"JSON parse: {}\"}}", e)),
+    };
+
+    // Extract opening (32-byte array)
+    let opening_arr = match json_val.get("opening") {
+        Some(serde_json::Value::Array(arr)) => arr,
+        _ => return to_c_string("{\"error\":\"missing 'opening' array\"}"),
+    };
+    let opening_bytes: Vec<u8> = opening_arr.iter()
+        .filter_map(|v| v.as_u64().map(|n| n as u8))
+        .collect();
+    if opening_bytes.len() != 32 {
+        return to_c_string(&format!("{{\"error\":\"opening must be 32 bytes, got {}\"}}", opening_bytes.len()));
+    }
+    let mut opening_arr = [0u8; 32];
+    opening_arr.copy_from_slice(&opening_bytes);
+    let opening = midnight_base_crypto::hash::HashOutput(opening_arr);
+
+    // Extract aligned value
+    let value_json = match json_val.get("value") {
+        Some(v) => v,
+        None => return to_c_string("{\"error\":\"missing 'value' field\"}"),
+    };
+    let aligned: AlignedValue = match parse_aligned_value(value_json) {
+        Ok(v) => v,
+        Err(e) => return to_c_string(&format!("{{\"error\":\"deserialize value: {}\"}}", e)),
+    };
+
+    // persistent_commit = SHA-256(opening || binary_repr(value))
+    let mut hasher = PersistentHashWriter::default();
+    opening.binary_repr(&mut hasher);
+    ValueReprAlignedValue(aligned).binary_repr(&mut hasher);
+    let hash_value = Value::from(hasher.finalize());
+
+    match serde_json::to_string(&hash_value) {
+        Ok(s) => to_c_string(&s),
+        Err(e) => to_c_string(&format!("{{\"error\":\"serialize: {}\"}}", e)),
+    }
+}
+
 /// Convert a BigInt (as hex string) to a Value (JSON).
 /// Matches the WASM's bigIntToValue exactly — uses Fr::from_le_bytes.
 #[no_mangle]
@@ -1835,5 +1890,156 @@ mod state_structure_tests {
             }
             other => panic!("Expected Array, got {:?}", std::mem::discriminant(other)),
         }
+    }
+}
+
+#[cfg(test)]
+mod persistent_commit_tests {
+    use super::*;
+    use std::ffi::CString;
+
+    // Alignment format: {"tag":"atom","value":{"tag":"bytes","length":N}}
+    fn bytes_alignment(length: usize) -> serde_json::Value {
+        serde_json::json!({"tag": "atom", "value": {"tag": "bytes", "length": length}})
+    }
+
+    fn field_alignment() -> serde_json::Value {
+        serde_json::json!({"tag": "atom", "value": {"tag": "field"}})
+    }
+
+    #[test]
+    fn test_persistent_commit_basic() {
+        let opening: Vec<u8> = (0..32).collect();
+        let value_bytes: Vec<u8> = vec![1, 2, 3];
+
+        let input = serde_json::json!({
+            "value": {
+                "value": [value_bytes],
+                "alignment": [bytes_alignment(3)]
+            },
+            "opening": opening
+        });
+
+        let json = CString::new(input.to_string()).unwrap();
+        let result_ptr = contract_persistent_commit_aligned(json.as_ptr());
+        assert!(!result_ptr.is_null(), "Should not return null");
+
+        let result = unsafe { std::ffi::CStr::from_ptr(result_ptr).to_str().unwrap() };
+        println!("persistentCommit result: {}", result);
+
+        let parsed: serde_json::Value = serde_json::from_str(result).unwrap();
+        assert!(!parsed.is_object() || parsed.get("error").is_none(),
+            "Should not be an error: {}", result);
+        assert!(parsed.is_array(), "Should be a Value array: {}", result);
+
+        unsafe { contract_free_string(result_ptr as *mut c_char); }
+    }
+
+    #[test]
+    fn test_persistent_commit_with_field_alignment() {
+        let opening: Vec<u8> = (0..32).map(|i| i * 7).collect();
+        let value_bytes: Vec<u8> = vec![0; 32]; // 32-byte field element
+
+        let input = serde_json::json!({
+            "value": {
+                "value": [value_bytes],
+                "alignment": [field_alignment()]
+            },
+            "opening": opening
+        });
+
+        let json = CString::new(input.to_string()).unwrap();
+        let result_ptr = contract_persistent_commit_aligned(json.as_ptr());
+        assert!(!result_ptr.is_null());
+
+        let result = unsafe { std::ffi::CStr::from_ptr(result_ptr).to_str().unwrap() };
+        println!("persistentCommit field result: {}", result);
+
+        let parsed: serde_json::Value = serde_json::from_str(result).unwrap();
+        assert!(parsed.is_array(), "Expected array, got: {}", result);
+
+        unsafe { contract_free_string(result_ptr as *mut c_char); }
+    }
+
+    #[test]
+    fn test_persistent_commit_deterministic() {
+        let opening: Vec<u8> = (0..32).collect();
+        let value_bytes: Vec<u8> = vec![10, 20, 30];
+
+        let input = serde_json::json!({
+            "value": {
+                "value": [value_bytes],
+                "alignment": [bytes_alignment(3)]
+            },
+            "opening": opening
+        });
+
+        let json1 = CString::new(input.to_string()).unwrap();
+        let json2 = CString::new(input.to_string()).unwrap();
+
+        let r1 = contract_persistent_commit_aligned(json1.as_ptr());
+        let r2 = contract_persistent_commit_aligned(json2.as_ptr());
+
+        let s1 = unsafe { std::ffi::CStr::from_ptr(r1).to_str().unwrap().to_string() };
+        let s2 = unsafe { std::ffi::CStr::from_ptr(r2).to_str().unwrap().to_string() };
+
+        assert_eq!(s1, s2, "Same input should produce same output");
+
+        unsafe {
+            contract_free_string(r1 as *mut c_char);
+            contract_free_string(r2 as *mut c_char);
+        }
+    }
+
+    #[test]
+    fn test_persistent_commit_different_opening_different_result() {
+        let value_bytes: Vec<u8> = vec![1, 2, 3];
+
+        let input1 = serde_json::json!({
+            "value": { "value": [value_bytes.clone()], "alignment": [bytes_alignment(3)] },
+            "opening": vec![0u8; 32]
+        });
+        let input2 = serde_json::json!({
+            "value": { "value": [value_bytes], "alignment": [bytes_alignment(3)] },
+            "opening": vec![1u8; 32]
+        });
+
+        let j1 = CString::new(input1.to_string()).unwrap();
+        let j2 = CString::new(input2.to_string()).unwrap();
+
+        let r1 = contract_persistent_commit_aligned(j1.as_ptr());
+        let r2 = contract_persistent_commit_aligned(j2.as_ptr());
+
+        let s1 = unsafe { std::ffi::CStr::from_ptr(r1).to_str().unwrap().to_string() };
+        let s2 = unsafe { std::ffi::CStr::from_ptr(r2).to_str().unwrap().to_string() };
+
+        assert_ne!(s1, s2, "Different openings should produce different commitments");
+
+        unsafe {
+            contract_free_string(r1 as *mut c_char);
+            contract_free_string(r2 as *mut c_char);
+        }
+    }
+
+    #[test]
+    fn test_persistent_commit_rejects_short_opening() {
+        let input = serde_json::json!({
+            "value": {
+                "value": [[1, 2, 3]],
+                "alignment": [bytes_alignment(3)]
+            },
+            "opening": [1, 2, 3] // only 3 bytes, need 32
+        });
+
+        let json = CString::new(input.to_string()).unwrap();
+        let result_ptr = contract_persistent_commit_aligned(json.as_ptr());
+        assert!(!result_ptr.is_null());
+
+        let result = unsafe { std::ffi::CStr::from_ptr(result_ptr).to_str().unwrap() };
+        println!("short opening result: {}", result);
+        assert!(result.contains("error"), "Should return error for short opening");
+        assert!(result.contains("32 bytes"), "Should mention 32 bytes");
+
+        unsafe { contract_free_string(result_ptr as *mut c_char); }
     }
 }
