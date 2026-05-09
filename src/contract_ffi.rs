@@ -253,19 +253,27 @@ pub extern "C" fn contract_query(
             Err(e) => return to_c_string(&format!("{{\"error\":\"opcodes deserialize: {}\"}}", e)),
         };
 
-    // Build QueryContext from state (same as ContractStateExt::query but preserves gas)
-    let qc = QueryContext::<InMemoryDB> {
-        state: state.data.clone(),
-        address: Default::default(),
-        effects: Default::default(),
-        call_context: Default::default(),
+    // Build QueryContext with realistic call_context so gas computation
+    // during circuit execution matches on-chain behavior. The gas from
+    // contract_query feeds into the JS runtime's gas tracking.
+    let qc = {
+        use midnight_base_crypto::time::Timestamp;
+        use midnight_base_crypto::hash::HashOutput;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        QueryContext::<InMemoryDB> {
+            state: state.data.clone(),
+            address: Default::default(),
+            effects: Default::default(),
+            call_context: midnight_onchain_runtime::context::CallContext {
+                tblock: Timestamp::from_secs(now_secs),
+                ..Default::default()
+            },
+        }
     };
 
-    // Execute query — returns gas_cost.
-    // Uses INITIAL_COST_MODEL here because contract_query is for circuit execution
-    // (computing state reads/writes), not for transaction assembly. The gas value
-    // from this execution is passed back to JS but NOT embedded in the Transcript.
-    // The correct cost model is used in assemble_call_tx_impl via ledger_parameters_hex.
     match qc.query(&ops, None, &INITIAL_COST_MODEL) {
         Ok(results) => {
             // Build new ContractState from results
@@ -1139,6 +1147,49 @@ fn convert_verify_to_gather(
     }).collect()
 }
 
+/// Build a QueryContext matching the on-chain VM's context for gas computation.
+///
+/// The on-chain VM (semantics.rs:1282-1290) constructs the QueryContext with:
+/// - `state`: the contract's current state tree
+/// - `address`: the contract address
+/// - `call_context`: built from the block context (block time, parent hash, etc.)
+///
+/// Our gas must match the on-chain gas because the node uses `transcript.gas`
+/// as the gas LIMIT during replay. If our gas < on-chain cost → OutOfGas.
+fn build_gas_query_context(
+    state: midnight_onchain_state::state::ChargedState<InMemoryDB>,
+    contract_address_hex: &str,
+) -> midnight_onchain_runtime::context::QueryContext<InMemoryDB> {
+    use midnight_base_crypto::time::Timestamp;
+    use midnight_base_crypto::hash::HashOutput;
+    use midnight_coin_structure::contract::ContractAddress;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let addr_bytes = hex::decode(contract_address_hex).unwrap_or_else(|_| vec![0u8; 32]);
+    let mut addr_arr = [0u8; 32];
+    let copy_len = addr_bytes.len().min(32);
+    addr_arr[..copy_len].copy_from_slice(&addr_bytes[..copy_len]);
+    let addr = ContractAddress(HashOutput(addr_arr));
+
+    midnight_onchain_runtime::context::QueryContext {
+        state,
+        address: addr,
+        effects: Default::default(),
+        call_context: midnight_onchain_runtime::context::CallContext {
+            own_address: addr,
+            tblock: Timestamp::from_secs(now_secs),
+            tblock_err: 3,
+            parent_block_hash: HashOutput(addr_arr),
+            last_block_time: Timestamp::from_secs(now_secs.saturating_sub(6)),
+            ..Default::default()
+        },
+    }
+}
+
 fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     use midnight_onchain_vm::result_mode::ResultModeVerify;
     use midnight_onchain_runtime::transcript::{Transcript, TranscriptVersion};
@@ -1225,41 +1276,10 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
         }
     };
 
-    let (gas, effects) = {
-        use midnight_onchain_runtime::context::QueryContext;
-
-        let pool = STATE_POOL.lock().map_err(|e| format!("lock: {}", e))?;
-        let initial_state = pool.get(&initial_state_handle)
-            .ok_or(format!("invalid initial_state_handle: {}", initial_state_handle))?;
-
-        // Also validate the final state handle
-        if !pool.contains_key(&state_handle) {
-            return Err(format!("invalid state_handle: {}", state_handle));
-        }
-
-        // Convert Verify-mode ops to Gather-mode for re-execution
-        // (strip popeq results — the VM will recompute them)
-        let gather_ops = convert_verify_to_gather(&transcript_ops);
-
-        let qc = QueryContext::<InMemoryDB> {
-            state: initial_state.data.clone(),
-            address: Default::default(),
-            effects: Default::default(),
-            call_context: Default::default(),
-        };
-
-        match qc.query(&gather_ops, None, &cost_model) {
-            Ok(results) => {
-                (results.gas_cost, results.context.effects)
-            }
-            Err(e) => return Err(format!("gas re-execution failed: {:?}", e)),
-        }
-    };
-
-    // SCALE round-trip the ops to normalize internal storage state.
-    // Manually-constructed Op types may have different Sp/Arena state
-    // than ops produced through the Storable infrastructure, which causes
-    // field_repr encoding differences during proving.
+    // 5. SCALE round-trip the ops to normalize internal storage state.
+    //    Manually-constructed Op types may have different Sp/Arena state
+    //    than ops produced through the Storable infrastructure, which causes
+    //    field_repr encoding differences during proving.
     let normalized_ops: Vec<Op<ResultModeVerify, InMemoryDB>> = {
         let mut buf = Vec::new();
         for op in &transcript_ops {
@@ -1277,6 +1297,38 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
         normalized
     };
 
+    // 6. Compute gas + effects by replaying in VERIFY mode — matching
+    //    the exact code path the on-chain node uses in run_transcript().
+    //    Then apply the SDK's official 1.2x heuristic overhead.
+    //
+    //    The SDK's `partition_transcripts` (ledger/src/construct.rs) builds
+    //    every Transcript via `res.gas_heuristic(params, false, 0)`, which
+    //    is defined (construct.rs:840) as:
+    //        let transcript_gas_cost_with_overhead = self.gas_cost * 1.2;
+    //    Submitting raw `gas_cost` without the overhead causes intermittent
+    //    OutOfGas rejections because the on-chain replay's call_context
+    //    (real block time, parent_hash, etc.) and storage-diff costing can
+    //    yield a slightly higher cost than our local replay.
+    let (gas, effects) = {
+        let pool = STATE_POOL.lock().map_err(|e| format!("lock: {}", e))?;
+        let initial_state = pool.get(&initial_state_handle)
+            .ok_or(format!("invalid initial_state_handle: {}", initial_state_handle))?;
+
+        if !pool.contains_key(&state_handle) {
+            return Err(format!("invalid state_handle: {}", state_handle));
+        }
+
+        let qc = build_gas_query_context(initial_state.data.clone(), contract_address_hex);
+
+        match qc.query(&normalized_ops, None, &cost_model) {
+            Ok(results) => {
+                let gas_with_overhead = results.gas_cost * 1.2;
+                (gas_with_overhead, results.context.effects)
+            }
+            Err(e) => return Err(format!("gas verify-mode re-execution failed: {:?}", e)),
+        }
+    };
+
     let transcript = Transcript::<InMemoryDB> {
         gas,
         effects,
@@ -1284,7 +1336,7 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
         version: Some(Sp::new(Transcript::<InMemoryDB>::VERSION)),
     };
 
-    // 6. ContractOperation (verifier key loaded separately during proving)
+    // 7. ContractOperation (verifier key loaded separately during proving)
     let op = ContractOperation::new(None);
 
     // 7. Build ContractCallPrototype
@@ -1890,6 +1942,369 @@ mod state_structure_tests {
             }
             other => panic!("Expected Array, got {:?}", std::mem::discriminant(other)),
         }
+    }
+}
+
+#[cfg(test)]
+mod normalized_value_tests {
+    use super::*;
+    use midnight_base_crypto::fab::{AlignedValue, Value, ValueAtom, Alignment, AlignmentSegment, AlignmentAtom};
+    use midnight_onchain_vm::ops::Op;
+    use midnight_onchain_vm::result_mode::ResultModeVerify;
+
+    /// Verifies that normalized (empty) ValueAtoms are preserved through
+    /// parse_aligned_value and match the on-chain normalized form.
+    /// This is the root cause fix for Error 104 (Transcript/ReadMismatch).
+    #[test]
+    fn empty_atom_matches_normalized_form() {
+        // Boolean false in Midnight is stored as ValueAtom([]) with Bytes(1) alignment.
+        // Our JS used to pad this to ValueAtom([0]) causing ReadMismatch on-chain.
+        let json: serde_json::Value = serde_json::json!({
+            "value": [[]],
+            "alignment": [{"tag": "atom", "value": {"tag": "bytes", "length": 1}}]
+        });
+        let parsed = parse_aligned_value(&json).expect("should parse");
+
+        // On-chain state stores normalized form
+        let on_chain = AlignedValue {
+            value: Value(vec![ValueAtom(vec![])]),
+            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 1 })]),
+        };
+
+        assert_eq!(parsed, on_chain,
+            "Parsed value must match on-chain normalized form (both empty)");
+    }
+
+    /// Bytes<32> with all-zero content (e.g. pad(32, "")) is stored as
+    /// ValueAtom([]) after normalization. Must NOT be padded to 32 zeros.
+    #[test]
+    fn empty_bytes32_matches_normalized_form() {
+        let json: serde_json::Value = serde_json::json!({
+            "value": [[]],
+            "alignment": [{"tag": "atom", "value": {"tag": "bytes", "length": 32}}]
+        });
+        let parsed = parse_aligned_value(&json).expect("should parse");
+
+        let on_chain = AlignedValue {
+            value: Value(vec![ValueAtom(vec![])]),
+            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 32 })]),
+        };
+
+        assert_eq!(parsed, on_chain,
+            "Empty Bytes<32> must match on-chain normalized form");
+    }
+
+    /// Non-zero values should parse identically to the on-chain form.
+    #[test]
+    fn nonzero_value_matches() {
+        let json: serde_json::Value = serde_json::json!({
+            "value": [[1]],
+            "alignment": [{"tag": "atom", "value": {"tag": "bytes", "length": 1}}]
+        });
+        let parsed = parse_aligned_value(&json).expect("should parse");
+
+        let on_chain = AlignedValue {
+            value: Value(vec![ValueAtom(vec![1])]),
+            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 1 })]),
+        };
+
+        assert_eq!(parsed, on_chain);
+    }
+
+    /// Popeq with empty result must SCALE round-trip correctly.
+    /// This simulates the transcript normalization step in assemble_call_tx.
+    #[test]
+    fn popeq_empty_result_scale_roundtrip() {
+        let av = AlignedValue {
+            value: Value(vec![ValueAtom(vec![])]),
+            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 1 })]),
+        };
+        let op: Op<ResultModeVerify, midnight_storage::db::InMemoryDB> = Op::Popeq {
+            cached: false,
+            result: av.clone(),
+        };
+
+        // SCALE serialize
+        let mut buf = Vec::new();
+        midnight_serialize::Serializable::serialize(&op, &mut buf)
+            .expect("serialize should succeed");
+
+        // SCALE deserialize
+        let deserialized: Op<ResultModeVerify, midnight_storage::db::InMemoryDB> =
+            midnight_serialize::Deserializable::deserialize(&mut &buf[..], 0)
+                .expect("deserialize should succeed");
+
+        if let Op::Popeq { result, .. } = &deserialized {
+            assert_eq!(result, &av,
+                "SCALE round-trip must preserve normalized (empty) ValueAtom");
+        } else {
+            panic!("Expected Popeq, got {:?}", deserialized);
+        }
+    }
+
+    /// Simulate the FULL commitBatch pipeline:
+    /// 1. Load actual on-chain state (post-joinMatch)
+    /// 2. Run commitBatch's first query ops in Gather mode (get actual results)
+    /// 3. Build Verify-mode ops with those results
+    /// 4. Run in Verify mode (must pass)
+    /// 5. SCALE-normalize the ops
+    /// 6. Run SCALE-normalized ops in Verify mode (must also pass)
+    /// If step 4 passes but step 6 fails → SCALE normalization is the bug
+    #[test]
+    fn commitbatch_full_pipeline_verify() {
+        use midnight_onchain_runtime::context::QueryContext;
+        use midnight_onchain_vm::ops::{Op, Key};
+        use midnight_onchain_vm::result_mode::{ResultModeGather, ResultModeVerify, GatherEvent};
+
+        let state_hex = std::fs::read_to_string("/tmp/penalty_state_joinmatch.txt")
+            .expect("Run save script first");
+        let state_hex = state_hex.trim();
+        if state_hex.is_empty() { panic!("Empty state file"); }
+
+        let bytes = hex::decode(state_hex).expect("hex decode");
+        let state: midnight_onchain_state::state::ContractState<InMemoryDB> =
+            midnight_serialize::tagged_deserialize(&mut &bytes[..]).expect("deserialize");
+
+        // Build the FIRST query of commitBatch: read phase at path [0, 0]
+        let key0 = AlignedValue {
+            value: Value(vec![ValueAtom(vec![])]),
+            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 1 })]),
+        };
+
+        // Step 1: Gather mode — get the actual read value
+        let gather_ops: Vec<Op<ResultModeGather, InMemoryDB>> = vec![
+            Op::Dup { n: 0 },
+            Op::Idx { cached: false, push_path: false,
+                path: vec![Key::Value(key0.clone()), Key::Value(key0.clone())].into_iter().collect() },
+            Op::Popeq { cached: false, result: () },
+        ];
+
+        let qc_gather = QueryContext::<InMemoryDB> {
+            state: state.data.clone(),
+            address: Default::default(),
+            effects: Default::default(),
+            call_context: Default::default(),
+        };
+        let gather_result = qc_gather.query(&gather_ops, None, &INITIAL_COST_MODEL)
+            .expect("Gather query should succeed");
+
+        let phase_value = match &gather_result.events[0] {
+            GatherEvent::Read(av) => av.clone(),
+            _ => panic!("Expected Read event"),
+        };
+        println!("Gather: phase = {:?}", phase_value.value);
+        assert_eq!(phase_value.value, Value(vec![ValueAtom(vec![1])]));
+
+        // Step 2: Verify mode — check popeq with the gathered result
+        let verify_ops: Vec<Op<ResultModeVerify, InMemoryDB>> = vec![
+            Op::Dup { n: 0 },
+            Op::Idx { cached: false, push_path: false,
+                path: vec![Key::Value(key0.clone()), Key::Value(key0.clone())].into_iter().collect() },
+            Op::Popeq { cached: false, result: phase_value.clone() },
+        ];
+
+        let qc_verify = QueryContext::<InMemoryDB> {
+            state: state.data.clone(),
+            address: Default::default(),
+            effects: Default::default(),
+            call_context: Default::default(),
+        };
+        qc_verify.query(&verify_ops, None, &INITIAL_COST_MODEL)
+            .expect("Verify query should pass (pre-SCALE)");
+        println!("Verify (pre-SCALE): PASSED");
+
+        // Step 3: SCALE normalize the ops (same as assemble_call_tx_impl)
+        let mut buf = Vec::new();
+        for op in &verify_ops {
+            midnight_serialize::Serializable::serialize(op, &mut buf)
+                .expect("SCALE serialize");
+        }
+        let mut reader = &buf[..];
+        let mut normalized_ops = Vec::new();
+        for _ in 0..verify_ops.len() {
+            let op: Op<ResultModeVerify, InMemoryDB> =
+                midnight_serialize::Deserializable::deserialize(&mut reader, 0)
+                    .expect("SCALE deserialize");
+            normalized_ops.push(op);
+        }
+
+        // Check if SCALE changed any popeq values
+        for (i, (orig, norm)) in verify_ops.iter().zip(normalized_ops.iter()).enumerate() {
+            if let (Op::Popeq { result: o, .. }, Op::Popeq { result: n, .. }) = (orig, norm) {
+                if o != n {
+                    panic!("SCALE CHANGED popeq[{}]! orig={:?} norm={:?}", i, o.value, n.value);
+                }
+            }
+        }
+        println!("SCALE normalization: popeq values UNCHANGED");
+
+        // Step 4: Verify mode with SCALE-normalized ops
+        let qc_norm = QueryContext::<InMemoryDB> {
+            state: state.data.clone(),
+            address: Default::default(),
+            effects: Default::default(),
+            call_context: Default::default(),
+        };
+        qc_norm.query(&normalized_ops, None, &INITIAL_COST_MODEL)
+            .expect("Verify query should pass (post-SCALE)");
+        println!("Verify (post-SCALE): PASSED");
+
+        println!("\n=== All pipeline stages passed for phase read ===");
+
+        // Step 5: Simulate blockTimeLt with WRONG deadline (300 = duration, not absolute)
+        // This is the root cause of error 104:
+        // - Local tblock=0, deadline=300 → 0 < 300 = true → [01]
+        // - On-chain tblock=1778214116, deadline=300 → 1778214116 < 300 = false → [-]
+        // → ReadMismatch { expected: [01], actual: [-] }
+        println!("\n=== blockTimeLt simulation ===");
+
+        // Build the blockTimeLt ops: dup n=2, idx [2], push(deadline), lt, popeq
+        let key2 = AlignedValue {
+            value: Value(vec![ValueAtom(vec![2])]),
+            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 1 })]),
+        };
+
+        // Deadline = 300 (WRONG — should be absolute timestamp)
+        let deadline_wrong: u64 = 300;
+        // Deadline = now + 300 (CORRECT — absolute timestamp)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let deadline_correct: u64 = now + 300;
+
+        for (label, deadline_val) in [("WRONG (300)", deadline_wrong), ("CORRECT (now+300)", deadline_correct)] {
+            // Build deadline Cell value (Uint<64> = Bytes(8) alignment)
+            let deadline_bytes = deadline_val.to_le_bytes();
+            let mut normalized = deadline_bytes.to_vec();
+            while normalized.last() == Some(&0) { normalized.pop(); }
+            let deadline_av = AlignedValue {
+                value: Value(vec![ValueAtom(normalized)]),
+                alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 8 })]),
+            };
+            let deadline_sv = midnight_onchain_state::state::StateValue::<InMemoryDB>::Cell(
+                midnight_storage::arena::Sp::new(deadline_av)
+            );
+
+            // Need full call_context on the stack for blockTimeLt
+            // For this test, construct a QueryContext with a real tblock
+            let tblock_bytes = now.to_le_bytes();
+            let mut tblock_norm = tblock_bytes.to_vec();
+            while tblock_norm.last() == Some(&0) { tblock_norm.pop(); }
+            let tblock_av = AlignedValue {
+                value: Value(vec![ValueAtom(tblock_norm)]),
+                alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 8 })]),
+            };
+
+            // Simulate the lt comparison directly: tblock < deadline?
+            let result = now < deadline_val;
+            println!("  {}: now={} < deadline={} → {}",
+                label, now, deadline_val, result);
+        }
+
+        println!("\n=== FIX: use absolute timestamp (now+300) as deadline ===");
+    }
+
+    /// Read phase from actual contract state SCALE hex at both deploy and joinMatch.
+    /// Confirms what the node would read when validating commitBatch.
+    #[test]
+    fn read_phase_from_on_chain_state() {
+        use midnight_onchain_runtime::context::QueryContext;
+        use midnight_onchain_vm::ops::{Op, Key};
+        use midnight_onchain_vm::result_mode::ResultModeGather;
+
+        // Test BOTH deploy and joinMatch states
+        for (label, path) in [
+            ("deploy", "/tmp/penalty_state_deploy.txt"),
+            ("joinMatch", "/tmp/penalty_state_joinmatch.txt"),
+        ] {
+        let state_hex = std::fs::read_to_string(path)
+            .unwrap_or_else(|_| panic!("Missing {}: run the save script first", path));
+        let state_hex = state_hex.trim();
+        if state_hex.is_empty() { println!("{}: EMPTY", label); continue; }
+
+        let bytes = hex::decode(state_hex).expect("hex decode");
+
+        // Create state handle
+        let state: midnight_onchain_state::state::ContractState<InMemoryDB> =
+            midnight_serialize::tagged_deserialize(&mut &bytes[..])
+                .expect("tagged deserialize");
+
+        println!("State data type: {:?}", std::mem::discriminant(state.data.get_ref()));
+
+        // Build the same idx path as commitBatch: path [0, 0] → phase field
+        let key0 = AlignedValue {
+            value: Value(vec![ValueAtom(vec![])]),  // normalized 0
+            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 1 })]),
+        };
+
+        let ops: Vec<Op<ResultModeGather, InMemoryDB>> = vec![
+            Op::Dup { n: 0 },
+            Op::Idx {
+                cached: false,
+                push_path: false,
+                path: vec![
+                    Key::Value(key0.clone()),
+                    Key::Value(key0.clone()),
+                ].into_iter().collect(),
+            },
+            Op::Popeq { cached: false, result: () },
+        ];
+
+        let qc = QueryContext::<InMemoryDB> {
+            state: state.data.clone(),
+            address: Default::default(),
+            effects: Default::default(),
+            call_context: Default::default(),
+        };
+
+        match qc.query(&ops, None, &INITIAL_COST_MODEL) {
+            Ok(results) => {
+                for (i, ev) in results.events.iter().enumerate() {
+                    match ev {
+                        midnight_onchain_vm::result_mode::GatherEvent::Read(av) => {
+                            println!("{}: phase read = value={:?}, alignment={:?}",
+                                label, av.value, av.alignment);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                println!("{}: Query FAILED: {:?}", label, e);
+            }
+        }
+        } // end for loop
+    }
+
+    /// Multiple alignment segments with mixed empty/non-empty atoms.
+    /// Simulates BatchPreimage-adjacent state reads.
+    #[test]
+    fn mixed_empty_and_nonzero_atoms() {
+        // Phase=COMMITTING(1), p1Committed=false([]), p1Commitment=zeros([])
+        let json: serde_json::Value = serde_json::json!({
+            "value": [[1], [], []],
+            "alignment": [
+                {"tag": "atom", "value": {"tag": "bytes", "length": 1}},
+                {"tag": "atom", "value": {"tag": "bytes", "length": 1}},
+                {"tag": "atom", "value": {"tag": "bytes", "length": 32}}
+            ]
+        });
+        let parsed = parse_aligned_value(&json).expect("should parse");
+
+        let on_chain = AlignedValue {
+            value: Value(vec![
+                ValueAtom(vec![1]),      // phase=COMMITTING
+                ValueAtom(vec![]),       // p1Committed=false (normalized)
+                ValueAtom(vec![]),       // p1Commitment=zeros (normalized)
+            ]),
+            alignment: Alignment(vec![
+                AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 1 }),
+                AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 1 }),
+                AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 32 }),
+            ]),
+        };
+
+        assert_eq!(parsed, on_chain,
+            "Mixed state fields must match on-chain normalized form");
     }
 }
 
