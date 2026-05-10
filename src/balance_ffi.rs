@@ -264,9 +264,16 @@ fn balance_proven_transaction_impl(
         }
     };
 
-    // Calculate fee from ledger params. If fee is 0 (common on testnets where
-    // fees are disabled), skip dust balancing entirely — just seal and return
-    // the proven tx as-is. The facade does the same: zero fee = no dust spends.
+    // Calculate fee from ledger params. NOTE: fees_with_margin can return 0
+    // for small contract-call txs because the synthetic cost rounds to 0
+    // specks. The on-chain verifier (verify.rs:609) calls fees(params, true),
+    // which enforces time_to_dismiss; on a tx with no dust spend, that check
+    // can fail and surface as Malformed(FeeCalculation) (error 168).
+    //
+    // The SDK's balanceTransactions ALWAYS emits a dust intent (see
+    // dust-wallet/Transacting.ts:512-527) even when the dust recipe is empty.
+    // We do the same: always include at least one dust spend so the tx has
+    // the structural shape the verifier expects, with v_fee >= 1.
     let erased_tx = proven_tx.erase_proofs();
     let base_fee = erased_tx
         .fees_with_margin(&params, DEFAULT_FEE_BLOCKS_MARGIN)
@@ -274,21 +281,10 @@ fn balance_proven_transaction_impl(
 
     balance_log!(LOG_INFO, "Fee from ledger params: {} specks", base_fee);
 
-    if base_fee == 0 {
-        // Zero fees on this network — no dust payment needed.
-        // Just seal the proven tx and return it.
-        balance_log!(LOG_INFO, "Zero fee network — sealing proven tx without dust");
-        let sealed_tx = proven_tx.seal(OsRng);
-
-        let mut result_bytes = Vec::new();
-        tagged_serialize(&sealed_tx, &mut result_bytes)
-            .map_err(|e| format!("Failed to serialize sealed transaction: {:?}", e))?;
-        let result_hex = hex::encode(&result_bytes);
-        return Ok((result_hex, dust_state.clone()));
-    }
-
     let overhead = base_fee * FEE_OVERHEAD_PERCENT / 100;
-    let total_fee: u128 = base_fee + overhead;
+    // Ensure v_fee >= 1 so the dust spend is always non-trivial. Without this,
+    // a 0-fee tx would have no dust spend and the node rejects with FeeCalculation.
+    let total_fee: u128 = (base_fee + overhead).max(1);
 
     balance_log!(LOG_INFO, "Calculated fee: {} specks (base={}, overhead={})",
         total_fee, base_fee, overhead);
@@ -872,6 +868,116 @@ mod preprod_diagnostic {
         let result = state.dust.spend(&state.dust_key, &utxo, 42, state.time);
         assert!(result.is_ok(), "Spend should work on extended state");
         eprintln!("Spend on extended state: SUCCESS");
+    }
+
+    /// Decode the live ledger parameters and print key fee/cost fields.
+    /// Run with: cargo test --release --lib inspect_ledger_params -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn inspect_ledger_params() {
+        use midnight_ledger::structure::LedgerParameters;
+        use midnight_serialize::tagged_deserialize;
+
+        let hex_str = std::fs::read_to_string("/tmp/ledger_params.hex")
+            .expect("/tmp/ledger_params.hex missing — fetch from indexer first");
+        let bytes = hex::decode(hex_str.trim()).expect("hex decode");
+        eprintln!("Ledger params: {} bytes", bytes.len());
+
+        let params: LedgerParameters = tagged_deserialize(&bytes[..])
+            .expect("deserialize ledger params");
+
+        eprintln!("\nlimits.min_time_to_dismiss: {:?}", params.limits.min_time_to_dismiss);
+        eprintln!("limits.time_to_dismiss_per_byte: {:?}", params.limits.time_to_dismiss_per_byte);
+        eprintln!("limits.block_limits: {:?}", params.limits.block_limits);
+        eprintln!("\nfee_prices: {:?}", params.fee_prices);
+        eprintln!("\ncost_model.baseline_cost: {:?}", params.cost_model.baseline_cost);
+    }
+
+    /// Decode an SDK-built transaction (sealed = PureGeneratorPedersen) and print its
+    /// dust spend structure. Used to compare against our balance_ffi-built tx.
+    ///
+    /// Inputs:
+    ///   /tmp/sdk_tx_raw.hex  — raw tagged Transaction bytes (extrinsic stripped)
+    ///   /tmp/our_tx_raw.hex  — our balance_ffi output (capture from logcat)
+    ///
+    /// Run with: cargo test --release --lib decode_sdk_tx_dust -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn decode_sdk_tx_dust() {
+        use midnight_base_crypto::signatures::Signature;
+        use midnight_ledger::structure::{ProofMarker, StandardTransaction, Transaction};
+        use midnight_serialize::tagged_deserialize;
+        use midnight_storage::db::InMemoryDB;
+        use midnight_transient_crypto::commitment::PureGeneratorPedersen;
+
+        type SealedTx = Transaction<Signature, ProofMarker, PureGeneratorPedersen, InMemoryDB>;
+
+        let params: midnight_ledger::structure::LedgerParameters = std::fs::read_to_string("/tmp/ledger_params.hex")
+            .ok()
+            .and_then(|h| hex::decode(h.trim()).ok())
+            .and_then(|b| midnight_serialize::tagged_deserialize(&b[..]).ok())
+            .expect("/tmp/ledger_params.hex required for fees(true) inspection");
+
+        for path in ["/tmp/sdk_tx_raw.hex", "/tmp/our_tx_raw.hex"] {
+            let hex_str = match std::fs::read_to_string(path) {
+                Ok(s) => s.trim().to_string(),
+                Err(_) => {
+                    eprintln!("--- {} not present, skipping ---\n", path);
+                    continue;
+                }
+            };
+            let bytes = hex::decode(&hex_str).expect("hex decode");
+            eprintln!("=== {} ({} bytes) ===", path, bytes.len());
+
+            let tx: SealedTx = match tagged_deserialize(&bytes[..]) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("  DESERIALIZE FAIL: {:?}\n", e);
+                    continue;
+                }
+            };
+
+            // The critical diagnostic: replicate what the on-chain verifier does.
+            eprintln!("  fees(params, true)  [node check]:  {:?}", tx.fees(&params, true));
+            eprintln!("  fees(params, false) [our check]:   {:?}", tx.fees(&params, false));
+            eprintln!("  fees_with_margin(params, 5):        {:?}", tx.fees_with_margin(&params, 5));
+
+            match &tx {
+                Transaction::Standard(std_tx) => {
+                    eprintln!("  network_id: {:?}", std_tx.network_id);
+                    eprintln!("  binding_randomness: {:?}", std_tx.binding_randomness);
+                    eprintln!("  guaranteed_coins.is_some(): {}", std_tx.guaranteed_coins.is_some());
+                    eprintln!("  fallible_coins entries: {}", std_tx.fallible_coins.size());
+                    eprintln!("  intents:");
+                    for entry in std_tx.intents.iter() {
+                        let inner = &*entry;
+                        let segment = *inner.0;
+                        let intent = &*inner.1;
+                        eprintln!("    segment {}: ttl={:?}", segment, intent.ttl);
+                        eprintln!("      dust_actions.is_some(): {}", intent.dust_actions.is_some());
+                        if let Some(da_sp) = &intent.dust_actions {
+                            let da = &**da_sp;
+                            eprintln!("      dust ctime: {:?}", da.ctime);
+                            eprintln!("      dust spends: count via Vec");
+                            let spends_vec: std::vec::Vec<_> = (&da.spends).into();
+                            eprintln!("      dust spends: {}", spends_vec.len());
+                            for (i, s) in spends_vec.iter().enumerate() {
+                                eprintln!("        spend[{}]: v_fee={}", i, s.v_fee);
+                                eprintln!("          old_nullifier: {:?}", s.old_nullifier);
+                                eprintln!("          new_commitment: {:?}", s.new_commitment);
+                            }
+                            let regs_vec: std::vec::Vec<_> = (&da.registrations).into();
+                            eprintln!("      dust registrations: {}", regs_vec.len());
+                        }
+                        eprintln!("      guaranteed_unshielded_offer.is_some(): {}", intent.guaranteed_unshielded_offer.is_some());
+                        eprintln!("      fallible_unshielded_offer.is_some(): {}", intent.fallible_unshielded_offer.is_some());
+                        eprintln!("      contract_actions: {}", intent.actions.len());
+                    }
+                }
+                _ => eprintln!("  Not a StandardTransaction"),
+            }
+            eprintln!();
+        }
     }
 
     /// Test: verify replay is deterministic (same events -> same roots).
