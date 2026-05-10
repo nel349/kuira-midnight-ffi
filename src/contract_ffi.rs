@@ -1195,7 +1195,7 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     use midnight_onchain_runtime::transcript::{Transcript, TranscriptVersion};
     use midnight_onchain_runtime::context::Effects;
     use midnight_onchain_state::state::{ContractOperation, EntryPointBuf};
-    use midnight_ledger::construct::ContractCallPrototype;
+    use midnight_ledger::construct::{ContractCallPrototype, PreTranscript, partition_transcripts};
     use midnight_ledger::structure::{Transaction, Intent, ProofPreimageMarker};
     use midnight_transient_crypto::proofs::{ProofPreimage, KeyLocation};
     use midnight_transient_crypto::curve::Fr;
@@ -1253,30 +1253,21 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     let transcript_ops = parse_transcript_ops(transcript_array)
         .map_err(|e| format!("transcript parse: {}", e))?;
 
-    // 5. Compute correct gas by re-executing transcript ops against initial state.
-    //    The prover embeds gas into the binding_input hash — zeroed gas = proof rejection.
-    //    We use QueryContext::query() (not ContractStateExt::query()) to preserve gas.
-    //
-    //    CRITICAL: Must use the same cost model the node uses (from ledger parameters),
-    //    NOT INITIAL_COST_MODEL. The node uses transcript.gas as the gas LIMIT during
-    //    re-execution. If we compute gas with a cheaper cost model, the node's re-execution
-    //    with its real (more expensive) cost model exceeds our gas limit → OutOfGas rejection.
-    let cost_model = {
-        let ledger_params_hex = params["ledger_parameters_hex"].as_str();
-        if let Some(hex_str) = ledger_params_hex {
-            let bytes = hex_to_bytes(hex_str)
-                .ok_or("invalid ledger_parameters_hex")?;
-            let lp: midnight_ledger::structure::LedgerParameters =
-                midnight_serialize::tagged_deserialize(&mut &bytes[..])
-                    .map_err(|e| format!("ledger params deserialize: {:?}", e))?;
-            lp.cost_model.runtime_cost_model
+    // 5. Decode the live ledger parameters. Required for partition_transcripts,
+    //    which uses params.limits.min_time_to_dismiss + params.cost_model to
+    //    decide where to split the program at checkpoints. Falls back to
+    //    INITIAL_PARAMETERS only on a fresh chain (best-effort for tests).
+    let ledger_params: midnight_ledger::structure::LedgerParameters = {
+        if let Some(hex_str) = params["ledger_parameters_hex"].as_str() {
+            let bytes = hex_to_bytes(hex_str).ok_or("invalid ledger_parameters_hex")?;
+            midnight_serialize::tagged_deserialize(&mut &bytes[..])
+                .map_err(|e| format!("ledger params deserialize: {:?}", e))?
         } else {
-            // Fallback to initial cost model (only correct on a fresh chain)
-            INITIAL_COST_MODEL.clone()
+            midnight_ledger::structure::INITIAL_PARAMETERS.clone()
         }
     };
 
-    // 5. SCALE round-trip the ops to normalize internal storage state.
+    // 6. SCALE round-trip the ops to normalize internal storage state.
     //    Manually-constructed Op types may have different Sp/Arena state
     //    than ops produced through the Storable infrastructure, which causes
     //    field_repr encoding differences during proving.
@@ -1297,19 +1288,22 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
         normalized
     };
 
-    // 6. Compute gas + effects by replaying in VERIFY mode — matching
-    //    the exact code path the on-chain node uses in run_transcript().
-    //    Then apply the SDK's official 1.2x heuristic overhead.
+    // 7. Build a PreTranscript and let the SDK's `partition_transcripts`
+    //    split the program into guaranteed + fallible at Op::Ckpt boundaries.
     //
-    //    The SDK's `partition_transcripts` (ledger/src/construct.rs) builds
-    //    every Transcript via `res.gas_heuristic(params, false, 0)`, which
-    //    is defined (construct.rs:840) as:
-    //        let transcript_gas_cost_with_overhead = self.gas_cost * 1.2;
-    //    Submitting raw `gas_cost` without the overhead causes intermittent
-    //    OutOfGas rejections because the on-chain replay's call_context
-    //    (real block time, parent_hash, etc.) and storage-diff costing can
-    //    yield a slightly higher cost than our local replay.
-    let (gas, effects) = {
+    //    Why this matters: the on-chain `cost_to_dismiss` check
+    //    (verify.rs:609 → fees(params, true) → cost(...,true)) only counts
+    //    the GUARANTEED transcript's gas plus validation_cost. For a
+    //    compute-heavy circuit like revealBatch, putting everything in
+    //    guaranteed pushes cost_to_dismiss past time_to_dismiss and the
+    //    node rejects with Malformed(FeeCalculation) (error 168).
+    //    Splitting at checkpoints moves the heavy ops to fallible (which
+    //    runs in a separate phase, NOT bounded by time_to_dismiss).
+    //
+    //    `partition_transcripts` handles all of this — it's the same call
+    //    path used by `mn` and the JS SDK (see ledger/src/construct.rs:918,
+    //    and ledger/tests/micro-dao.rs for canonical usage).
+    let (guaranteed_transcript, fallible_transcript) = {
         let pool = STATE_POOL.lock().map_err(|e| format!("lock: {}", e))?;
         let initial_state = pool.get(&initial_state_handle)
             .ok_or(format!("invalid initial_state_handle: {}", initial_state_handle))?;
@@ -1320,20 +1314,19 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
 
         let qc = build_gas_query_context(initial_state.data.clone(), contract_address_hex);
 
-        match qc.query(&normalized_ops, None, &cost_model) {
-            Ok(results) => {
-                let gas_with_overhead = results.gas_cost * 1.2;
-                (gas_with_overhead, results.context.effects)
-            }
-            Err(e) => return Err(format!("gas verify-mode re-execution failed: {:?}", e)),
-        }
-    };
+        let pre = PreTranscript {
+            context: qc,
+            program: normalized_ops.clone(),
+            comm_comm: None,
+        };
 
-    let transcript = Transcript::<InMemoryDB> {
-        gas,
-        effects,
-        program: normalized_ops.into_iter().collect(),
-        version: Some(Sp::new(Transcript::<InMemoryDB>::VERSION)),
+        let mut transcripts = partition_transcripts(&[pre], &ledger_params)
+            .map_err(|e| format!("partition_transcripts failed: {:?}", e))?;
+
+        if transcripts.is_empty() {
+            return Err("partition_transcripts returned no transcripts".to_string());
+        }
+        transcripts.swap_remove(0)
     };
 
     // 7. ContractOperation (verifier key loaded separately during proving)
@@ -1353,8 +1346,8 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
         address: addr,
         entry_point: ep,
         op,
-        guaranteed_public_transcript: Some(transcript),
-        fallible_public_transcript: None,
+        guaranteed_public_transcript: guaranteed_transcript,
+        fallible_public_transcript: fallible_transcript,
         private_transcript_outputs: private_outputs,
         input,
         output,
