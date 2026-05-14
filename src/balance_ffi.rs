@@ -223,6 +223,11 @@ fn balance_proven_transaction_impl(
     balance_log!(LOG_INFO, "Starting balance: proven_tx={} chars, keys_dir={:?}",
         proven_hex.len(), keys_path);
 
+    // [ERROR_170_DEBUG] Capture the input bytes verbatim so we can replay this
+    // exact tx through a Rust unit test without re-running the Android app.
+    // Remove after balance_ffi tx-construction bug is identified + fixed.
+    balance_log!(LOG_INFO, "ERR170_INPUT_HEX={}", proven_hex);
+
     // ── Step 1: Deserialize the proven transaction ──
 
     let proven_bytes = hex::decode(proven_hex)
@@ -446,6 +451,12 @@ fn balance_proven_transaction_impl(
         total_fee,
         prove_elapsed.as_secs_f64()
     );
+
+    // [ERROR_170_DEBUG] Output bytes — the balanced + sealed tx that gets
+    // submitted to the node. Paired with ERR170_INPUT_HEX upstream, these are
+    // the two artifacts a Rust unit test needs to reproduce / diff against
+    // a known-good (mn serve / mn transfer) tx. Remove after fix lands.
+    balance_log!(LOG_INFO, "ERR170_OUTPUT_HEX={}", result_hex);
 
     Ok((result_hex, current_state))
 }
@@ -977,6 +988,84 @@ mod preprod_diagnostic {
                 _ => eprintln!("  Not a StandardTransaction"),
             }
             eprintln!();
+        }
+    }
+
+    /// Err170 isolation: structural diff between a working deploy tx and a failing
+    /// contract-call tx that the node rejects with "Invalid Transaction (Custom error: 170)".
+    ///
+    /// Inputs (both produced by balance_ffi, captured via ERR170_OUTPUT_HEX logcat):
+    ///   /tmp/err170/deploy_ok.hex   — accepted by node (✅)
+    ///   /tmp/err170/join_fail.hex   — rejected with error 170 (❌)
+    ///
+    /// Run with:
+    ///   cargo test --release --lib err170_structural_diff -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn err170_structural_diff() {
+        use midnight_base_crypto::signatures::Signature;
+        use midnight_ledger::structure::{ProofMarker, Transaction};
+        use midnight_serialize::tagged_deserialize;
+        use midnight_storage::DefaultDB;
+        use midnight_transient_crypto::commitment::PureGeneratorPedersen;
+
+        type SealedTx = Transaction<Signature, ProofMarker, PureGeneratorPedersen, DefaultDB>;
+
+        for (label, path) in [
+            ("DEPLOY_OK", "/tmp/err170/deploy_ok.hex"),
+            ("JOIN_FAIL", "/tmp/err170/join_fail.hex"),
+        ] {
+            let hex_str = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("read {}: {}", path, e));
+            let bytes = hex::decode(hex_str.trim()).expect("hex decode");
+            eprintln!("\n========== {} ({} bytes) ==========", label, bytes.len());
+
+            let tx: SealedTx = match tagged_deserialize(&bytes[..]) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("  DESERIALIZE FAIL: {:?}", e);
+                    continue;
+                }
+            };
+
+            match &tx {
+                Transaction::Standard(std_tx) => {
+                    eprintln!("  network_id:           {:?}", std_tx.network_id);
+                    eprintln!("  binding_randomness:   {:?}", std_tx.binding_randomness);
+                    eprintln!("  guaranteed_coins:     is_some={}", std_tx.guaranteed_coins.is_some());
+                    eprintln!("  fallible_coins:       count={}", std_tx.fallible_coins.size());
+                    eprintln!("  intents:              count={}", std_tx.intents.size());
+                    for entry in std_tx.intents.iter() {
+                        let inner = &*entry;
+                        let seg = *inner.0;
+                        let intent = &*inner.1;
+                        eprintln!("    ── segment {} ──", seg);
+                        eprintln!("      ttl:                            {:?}", intent.ttl);
+                        eprintln!("      binding_commitment:             {:?}", intent.binding_commitment);
+                        eprintln!("      guaranteed_unshielded_offer:    is_some={}", intent.guaranteed_unshielded_offer.is_some());
+                        eprintln!("      fallible_unshielded_offer:      is_some={}", intent.fallible_unshielded_offer.is_some());
+                        eprintln!("      actions:                        count={}", intent.actions.len());
+                        for (ai, action) in intent.actions.iter().enumerate() {
+                            eprintln!("        action[{}]:                    {:?}", ai, action);
+                        }
+                        eprintln!("      dust_actions:                   is_some={}", intent.dust_actions.is_some());
+                        if let Some(da_sp) = &intent.dust_actions {
+                            let da = &**da_sp;
+                            eprintln!("        ctime:                        {:?}", da.ctime);
+                            let spends_vec: std::vec::Vec<_> = (&da.spends).into();
+                            eprintln!("        spends:                       count={}", spends_vec.len());
+                            for (i, s) in spends_vec.iter().enumerate() {
+                                eprintln!("          spend[{}].v_fee:             {}", i, s.v_fee);
+                                eprintln!("          spend[{}].old_nullifier:     {:?}", i, s.old_nullifier);
+                                eprintln!("          spend[{}].new_commitment:    {:?}", i, s.new_commitment);
+                            }
+                            let regs_vec: std::vec::Vec<_> = (&da.registrations).into();
+                            eprintln!("        registrations:                count={}", regs_vec.len());
+                        }
+                    }
+                }
+                _ => eprintln!("  Not a StandardTransaction: {:?}", std::mem::discriminant(&tx)),
+            }
         }
     }
 
