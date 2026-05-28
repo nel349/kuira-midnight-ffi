@@ -75,8 +75,14 @@ for target_config in "${TARGETS[@]}"; do
     # Set up Android NDK toolchain environment
     export ANDROID_NDK_HOME="$ANDROID_NDK"
 
-    # Toolchain paths
-    TOOLCHAIN="$ANDROID_NDK/toolchains/llvm/prebuilt/darwin-x86_64"
+    # Toolchain paths — pick the prebuilt dir matching the host OS so this
+    # script works on dev Macs and Linux CI runners alike.
+    case "$(uname -s)" in
+        Darwin) HOST_TAG="darwin-x86_64" ;;
+        Linux)  HOST_TAG="linux-x86_64"  ;;
+        *) echo "ERROR: unsupported host OS: $(uname -s)"; exit 1 ;;
+    esac
+    TOOLCHAIN="$ANDROID_NDK/toolchains/llvm/prebuilt/$HOST_TAG"
 
     # Compiler (CC)
     export CC_aarch64_linux_android="$TOOLCHAIN/bin/aarch64-linux-android${API_LEVEL}-clang"
