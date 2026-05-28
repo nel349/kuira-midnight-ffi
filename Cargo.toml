@@ -9,21 +9,21 @@ crate-type = ["lib", "staticlib", "cdylib"]  # lib for tests, staticlib for Andr
 [dependencies]
 # Midnight ledger libraries (from local midnight-libraries repo)
 # Path: 4 levels up from kuira-crypto-ffi → android/Development, then into midnight/
-midnight-zswap = { path = "../../../../midnight/midnight-libraries/midnight-ledger/zswap" }
-midnight-serialize = { path = "../../../../midnight/midnight-libraries/midnight-ledger/serialize" }
-midnight-ledger = { path = "../../../../midnight/midnight-libraries/midnight-ledger/ledger" }
-midnight-base-crypto = { path = "../../../../midnight/midnight-libraries/midnight-ledger/base-crypto" }
-midnight-storage = { path = "../../../../midnight/midnight-libraries/midnight-ledger/storage" }
-midnight-coin-structure = { path = "../../../../midnight/midnight-libraries/midnight-ledger/coin-structure" }
-midnight-transient-crypto = { path = "../../../../midnight/midnight-libraries/midnight-ledger/transient-crypto" }
+midnight-zswap = { path = "./midnight-ledger/zswap" }
+midnight-serialize = { path = "./midnight-ledger/serialize" }
+midnight-ledger = { path = "./midnight-ledger/ledger" }
+midnight-base-crypto = { path = "./midnight-ledger/base-crypto" }
+midnight-storage = { path = "./midnight-ledger/storage" }
+midnight-coin-structure = { path = "./midnight-ledger/coin-structure" }
+midnight-transient-crypto = { path = "./midnight-ledger/transient-crypto" }
 
 # Phase 6: Contract runtime (onchain-runtime for QueryContext.query)
-midnight-onchain-runtime = { path = "../../../../midnight/midnight-libraries/midnight-ledger/onchain-runtime" }
-midnight-onchain-vm = { path = "../../../../midnight/midnight-libraries/midnight-ledger/onchain-vm" }
-midnight-onchain-state = { path = "../../../../midnight/midnight-libraries/midnight-ledger/onchain-state" }
+midnight-onchain-runtime = { path = "./midnight-ledger/onchain-runtime" }
+midnight-onchain-vm = { path = "./midnight-ledger/onchain-vm" }
+midnight-onchain-state = { path = "./midnight-ledger/onchain-state" }
 
 # Phase 4C: Local ZK Proving
-midnight-zkir = { path = "../../../../midnight/midnight-libraries/midnight-ledger/zkir" }
+midnight-zkir = { path = "./midnight-ledger/zkir" }
 tokio = { version = "1", features = ["rt"] }
 
 # For state handle pool
@@ -52,7 +52,7 @@ log = "0.4"
 # `well_formed()` reproduction tests don't have to hand-roll a LedgerState.
 # Only pulled in for `cargo test`; production builds (staticlib / cdylib / lib)
 # are unaffected.
-midnight-ledger = { path = "../../../../midnight/midnight-libraries/midnight-ledger/ledger", features = ["test-utilities"] }
+midnight-ledger = { path = "./midnight-ledger/ledger", features = ["test-utilities"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [profile.release]

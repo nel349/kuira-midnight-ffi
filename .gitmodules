@@ -1,0 +1,3 @@
+[submodule "midnight-ledger"]
+	path = midnight-ledger
+	url = https://github.com/nel349/midnight-ledger.git
