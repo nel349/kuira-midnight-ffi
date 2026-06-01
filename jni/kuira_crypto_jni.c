@@ -88,6 +88,8 @@ extern void free_c_string(char* ptr);
 /* Dust state management (Phase 2D-2) */
 extern void* create_dust_local_state(void);
 extern char* dust_wallet_balance(const void* state_ptr, int64_t time_millis);
+extern char* dust_commitment_root(const void* state_ptr);
+extern char* dust_generation_root(const void* state_ptr);
 extern uint8_t* serialize_dust_state(const void* state_ptr);
 extern void* deserialize_dust_state(const uint8_t* data_ptr, size_t data_len);
 extern void free_dust_local_state(void* ptr);
@@ -1386,6 +1388,62 @@ Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustWalletBalance(
     /* Free native memory */
     free_c_string(balance_str);
 
+    return jresult;
+}
+
+/**
+ * Returns the commitment-tree Merkle root as a hex string (or NULL).
+ *
+ *   external fun nativeDustCommitmentRoot(statePtr: Long): String?
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustCommitmentRoot(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr
+) {
+    if (state_ptr == 0) {
+        LOGE("nativeDustCommitmentRoot: state_ptr is 0 (null)");
+        return NULL;
+    }
+    void* state = (void*)(uintptr_t)state_ptr;
+    char* root_str = dust_commitment_root(state);
+    if (root_str == NULL) {
+        return NULL;
+    }
+    jstring jresult = (*env)->NewStringUTF(env, root_str);
+    if (jresult == NULL) {
+        LOGE("nativeDustCommitmentRoot: NewStringUTF failed");
+    }
+    free_c_string(root_str);
+    return jresult;
+}
+
+/**
+ * Returns the generation-tree Merkle root as a hex string (or NULL).
+ *
+ *   external fun nativeDustGenerationRoot(statePtr: Long): String?
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustGenerationRoot(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr
+) {
+    if (state_ptr == 0) {
+        LOGE("nativeDustGenerationRoot: state_ptr is 0 (null)");
+        return NULL;
+    }
+    void* state = (void*)(uintptr_t)state_ptr;
+    char* root_str = dust_generation_root(state);
+    if (root_str == NULL) {
+        return NULL;
+    }
+    jstring jresult = (*env)->NewStringUTF(env, root_str);
+    if (jresult == NULL) {
+        LOGE("nativeDustGenerationRoot: NewStringUTF failed");
+    }
+    free_c_string(root_str);
     return jresult;
 }
 

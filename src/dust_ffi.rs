@@ -295,6 +295,53 @@ pub extern "C" fn deserialize_dust_state(
     }
 }
 
+/// Returns the commitment-tree Merkle root as a lowercase hex string, or null
+/// if the pointer is null or the tree has no root (not rehashed). Exposed so
+/// tests can assert root equality across replay paths (full vs checkpoint+delta).
+///
+/// # Safety
+///
+/// - `state_ptr` must be a valid DustLocalState pointer
+/// - Caller must free the returned string with `free_c_string`
+#[no_mangle]
+pub extern "C" fn dust_commitment_root(state_ptr: *const DustState) -> *mut c_char {
+    if state_ptr.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        match (*state_ptr).commitment_root() {
+            Some(root) => match CString::new(format!("{:?}", root)) {
+                Ok(s) => s.into_raw(),
+                Err(_) => ptr::null_mut(),
+            },
+            None => ptr::null_mut(),
+        }
+    }
+}
+
+/// Returns the generation-tree Merkle root as a lowercase hex string, or null
+/// if the pointer is null or the tree has no root (not rehashed).
+///
+/// # Safety
+///
+/// - `state_ptr` must be a valid DustLocalState pointer
+/// - Caller must free the returned string with `free_c_string`
+#[no_mangle]
+pub extern "C" fn dust_generation_root(state_ptr: *const DustState) -> *mut c_char {
+    if state_ptr.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        match (*state_ptr).generation_root() {
+            Some(root) => match CString::new(format!("{:?}", root)) {
+                Ok(s) => s.into_raw(),
+                Err(_) => ptr::null_mut(),
+            },
+            None => ptr::null_mut(),
+        }
+    }
+}
+
 /// Frees a DustLocalState pointer.
 ///
 /// # Safety
