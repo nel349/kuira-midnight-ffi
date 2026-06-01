@@ -3,11 +3,8 @@ set -euo pipefail
 
 # Kuira Crypto FFI - Android Cross-Compilation Script
 #
-# Builds libkuira_crypto_ffi.a for all Android architectures:
-# - aarch64-linux-android (ARM64 - primary)
-# - armv7-linux-androideabi (ARM32 - legacy)
-# - x86_64-linux-android (x86_64 emulator)
-# - i686-linux-android (x86 emulator)
+# Builds libkuira_crypto_ffi.a for the shipped Android architecture:
+# - aarch64-linux-android (ARM64 - the only ABI packaged; see TARGETS)
 #
 # Requirements:
 # - Rust toolchain with Android targets (installed via rustup)
@@ -47,11 +44,23 @@ echo "Using Android NDK: $ANDROID_NDK"
 
 # Android target configurations
 # Format: "rust_target:android_api_level"
+#
+# Only arm64-v8a is built: the Android Gradle build pins
+# `abiFilters = ["arm64-v8a"]` (core/crypto + midnight-kicks), so any
+# other ABI compiles here but is never packaged into an APK — and on
+# Apple Silicon the dev emulator is arm64-v8a too.
+#
+# IF YOU HIT `UnsatisfiedLinkError: ... libkuira_crypto_ffi.so` AT APP
+# LAUNCH: you're almost certainly on a non-arm64 emulator (x86_64 is the
+# common one — default on Intel-Mac Android Studio and most CI runners).
+# Physical Android devices are all arm64, so this only bites x86_64/x86
+# emulator setups. Fix: un-comment the ABI you need below AND add it to
+# the matching `abiFilters` in core/crypto + the app, then re-run.
+#   "armv7-linux-androideabi:24"    # ARM32 (32-bit ARM — legacy devices)
+#   "x86_64-linux-android:24"       # x86_64 (Intel emulators / CI)
+#   "i686-linux-android:24"         # x86 (32-bit Intel emulators)
 declare -a TARGETS=(
-    "aarch64-linux-android:24"      # ARM64 (64-bit ARM, API 24+)
-    "armv7-linux-androideabi:24"    # ARM32 (32-bit ARM, API 24+)
-    "x86_64-linux-android:24"       # x86_64 (64-bit Intel, emulators)
-    "i686-linux-android:24"         # x86 (32-bit Intel, emulators)
+    "aarch64-linux-android:24"      # ARM64 (64-bit ARM, API 24+) — shipped
 )
 
 # Build flags

@@ -60,3 +60,11 @@ opt-level = 3        # Maximum optimization
 lto = true           # Link-time optimization for smaller binaries
 codegen-units = 1    # Better optimization (slower compile)
 strip = true         # Strip symbols for smaller size
+
+[profile.dev]
+# Line-tables only instead of full debuginfo (the cargo default for dev).
+# Backtraces still resolve to file:line, but the heavy ZK/crypto deps
+# (midnight-ledger workspace) stop emitting full symbol tables — which
+# is what bloated target/debug into tens of GB. Applies to path deps too,
+# since this crate is the build root.
+debug = 1

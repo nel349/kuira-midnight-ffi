@@ -158,13 +158,14 @@ Transaction fee estimation.
 
 ### Prerequisites
 
-1. **Rust toolchain** with Android targets:
+1. **Rust toolchain** with the Android target:
    ```bash
    rustup target add aarch64-linux-android
-   rustup target add armv7-linux-androideabi
-   rustup target add x86_64-linux-android
-   rustup target add i686-linux-android
    ```
+   Only `arm64-v8a` is built — the Gradle build pins
+   `abiFilters = ["arm64-v8a"]`, so any other ABI compiles but is never
+   packaged. Add the matching `rustup target add` line (and widen
+   `abiFilters`) if you re-enable an ABI in `build-android.sh`.
 
 2. **Android NDK 26+** (LLVM toolchain)
 
@@ -172,12 +173,12 @@ Transaction fee estimation.
 
 ### Build Commands
 
-**Build for all Android ABIs:**
+**Build the shipped ABI (arm64-v8a):**
 ```bash
 ./build-android.sh
 ```
 
-**Build for specific target:**
+**Build for a specific target:**
 ```bash
 cargo build --release --target aarch64-linux-android
 ```
@@ -189,14 +190,22 @@ cargo test
 
 ### Output
 
-Static libraries are generated in `target/<arch>/release/`:
-- `aarch64-linux-android/libkuira_crypto_ffi.a` (~9 MB)
-- `armv7-linux-androideabi/libkuira_crypto_ffi.a` (~7.5 MB)
-- `x86_64-linux-android/libkuira_crypto_ffi.a` (~9.5 MB)
-- `i686-linux-android/libkuira_crypto_ffi.a` (~6.7 MB)
+The static library is generated in `target/<arch>/release/`:
+- `aarch64-linux-android/libkuira_crypto_ffi.a`
 
-After CMake linking with JNI bridge:
-- `libkuira_crypto_ffi.so` (~500 KB stripped per ABI)
+After CMake linking with the JNI bridge:
+- `libkuira_crypto_ffi.so` (stripped, arm64-v8a)
+
+### Disk hygiene
+
+The debug/test cache (`cargo test`) and stale fingerprinted artifacts
+accumulate fast — the ZK/crypto dep tree is large. `[profile.dev]` is
+pinned to `debug = 1` (line-tables only) to keep `target/debug` from
+ballooning, and [`cargo-sweep`](https://github.com/holmgr/cargo-sweep)
+prunes stale fingerprints:
+```bash
+cargo sweep --time 30   # remove artifacts unused for 30+ days
+```
 
 ---
 
