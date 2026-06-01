@@ -55,6 +55,12 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     android  # Android APIs (if needed)
 )
 
+# Align LOAD segments to 16 KB so the .so is compatible with Android 15+
+# devices that use a 16 KB memory page size (a Play requirement for apps
+# targeting Android 15+). Without this the loader falls back to page-size
+# compatibility mode and surfaces an "ELF alignment check failed" warning.
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE "-Wl,-z,max-page-size=16384")
+
 # Strip symbols in release builds (reduce .so size)
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES LINK_FLAGS_RELEASE -s)
