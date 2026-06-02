@@ -276,16 +276,68 @@ pub extern "C" fn deserialize_dust_state(
         // Get slice of serialized data
         let data_slice = std::slice::from_raw_parts(data_ptr, data_len);
 
-        // Deserialize using SCALE codec (recursion_depth=0 for top-level)
+        // Deserialize using SCALE codec (recursion_depth=0 for top-level).
+        // The Merkle trees round-trip losslessly (incl. their roots) — verified
+        // by `serialize_deserialize_reproduces_root` in transient-crypto, for
+        // both plain and collapsed trees. So a checkpoint/backup-restored state
+        // is directly usable; no post-deserialize rehash is needed. (The old
+        // "SDK-001: deserialize corrupts roots" belief was a misattribution of
+        // the wall-clock-ctime error-170 bug, since fixed.)
         match <DustState as Deserializable>::deserialize(&mut &data_slice[..], 0) {
             Ok(state) => {
-                // Box and return pointer
                 Box::into_raw(Box::new(state))
             }
             Err(e) => {
                 eprintln!("Error deserializing dust state: {}", e);
                 ptr::null_mut()
             }
+        }
+    }
+}
+
+/// Returns the commitment-tree Merkle root as a lowercase hex string, or null
+/// if the pointer is null or the tree has no root (not rehashed). Exposed so
+/// tests can assert root equality across replay paths (full vs checkpoint+delta).
+///
+/// # Safety
+///
+/// - `state_ptr` must be a valid DustLocalState pointer
+/// - Caller must free the returned string with `free_c_string`
+#[no_mangle]
+pub extern "C" fn dust_commitment_root(state_ptr: *const DustState) -> *mut c_char {
+    if state_ptr.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        match (*state_ptr).commitment_root() {
+            Some(root) => match CString::new(format!("{:?}", root)) {
+                Ok(s) => s.into_raw(),
+                Err(_) => ptr::null_mut(),
+            },
+            None => ptr::null_mut(),
+        }
+    }
+}
+
+/// Returns the generation-tree Merkle root as a lowercase hex string, or null
+/// if the pointer is null or the tree has no root (not rehashed).
+///
+/// # Safety
+///
+/// - `state_ptr` must be a valid DustLocalState pointer
+/// - Caller must free the returned string with `free_c_string`
+#[no_mangle]
+pub extern "C" fn dust_generation_root(state_ptr: *const DustState) -> *mut c_char {
+    if state_ptr.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        match (*state_ptr).generation_root() {
+            Some(root) => match CString::new(format!("{:?}", root)) {
+                Ok(s) => s.into_raw(),
+                Err(_) => ptr::null_mut(),
+            },
+            None => ptr::null_mut(),
         }
     }
 }
@@ -580,70 +632,95 @@ pub extern "C" fn dust_replay_events_from_file(
             }
         };
 
-        // Read entire file into native memory (bypasses JVM heap)
-        let hex_data = match std::fs::read_to_string(path_str) {
-            Ok(s) => s,
+        // Stream the file line-by-line and replay in 500-event chunks. Reading
+        // the whole file + deserializing every event up front OOMs at PREPROD
+        // scale (906k events / ~800MB file → native allocator exhaustion → the
+        // low-memory killer reaps the process). Streaming holds at most one
+        // chunk (~500 events) plus a line buffer in memory at any moment.
+        //
+        // The replay call sequence — chunk size, file order, one replay_events
+        // per 500 events (each of which rehashes internally) — is byte-for-byte
+        // identical to the previous read-all-then-chunk path, so the resulting
+        // Merkle roots are unchanged. Only *when* events are deserialized moves
+        // from "all up front" to "one chunk at a time".
+        use std::io::BufRead;
+        let file = match std::fs::File::open(path_str) {
+            Ok(f) => f,
             Err(e) => {
-                android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Failed to read events file: {}", e);
+                android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Failed to open events file: {}", e);
                 return ptr::null_mut();
             }
         };
+        let reader = std::io::BufReader::new(file);
 
-        android_log!(ANDROID_LOG_INFO, "KuiraDustFFI", "Read {} bytes from events file", hex_data.len());
+        const CHUNK_SIZE: usize = 500;
+        let mut state = (*state_ptr).clone();
+        let mut chunk: Vec<Event<InMemoryDB>> = Vec::with_capacity(CHUNK_SIZE);
+        let mut total: usize = 0;
+        let mut bytes_read: usize = 0;
+        let mut logged_first = false;
 
-        // Log file fingerprint for comparison with WASM reference
-        {
-            let last50 = if hex_data.len() > 50 { &hex_data[hex_data.len()-50..] } else { &hex_data };
-            android_log!(ANDROID_LOG_INFO, "KuiraDustFFI", "File last 50 chars: {}", last50.trim());
-        }
+        for line_res in reader.lines() {
+            let line = match line_res {
+                Ok(l) => l,
+                Err(e) => {
+                    android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Error reading events file at event {}: {}", total, e);
+                    return ptr::null_mut();
+                }
+            };
+            if line.is_empty() {
+                continue;
+            }
+            bytes_read += line.len() + 1;
 
-        // Each line is one event's tagged hex (written by Kotlin with newLine())
-        let lines: Vec<&str> = hex_data.lines().filter(|s| !s.is_empty()).collect();
+            // Diagnostic: first event hex (first 100 chars), for WASM comparison.
+            if !logged_first {
+                let preview = &line[..line.len().min(100)];
+                android_log!(ANDROID_LOG_INFO, "KuiraDustFFI", "First event hex ({}chars): {}...", line.len(), preview);
+                logged_first = true;
+            }
 
-        // Diagnostic: print first event hex (first 100 chars) for comparison with WASM
-        if let Some(first) = lines.first() {
-            let preview = &first[..first.len().min(100)];
-            android_log!(ANDROID_LOG_INFO, "KuiraDustFFI", "First event hex ({}chars): {}...", first.len(), preview);
-        }
-
-        let mut events: Vec<Event<InMemoryDB>> = Vec::with_capacity(lines.len());
-        for (i, line) in lines.iter().enumerate() {
-            let event_bytes = match hex::decode(line) {
+            let event_bytes = match hex::decode(&line) {
                 Ok(b) => b,
                 Err(e) => {
-                    android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Error decoding event {} hex: {}", i, e);
+                    android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Error decoding event {} hex: {}", total, e);
                     return ptr::null_mut();
                 }
             };
             let event: Event<InMemoryDB> = match midnight_serialize::tagged_deserialize(&event_bytes[..]) {
                 Ok(e) => e,
                 Err(e) => {
-                    android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Error deserializing event {}: {}", i, e);
+                    android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Error deserializing event {}: {}", total, e);
                     return ptr::null_mut();
                 }
             };
-            events.push(event);
+            chunk.push(event);
+            total += 1;
+
+            if chunk.len() == CHUNK_SIZE {
+                state = match state.replay_events(&sk, chunk.iter()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Chunk replay failed at event {}: {:?}", total, e);
+                        return ptr::null_mut();
+                    }
+                };
+                chunk.clear();
+            }
         }
 
-        android_log!(ANDROID_LOG_INFO, "KuiraDustFFI", "Deserialized {} events, replaying in 500-event chunks", events.len());
-
-        // Replay in 500-event chunks matching WASM SDK pattern.
-        // Proven identical to WASM at full PREPROD scale (253k events).
-        let chunk_size = 500;
-        let mut state = (*state_ptr).clone();
-        let total = events.len();
-
-        for chunk in events.chunks(chunk_size) {
+        // Replay the final partial chunk.
+        if !chunk.is_empty() {
             state = match state.replay_events(&sk, chunk.iter()) {
                 Ok(s) => s,
                 Err(e) => {
-                    android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Chunk replay failed: {:?}", e);
+                    android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Final chunk replay failed at event {}: {:?}", total, e);
                     return ptr::null_mut();
                 }
             };
         }
 
-        android_log!(ANDROID_LOG_INFO, "KuiraDustFFI", "Chunked replay complete: {} events in {} chunks", total, (total + chunk_size - 1) / chunk_size);
+        android_log!(ANDROID_LOG_INFO, "KuiraDustFFI", "Streamed {} bytes, replayed {} events in {}-event chunks", bytes_read, total, CHUNK_SIZE);
         android_log!(ANDROID_LOG_INFO, "KuiraDustFFI", "Commitment root after replay: {:?}", state.commitment_root());
         android_log!(ANDROID_LOG_INFO, "KuiraDustFFI", "Generation root after replay: {:?}", state.generation_root());
         android_log!(ANDROID_LOG_INFO, "KuiraDustFFI", "UTXOs after replay: {}", state.utxos().count());
