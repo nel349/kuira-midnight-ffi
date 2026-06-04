@@ -173,13 +173,27 @@ pub extern "C" fn balance_proven_transaction(
         &keys_path,
         network_id_str,
     ) {
-        Ok((balanced_hex, _updated_state)) => {
-            // Do NOT write the post-spend state back to the pointer.
-            // The caller (DustSyncManager) caches the original state for reuse
-            // across transactions. Writing back corrupts the Merkle tree roots
-            // for subsequent spends. The node's root history keeps old roots
-            // valid for 1+ hours, so reusing the original state is safe.
-            balance_log!(LOG_INFO, "Balance complete, original state preserved");
+        Ok((balanced_hex, updated_state)) => {
+            // Write the post-spend state back to the cached pointer. `spend()` marks
+            // the consumed UTXO `pending_until`, which `utxos()` filters out — so the
+            // next sequential transaction can't reselect it ("UTXO already spent",
+            // error 115). Crucially, `spend()` does NOT mutate the commitment/
+            // generation trees (those ops build the proof, not local state), so the
+            // root is byte-identical and this does NOT cause error 170 — see the
+            // spend_marks_pending_and_preserves_root invariant test in dust_ffi.rs.
+            //
+            // History: removing this write-back (commit 9af1f7f) on a "corrupts
+            // Merkle roots" premise is what reintroduced 115; that premise is false
+            // (the trees are untouched). The real error-170 fix is the freshness /
+            // chain-block-time path in MidnightWallet, independent of this.
+            //
+            // SAFETY: dust_state_ptr is non-null (checked at entry); the impl borrowed
+            // the prior state immutably and cloned it before mutating, so no live
+            // borrow aliases this write.
+            unsafe {
+                *dust_state_ptr = updated_state;
+            }
+            balance_log!(LOG_INFO, "Updated dust state after balance (spent UTXO marked pending)");
 
             match CString::new(balanced_hex) {
                 Ok(c_str) => c_str.into_raw(),
