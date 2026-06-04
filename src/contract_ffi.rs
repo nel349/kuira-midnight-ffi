@@ -2551,3 +2551,221 @@ mod persistent_commit_crosscheck {
         }
     }
 }
+
+/// Regression coverage for the circuit `ReadMismatch` on an evolved contract state.
+///
+/// Background: calling a circuit (e.g. BBoard `post`) against a contract whose
+/// on-chain state has advanced past its constructor value fails at assembly with
+/// `partition_transcripts ... ReadMismatch`. The fixture captures one real device
+/// run — the on-chain state hex plus the exact transcript the circuit produced —
+/// so the divergence reproduces in-process with no emulator. The device pool
+/// handles inside `params` are non-portable, so each test recreates handles from
+/// the on-chain hex and patches them in.
+#[cfg(test)]
+mod readmismatch_repro {
+    use super::*;
+    use std::ffi::CString;
+
+    const FIXTURE: &str = include_str!("../test-fixtures/readmismatch-post.json");
+
+    fn fixture() -> serde_json::Value {
+        serde_json::from_str(FIXTURE).expect("fixture parses")
+    }
+
+    /// Build a params JSON whose `state_handle` / `initial_state_handle` point at
+    /// freshly-created in-process pool entries holding the on-chain state. Returns
+    /// the params string and the initial-state handle (the assembler replays against
+    /// it).
+    fn params_with_local_handles(fx: &serde_json::Value) -> String {
+        let onchain_hex = fx["onChainStateHex"].as_str().expect("onChainStateHex");
+        let hex_c = CString::new(onchain_hex).unwrap();
+        let init_h = contract_state_create(hex_c.as_ptr());
+        assert_ne!(init_h, 0, "failed to create state from on-chain hex");
+        let state_h = contract_state_clone(init_h);
+        assert_ne!(state_h, 0, "failed to clone state");
+
+        let mut params = fx["params"].clone();
+        params["state_handle"] = serde_json::json!(state_h);
+        params["initial_state_handle"] = serde_json::json!(init_h);
+        serde_json::to_string(&params).unwrap()
+    }
+
+    /// The captured fixture is the CORRUPTED transcript the buggy runtime produced:
+    /// the `sequence` Counter (b8) read recorded as 0, while the on-chain state
+    /// replays as 1. The assembler must reject it — this guards that the native
+    /// partition correctly catches a bad transcript. (The producing bug itself lives
+    /// in the JS runtime; see `corrected_transcript_assembles_on_evolved_state` for
+    /// the fixed-transcript counterpart, and `snapshotReadContent` in
+    /// compact-runtime-iife.js for the fix.)
+    #[test]
+    fn reproduces_readmismatch_on_evolved_state() {
+        let params = params_with_local_handles(&fixture());
+        let result = assemble_call_tx_impl(&params);
+        let err = result.expect_err("a corrupted transcript must be rejected");
+        assert!(err.contains("ReadMismatch"), "unexpected error: {}", err);
+    }
+
+    /// With the runtime fix (`snapshotReadContent`), the transcript records the real
+    /// `sequence` read of 1 instead of the shifted-empty 0. Patch the fixture's
+    /// Counter popeq to that corrected value and assert the assembler accepts it —
+    /// the positive proof that a faithful transcript assembles against the evolved
+    /// on-chain state. Mirrors the on-device post→finalize round-trip.
+    #[test]
+    fn corrected_transcript_assembles_on_evolved_state() {
+        let mut fx = fixture();
+        // The b8 Counter read is popeq op[5]; the fix records it as [[1]] (= on-chain).
+        fx["params"]["proof_data"]["public_transcript"][5]["popeq"]["result"]["value"] =
+            serde_json::json!([[1]]);
+        let params = params_with_local_handles(&fx);
+        let result = assemble_call_tx_impl(&params);
+        assert!(
+            result.is_ok(),
+            "corrected transcript should assemble, got: {:?}", result.err()
+        );
+    }
+
+    /// The transcript b8 read is 0, but the on-chain state holds 1: re-gather the
+    /// SAME transcript ops natively against the on-chain state and confirm it reads
+    /// 1. This exonerates the native query path — the device circuit DID query the
+    /// on-chain state and read 1 too; the recorded 0 came from the JS runtime
+    /// emptying the read value via `fromValue`'s `shift()` after the read (fixed by
+    /// `snapshotReadContent`).
+    #[test]
+    fn native_regather_reads_seq_one() {
+        use midnight_onchain_runtime::context::QueryContext;
+        use midnight_onchain_vm::result_mode::GatherEvent;
+
+        let fx = fixture();
+        let onchain_hex = fx["onChainStateHex"].as_str().unwrap();
+        let bytes = hex_to_bytes(onchain_hex).expect("hex");
+        let state: RustContractState<InMemoryDB> =
+            midnight_serialize::tagged_deserialize(&mut &bytes[..]).expect("deserialize on-chain state");
+
+        // The transcript b8 read (the recorded popeq[5].result) — what the device
+        // circuit claims it read for the Counter.
+        let transcript_ops_json = fx["params"]["proof_data"]["public_transcript"]
+            .as_array().unwrap();
+        let verify_ops = parse_transcript_ops(transcript_ops_json).expect("parse transcript");
+        let gather_ops = convert_verify_to_gather(&verify_ops);
+
+        let qc = QueryContext::<InMemoryDB> {
+            state: state.data.clone(),
+            address: Default::default(),
+            effects: Default::default(),
+            call_context: Default::default(),
+        };
+        let res = qc.query(&gather_ops, None, &INITIAL_COST_MODEL).expect("gather query");
+
+        // Collect the read values the on-chain state actually yields.
+        let reads: Vec<Vec<Vec<u8>>> = res.events.iter().filter_map(|e| match e {
+            GatherEvent::Read(av) => Some(
+                av.value.0.iter().map(|atom| atom.0.to_vec()).collect()
+            ),
+            _ => None,
+        }).collect();
+        println!("native re-gather reads: {:?}", reads);
+
+        // Two reads, in transcript order: [0] = `state` enum (b1), [1] = `sequence`
+        // Counter (b8, normalized so 1 → atom [1]). On-chain the Counter is non-zero
+        // (a prior post advanced it).
+        let native_counter = &reads[1];
+        let native_nonzero = native_counter.iter().flatten().any(|&b| b != 0);
+
+        // The device transcript recorded that same Counter read (popeq[5]) as all-zero.
+        let device_counter = transcript_ops_json[5]["popeq"]["result"]["value"][0]
+            .as_array().expect("device popeq[5] value");
+        let device_zero = device_counter.iter().all(|v| v.as_u64() == Some(0));
+        println!("device transcript b8 read: {:?}", device_counter);
+
+        // The on-chain state reads Counter=1; the device transcript recorded 0. The
+        // native query is correct, so the corruption happened in the JS runtime after
+        // the read (see `snapshotReadContent`).
+        assert!(
+            native_nonzero && device_zero,
+            "expected on-chain Counter non-zero + device-recorded zero; \
+             native={:?} device={:?}", native_counter, device_counter
+        );
+    }
+
+    /// Reproduce the DEVICE execution path: the circuit splits into one query per
+    /// ledger op, and the device's `contract_query` writes each query's resulting
+    /// state back into the pool (contract_ffi.rs:285) before the next op runs. Thread
+    /// the transcript ops in those same chunks through `qc.query` (Rust ops, no serde
+    /// round-trip), feeding each query's `context.state` into the next — exactly what
+    /// the device does — and confirm the `sequence` Counter survives every query's
+    /// write-back (it does: the native state threading is correct; the corruption was
+    /// purely in the JS transcript recording).
+    #[test]
+    fn split_query_path_preserves_counter() {
+        use midnight_onchain_runtime::context::QueryContext;
+        use midnight_onchain_state::state::ChargedState;
+        use midnight_onchain_vm::result_mode::GatherEvent;
+
+        let fx = fixture();
+        let onchain_hex = fx["onChainStateHex"].as_str().unwrap();
+        let bytes = hex_to_bytes(onchain_hex).unwrap();
+        let state: RustContractState<InMemoryDB> =
+            midnight_serialize::tagged_deserialize(&mut &bytes[..]).unwrap();
+
+        let verify_ops = parse_transcript_ops(
+            fx["params"]["proof_data"]["public_transcript"].as_array().unwrap()
+        ).unwrap();
+        let gather_ops = convert_verify_to_gather(&verify_ops);
+        let chunks: [&[Op<ResultModeGather, InMemoryDB>]; 5] = [
+            &gather_ops[0..3],   // read state
+            &gather_ops[3..6],   // read sequence  ← watch this one
+            &gather_ops[6..9],   // write owner
+            &gather_ops[9..12],  // write message
+            &gather_ops[12..15], // write sequence
+        ];
+
+        // `data` is threaded between queries exactly as the device pool does.
+        let mut data: ChargedState<InMemoryDB> = state.data.clone();
+        println!("Counter before any query: {:?}", counter_of(&data));
+
+        let mut sequence_read: Option<Vec<Vec<u8>>> = None;
+        for (ci, chunk) in chunks.iter().enumerate() {
+            let qc = QueryContext::<InMemoryDB> {
+                state: data.clone(),
+                address: Default::default(),
+                effects: Default::default(),
+                call_context: Default::default(),
+            };
+            let res = qc.query(chunk, None, &INITIAL_COST_MODEL).expect("query");
+            for ev in &res.events {
+                if let GatherEvent::Read(av) = ev {
+                    let v: Vec<Vec<u8>> = av.value.0.iter().map(|a| a.0.to_vec()).collect();
+                    println!("chunk {} read: {:?}", ci, v);
+                    if ci == 1 { sequence_read = Some(v); }
+                }
+            }
+            // Device write-back: the next op runs against this query's resulting state.
+            data = res.context.state;
+            println!("Counter after chunk {}: {:?}", ci, counter_of(&data));
+        }
+
+        let seq = sequence_read.expect("chunk 1 must produce a sequence read");
+        let nonzero = seq.iter().flatten().any(|&b| b != 0);
+        println!("sequence read via device-style split: {:?} (nonzero={})", seq, nonzero);
+        assert!(nonzero, "split-path sequence read should be 1, got {:?}", seq);
+    }
+
+    /// Field 2 (the `sequence` Counter) of a threaded state, as the FFI field-walker
+    /// reports it — by round-tripping through a temporary pool handle.
+    fn counter_of(data: &midnight_onchain_state::state::ChargedState<InMemoryDB>) -> serde_json::Value {
+        use std::ffi::CStr;
+        let mut cs = RustContractState::<InMemoryDB>::default();
+        cs.data = data.clone();
+        let handle = {
+            let h = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            lock_state_pool().unwrap().insert(h, cs);
+            h
+        };
+        let ptr = contract_state_read_fields(handle);
+        let json = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_owned();
+        unsafe { contract_free_string(ptr as *mut c_char) };
+        lock_state_pool().unwrap().remove(&handle);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+        v.get(2).cloned().unwrap_or(serde_json::Value::Null)
+    }
+}
