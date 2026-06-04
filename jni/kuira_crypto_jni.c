@@ -185,8 +185,10 @@ extern char* calculate_transaction_fee(const char* tx_hex, const char* params_he
 extern char* build_dust_registration_transaction(const uint8_t* night_private_key_ptr, size_t night_private_key_len, const char* dust_public_key_hex, const char* allow_fee_payment_str, uint64_t ttl_millis, int64_t current_time_millis, const char* utxos_json, const char* network_id);
 
 /* Transaction balancing — balance proven tx with dust fees (balance_ffi.rs) */
-extern char* balance_proven_transaction(const char* proven_tx_hex, void* dust_state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* ledger_params_hex, int64_t current_time_ms, const char* keys_dir, const char* network_id);
+extern char* balance_proven_transaction(const char* proven_tx_hex, void* dust_state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* ledger_params_hex, int64_t current_time_ms, const char* keys_dir, const char* network_id, const char* exclude_nullifiers_hex);
 extern void free_balanced_transaction(char* ptr);
+/* List current dust UTXO nullifiers (balance_ffi.rs) — for skip-set prune / fast-fail */
+extern char* dust_current_nullifiers(const void* state_ptr, const uint8_t* seed_ptr, size_t seed_len);
 
 /* JNI function implementations */
 
@@ -1444,6 +1446,64 @@ Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustGenerationRoot
         LOGE("nativeDustGenerationRoot: NewStringUTF failed");
     }
     free_c_string(root_str);
+    return jresult;
+}
+
+/**
+ * Lists the dust nullifiers (lowercase hex, comma-separated) of every UTXO in the
+ * current state — for pruning the wallet's spent-nullifier skip-set and fast-failing
+ * when all spendable dust is excluded.
+ *
+ * JNI signature matches:
+ *   object DustLocalState {
+ *       external fun nativeDustCurrentNullifiers(statePtr: Long, seed: ByteArray): String?
+ *   }
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustCurrentNullifiers(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr,
+    jbyteArray seed
+) {
+    if (state_ptr == 0) {
+        LOGE("nativeDustCurrentNullifiers: state_ptr is 0 (null)");
+        return NULL;
+    }
+    if (seed == NULL) {
+        LOGE("nativeDustCurrentNullifiers: seed is null");
+        return NULL;
+    }
+
+    jsize seed_len = (*env)->GetArrayLength(env, seed);
+    if (seed_len != 32) {
+        LOGE("nativeDustCurrentNullifiers: invalid seed length %d (expected 32)", seed_len);
+        return NULL;
+    }
+
+    uint8_t seed_buf[32];
+    (*env)->GetByteArrayRegion(env, seed, 0, 32, (jbyte*)seed_buf);
+    if ((*env)->ExceptionCheck(env)) {
+        LOGE("nativeDustCurrentNullifiers: exception during GetByteArrayRegion");
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        secure_memzero(seed_buf, 32);
+        return NULL;
+    }
+
+    char* result = dust_current_nullifiers((void*)(uintptr_t)state_ptr, seed_buf, 32);
+    secure_memzero(seed_buf, 32);
+
+    if (result == NULL) {
+        LOGE("nativeDustCurrentNullifiers: Rust FFI returned null");
+        return NULL;
+    }
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    if (jresult == NULL) {
+        LOGE("nativeDustCurrentNullifiers: NewStringUTF failed");
+    }
+    free_c_string(result);
     return jresult;
 }
 
@@ -3067,9 +3127,10 @@ Java_com_midnight_kuira_sdk_TransactionBalancerNative_nativeBalanceProvenTransac
     jstring ledger_params_hex,
     jlong current_time_ms,
     jstring keys_dir,
-    jstring network_id)
+    jstring network_id,
+    jstring exclude_nullifiers)
 {
-    /* Validate inputs */
+    /* Validate inputs. exclude_nullifiers is optional (null = skip nothing). */
     if (proven_tx_hex == NULL || dust_state_ptr == 0 || seed == NULL ||
         ledger_params_hex == NULL || keys_dir == NULL || network_id == NULL) {
         LOGE("nativeBalanceProvenTransaction: null parameter");
@@ -3120,6 +3181,21 @@ Java_com_midnight_kuira_sdk_TransactionBalancerNative_nativeBalanceProvenTransac
         return NULL;
     }
 
+    /* Optional: comma-separated hex nullifiers to skip during selection. A null
+       Java string means "skip nothing" — pass NULL through to the Rust FFI. */
+    const char* exclude_c = NULL;
+    if (exclude_nullifiers != NULL) {
+        exclude_c = (*env)->GetStringUTFChars(env, exclude_nullifiers, NULL);
+        if (exclude_c == NULL) {
+            (*env)->ReleaseStringUTFChars(env, proven_tx_hex, proven_c);
+            (*env)->ReleaseStringUTFChars(env, ledger_params_hex, params_c);
+            (*env)->ReleaseStringUTFChars(env, keys_dir, keys_c);
+            (*env)->ReleaseStringUTFChars(env, network_id, network_c);
+            (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
+            return NULL;
+        }
+    }
+
     /* Call Rust FFI */
     char* result_hex = balance_proven_transaction(
         proven_c,
@@ -3129,7 +3205,8 @@ Java_com_midnight_kuira_sdk_TransactionBalancerNative_nativeBalanceProvenTransac
         params_c,
         current_time_ms,
         keys_c,
-        network_c
+        network_c,
+        exclude_c
     );
 
     /* Zeroize sensitive data */
@@ -3140,6 +3217,9 @@ Java_com_midnight_kuira_sdk_TransactionBalancerNative_nativeBalanceProvenTransac
     (*env)->ReleaseStringUTFChars(env, ledger_params_hex, params_c);
     (*env)->ReleaseStringUTFChars(env, keys_dir, keys_c);
     (*env)->ReleaseStringUTFChars(env, network_id, network_c);
+    if (exclude_c != NULL) {
+        (*env)->ReleaseStringUTFChars(env, exclude_nullifiers, exclude_c);
+    }
     (*env)->ReleaseByteArrayElements(env, seed, seed_bytes, JNI_ABORT);
 
     if (result_hex == NULL) {

@@ -13,12 +13,13 @@ use std::ptr;
 
 use midnight_base_crypto::signatures::Signature;
 use midnight_base_crypto::time::Timestamp;
-use midnight_ledger::dust::{DustActions, DustLocalState, DustSecretKey, Seed};
+use midnight_ledger::dust::{DustActions, DustLocalState, DustNullifier, DustSecretKey, DustSpend, Seed};
 use midnight_ledger::structure::{
     Intent, LedgerParameters, ProofMarker, ProofPreimageMarker, Transaction,
     INITIAL_TRANSACTION_COST_MODEL,
 };
 use midnight_serialize::{tagged_deserialize, tagged_serialize};
+use midnight_storage::db::DB;
 use midnight_storage::storage::HashMap as StorageHashMap;
 use midnight_storage::DefaultDB;
 use midnight_transient_crypto::commitment::PedersenRandomness;
@@ -83,15 +84,21 @@ const DEFAULT_FEE_BLOCKS_MARGIN: usize = 5;
 /// - `current_time_ms`: Current time in milliseconds (for dust spend timestamp)
 /// - `keys_dir`: Path to cached proving keys directory
 /// - `network_id`: Network ID string (e.g., "undeployed", "preview", "preprod")
+/// - `exclude_nullifiers_hex`: Comma-separated lowercase-hex dust nullifiers to skip
+///   during UTXO selection (UTXOs the wallet already spent but the event stream
+///   hasn't reflected). May be null or empty to skip nothing.
 ///
 /// # Returns
 ///
-/// Tagged-SCALE hex of the balanced+sealed transaction, or null on error.
-/// Caller must free with `free_balanced_transaction`.
+/// A string `<balanced+sealed tagged-SCALE hex>;<spent nullifier hex>,<...>`
+/// (the spent-nullifier list may be empty), or null on error. The caller records
+/// the spent nullifiers durably and passes them back via `exclude_nullifiers_hex`
+/// on subsequent balances. Caller must free with `free_balanced_transaction`.
 ///
 /// # Safety
 ///
-/// All pointer parameters must be valid, non-null. `dust_state_ptr` is modified on success.
+/// All pointer parameters except `exclude_nullifiers_hex` must be valid and
+/// non-null. `dust_state_ptr` is modified on success.
 #[no_mangle]
 pub extern "C" fn balance_proven_transaction(
     proven_tx_hex: *const c_char,
@@ -102,8 +109,10 @@ pub extern "C" fn balance_proven_transaction(
     current_time_ms: i64,
     keys_dir: *const c_char,
     network_id: *const c_char,
+    exclude_nullifiers_hex: *const c_char,
 ) -> *mut c_char {
-    // Null checks
+    // Null checks. `exclude_nullifiers_hex` is intentionally NOT required — a null
+    // or empty value means "no UTXOs to skip" (the common case before any spend).
     if proven_tx_hex.is_null()
         || dust_state_ptr.is_null()
         || seed_ptr.is_null()
@@ -154,6 +163,26 @@ pub extern "C" fn balance_proven_transaction(
         }
     };
 
+    // Dust nullifiers (lowercase hex, comma-separated) the wallet has already
+    // spent but whose spend the indexer's event stream hasn't reflected yet. The
+    // balancer must not re-select these (re-spend → node error 115). Null/empty =
+    // skip nothing. Hex contains no commas, so comma-splitting is unambiguous.
+    let exclude_nullifiers: std::collections::HashSet<String> = if exclude_nullifiers_hex.is_null() {
+        std::collections::HashSet::new()
+    } else {
+        match unsafe { CStr::from_ptr(exclude_nullifiers_hex).to_str() } {
+            Ok(s) => s
+                .split(',')
+                .map(|n| n.trim().to_lowercase())
+                .filter(|n| !n.is_empty())
+                .collect(),
+            Err(e) => {
+                balance_log!(LOG_ERROR, "Invalid UTF-8 in exclude_nullifiers_hex: {}", e);
+                return ptr::null_mut();
+            }
+        }
+    };
+
     // Convert seed
     // SAFETY: seed_ptr validated non-null, seed_len validated == 32 above.
     let seed_slice = unsafe { std::slice::from_raw_parts(seed_ptr, seed_len) };
@@ -172,8 +201,9 @@ pub extern "C" fn balance_proven_transaction(
         current_time_ms,
         &keys_path,
         network_id_str,
+        &exclude_nullifiers,
     ) {
-        Ok((balanced_hex, updated_state)) => {
+        Ok((balanced_hex, updated_state, spent_nullifiers)) => {
             // Write the post-spend state back to the cached pointer. `spend()` marks
             // the consumed UTXO `pending_until`, which `utxos()` filters out — so the
             // next sequential transaction can't reselect it ("UTXO already spent",
@@ -195,7 +225,16 @@ pub extern "C" fn balance_proven_transaction(
             }
             balance_log!(LOG_INFO, "Updated dust state after balance (spent UTXO marked pending)");
 
-            match CString::new(balanced_hex) {
+            // Return `<balanced tx hex>;<spent nullifier hex>,<...>`. One C string
+            // keeps the JNI layer untouched, and a delimited form lets the caller
+            // parse it with a plain split — no JSON dependency (which the Android
+            // unit-test classpath lacks). Hex contains neither ';' nor ',', so the
+            // delimiters are unambiguous. The caller records the nullifiers durably
+            // and feeds them back via `exclude_nullifiers_hex` on the next balance —
+            // the dust event stream doesn't reliably reflect the wallet's own fee
+            // spends, so without this the next move re-selects the UTXO → error 115.
+            let envelope = format!("{};{}", balanced_hex, spent_nullifiers.join(","));
+            match CString::new(envelope) {
                 Ok(c_str) => c_str.into_raw(),
                 Err(e) => {
                     balance_log!(LOG_ERROR, "Failed to create C string: {}", e);
@@ -222,6 +261,173 @@ pub extern "C" fn free_balanced_transaction(ptr: *mut c_char) {
 
 // ── Implementation ──
 
+/// Serialize a dust nullifier to lowercase hex. Shared by the balancer's selection
+/// (what it records as spent) and [`current_nullifiers`] (what it prunes against) so
+/// both produce byte-identical strings — the skip-set match depends on it.
+fn nullifier_to_hex(nullifier: &DustNullifier) -> Result<String, String> {
+    use midnight_serialize::Serializable;
+    let mut bytes = Vec::new();
+    nullifier
+        .0
+        .serialize(&mut bytes)
+        .map_err(|e| format!("Failed to serialize dust nullifier: {:?}", e))?;
+    Ok(hex::encode(&bytes))
+}
+
+/// Lowercase-hex nullifiers of every UTXO currently in `state`. Generic over the DB
+/// backend so it's unit-testable against an in-memory state.
+fn current_nullifiers<D: DB>(
+    state: &DustLocalState<D>,
+    dust_secret_key: &DustSecretKey,
+) -> Result<Vec<String>, String> {
+    state
+        .utxos()
+        .map(|utxo| nullifier_to_hex(&utxo.nullifier(dust_secret_key)))
+        .collect()
+}
+
+/// List the dust nullifiers (lowercase hex, comma-separated) of every UTXO in the
+/// current state. Used to prune the wallet's spent-nullifier skip-set: a recorded
+/// nullifier still present here means the event stream hasn't reflected the spend
+/// (keep skipping it); one that's gone has been confirmed spent and can be dropped.
+/// It also lets the caller detect "all spendable dust is excluded" and fail fast
+/// instead of attempting a balance that can't succeed.
+///
+/// Caller must free the result with `free_c_string`.
+///
+/// # Safety
+///
+/// `state_ptr` and `seed_ptr` must be valid and non-null; `seed_len` must be 32.
+#[no_mangle]
+pub extern "C" fn dust_current_nullifiers(
+    state_ptr: *const DustLocalState<DefaultDB>,
+    seed_ptr: *const u8,
+    seed_len: usize,
+) -> *mut c_char {
+    if state_ptr.is_null() || seed_ptr.is_null() {
+        balance_log!(LOG_ERROR, "Null pointer in dust_current_nullifiers");
+        return ptr::null_mut();
+    }
+    if seed_len != 32 {
+        balance_log!(LOG_ERROR, "Seed must be 32 bytes, got {}", seed_len);
+        return ptr::null_mut();
+    }
+
+    // SAFETY: pointers validated non-null; seed_len validated == 32.
+    let state = unsafe { &*state_ptr };
+    let seed_slice = unsafe { std::slice::from_raw_parts(seed_ptr, seed_len) };
+    let mut seed: Seed = [0u8; 32];
+    seed.copy_from_slice(seed_slice);
+    let dust_secret_key = DustSecretKey::derive_secret_key(&seed);
+
+    let hexes = match current_nullifiers(state, &dust_secret_key) {
+        Ok(h) => h,
+        Err(e) => {
+            balance_log!(LOG_ERROR, "dust_current_nullifiers: {}", e);
+            return ptr::null_mut();
+        }
+    };
+
+    match CString::new(hexes.join(",")) {
+        Ok(c_str) => c_str.into_raw(),
+        Err(e) => {
+            balance_log!(LOG_ERROR, "dust_current_nullifiers: C string failed: {}", e);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Select dust UTXOs to cover `total_fee`, skipping any whose nullifier is in
+/// `exclude_nullifiers` — UTXOs the wallet already spent but the indexer's event
+/// stream hasn't reflected yet. Re-selecting such a UTXO makes the node reject the
+/// transaction with error 115 ("UTXO already spent").
+///
+/// Returns the post-selection state (each selected UTXO marked `pending_until`,
+/// which [`DustLocalState::utxos`] then filters out — the commitment root is
+/// untouched, so this does NOT cause error 170), the dust spends to include in the
+/// transaction, and the spent nullifiers as lowercase hex in selection order. The
+/// caller records those nullifiers durably and feeds them back via
+/// `exclude_nullifiers` on the next balance.
+///
+/// Generic over the DB backend so it can be unit-tested against an in-memory state
+/// without the full prove/seal pipeline.
+fn select_dust_spends<D: DB>(
+    dust_state: &DustLocalState<D>,
+    dust_secret_key: &DustSecretKey,
+    total_fee: u128,
+    timestamp: Timestamp,
+    exclude_nullifiers: &std::collections::HashSet<String>,
+) -> Result<(DustLocalState<D>, Vec<DustSpend<ProofPreimageMarker, D>>, Vec<String>), String> {
+    let utxos: Vec<_> = dust_state.utxos().collect();
+    let mut current_state = dust_state.clone();
+    let mut dust_spends = Vec::new();
+    let mut spent_nullifiers: Vec<String> = Vec::new();
+    let mut fee_remaining = total_fee;
+
+    for (idx, utxo) in utxos.iter().enumerate() {
+        if fee_remaining == 0 {
+            break;
+        }
+
+        match current_state.spend(dust_secret_key, utxo, fee_remaining, timestamp) {
+            Ok((new_state, dust_spend)) => {
+                // The nullifier the node will check for this spend. Matching the
+                // skip-set against `old_nullifier` (not a value re-derived from the
+                // UTXO) keeps it byte-for-byte what a prior spend recorded and what
+                // the node verifies. `dust_current_nullifiers` uses the same helper
+                // on `utxo.nullifier(sk)` (== `old_nullifier`) so prune and exclude
+                // compare identical strings.
+                let nullifier_hex = nullifier_to_hex(&dust_spend.old_nullifier)?;
+
+                // Skip UTXOs the wallet has already spent. The dust event stream
+                // doesn't reliably reflect our own fee spends, so the synced state
+                // still lists a consumed UTXO as available; re-selecting it makes the
+                // node reject with error 115. Discard this speculative spend (keep
+                // `current_state`, don't count the fee) and roll to the next UTXO.
+                if exclude_nullifiers.contains(&nullifier_hex) {
+                    balance_log!(LOG_INFO,
+                        "Skipping already-spent dust UTXO: nullifier={} seq={} mt_index={}",
+                        nullifier_hex, utxo.seq, utxo.mt_index);
+                    continue;
+                }
+
+                // Diagnostic: log the Merkle roots used in the proof.
+                if let Some(com_root) = current_state.commitment_root() {
+                    balance_log!(LOG_INFO, "Commitment root BEFORE spend: {:?}", com_root);
+                } else {
+                    balance_log!(LOG_ERROR, "Commitment root is None (tree not rehashed!)");
+                }
+                if let Some(gen_root) = current_state.generation_root() {
+                    balance_log!(LOG_INFO, "Generation root BEFORE spend: {:?}", gen_root);
+                } else {
+                    balance_log!(LOG_ERROR, "Generation root is None (tree not rehashed!)");
+                }
+
+                current_state = new_state;
+                dust_spends.push(dust_spend);
+                spent_nullifiers.push(nullifier_hex);
+                balance_log!(LOG_INFO, "Created DustSpend from UTXO {}: v_fee={}", idx, fee_remaining);
+                fee_remaining = 0;
+            }
+            Err(e) => {
+                balance_log!(LOG_INFO, "Skipping UTXO {} (insufficient balance: {:?})", idx, e);
+                continue;
+            }
+        }
+    }
+
+    if fee_remaining > 0 {
+        return Err(format!(
+            "Insufficient dust balance. Need {} specks, no UTXO has enough \
+             (after skipping {} already-spent UTXO(s)).",
+            total_fee,
+            exclude_nullifiers.len()
+        ));
+    }
+
+    Ok((current_state, dust_spends, spent_nullifiers))
+}
+
 fn balance_proven_transaction_impl(
     proven_hex: &str,
     dust_state: &DustLocalState<DefaultDB>,
@@ -230,17 +436,13 @@ fn balance_proven_transaction_impl(
     current_time_ms: i64,
     keys_path: &PathBuf,
     network_id: &str,
-) -> Result<(String, DustLocalState<DefaultDB>), String> {
+    exclude_nullifiers: &std::collections::HashSet<String>,
+) -> Result<(String, DustLocalState<DefaultDB>, Vec<String>), String> {
     use midnight_storage::arena::Sp;
     use midnight_storage::storage::Array as StorageArray;
 
     balance_log!(LOG_INFO, "Starting balance: proven_tx={} chars, keys_dir={:?}",
         proven_hex.len(), keys_path);
-
-    // [ERROR_170_DEBUG] Capture the input bytes verbatim so we can replay this
-    // exact tx through a Rust unit test without re-running the Android app.
-    // Remove after balance_ffi tx-construction bug is identified + fixed.
-    balance_log!(LOG_INFO, "ERR170_INPUT_HEX={}", proven_hex);
 
     // ── Step 1: Deserialize the proven transaction ──
 
@@ -253,6 +455,43 @@ fn balance_proven_transaction_impl(
         .map_err(|e| format!("Failed to deserialize proven transaction: {:?}", e))?;
 
     balance_log!(LOG_INFO, "Deserialized proven tx: {} bytes", proven_bytes.len());
+
+    // TEMP (error-115/InvalidProof localization): capture the PRE-SEAL proven tx
+    // exactly as it enters the balancer, before seal()/dust mutate anything. Paired
+    // with CAPTURE_SUBMITTED_TX (post-seal), this lets the offline well_formed repro
+    // diff the contract-call transcript/gas/effects/binding across the seal boundary
+    // and decide whether seal broke the proof or the prover used a different
+    // transcript than was embedded. Chunked because logcat truncates long lines.
+    // Remove after diagnosis.
+    for (i, chunk) in proven_hex.as_bytes().chunks(3500).enumerate() {
+        balance_log!(LOG_INFO, "CAPTURE_PRESEAL_TX[{}]={}", i, std::str::from_utf8(chunk).unwrap_or(""));
+    }
+
+    // TEMP (error-115 unshielded diagnosis): the dust fix removed the dust spend, but
+    // 115 (InputNotInUtxos on an UnshieldedOffer) persists — so the contract-call tx
+    // itself spends an already-spent NIGHT UTXO. Log every unshielded input so we can
+    // see which UTXO it is and whether it's the stale one. Remove after diagnosis.
+    if let Transaction::Standard(stx) = &proven_tx {
+        balance_log!(LOG_INFO, "REVEAL_TX: guaranteed_zswap_present={}, intents={}",
+            stx.guaranteed_coins.is_some(), stx.intents.iter().count());
+        for entry in stx.intents.iter() {
+            let (_seg, intent) = &*entry;
+            if let Some(offer) = &intent.guaranteed_unshielded_offer {
+                for input in offer.inputs.iter_deref() {
+                    balance_log!(LOG_INFO,
+                        "REVEAL_UNSHIELDED_INPUT kind=guaranteed value={} output_no={} type={:?} intent_hash={:?}",
+                        input.value, input.output_no, input.type_, input.intent_hash);
+                }
+            }
+            if let Some(offer) = &intent.fallible_unshielded_offer {
+                for input in offer.inputs.iter_deref() {
+                    balance_log!(LOG_INFO,
+                        "REVEAL_UNSHIELDED_INPUT kind=fallible value={} output_no={} type={:?} intent_hash={:?}",
+                        input.value, input.output_no, input.type_, input.intent_hash);
+                }
+            }
+        }
+    }
 
     // ── Step 2: Calculate fee ──
     //
@@ -283,16 +522,16 @@ fn balance_proven_transaction_impl(
         }
     };
 
-    // Calculate fee from ledger params. NOTE: fees_with_margin can return 0
-    // for small contract-call txs because the synthetic cost rounds to 0
-    // specks. The on-chain verifier (verify.rs:609) calls fees(params, true),
-    // which enforces time_to_dismiss; on a tx with no dust spend, that check
-    // can fail and surface as Malformed(FeeCalculation) (error 168).
-    //
-    // The SDK's balanceTransactions ALWAYS emits a dust intent (see
-    // dust-wallet/Transacting.ts:512-527) even when the dust recipe is empty.
-    // We do the same: always include at least one dust spend so the tx has
-    // the structural shape the verifier expects, with v_fee >= 1.
+    // Calculate the dust fee. `fees_with_margin` returns 0 on a zero-fee network
+    // (e.g. `undeployed`). In that case the transaction needs NO dust intent at
+    // all — the ledger skips dust checks when `dust_actions` is None, a
+    // present-but-empty `DustActions` is rejected as `NotNormalized`
+    // (dust.rs:762), and error 168 (FeeCalculation) is a cost/time-to-dismiss
+    // limit, never "no dust spent" (structure.rs:2181). Forcing a ≥1-speck spend
+    // here (commit 2c41709's `.max(1)`) burned a real dust UTXO on every move; the
+    // node then saw it spent and the next move re-selected it → error 115. So when
+    // the fee is 0, seal the proven tx with no dust intent and return it unchanged
+    // — exactly as the code did before 2c41709.
     let erased_tx = proven_tx.erase_proofs();
     let base_fee = erased_tx
         .fees_with_margin(&params, DEFAULT_FEE_BLOCKS_MARGIN)
@@ -301,12 +540,27 @@ fn balance_proven_transaction_impl(
     balance_log!(LOG_INFO, "Fee from ledger params: {} specks", base_fee);
 
     let overhead = base_fee * FEE_OVERHEAD_PERCENT / 100;
-    // Ensure v_fee >= 1 so the dust spend is always non-trivial. Without this,
-    // a 0-fee tx would have no dust spend and the node rejects with FeeCalculation.
-    let total_fee: u128 = (base_fee + overhead).max(1);
+    let total_fee: u128 = base_fee + overhead;
 
     balance_log!(LOG_INFO, "Calculated fee: {} specks (base={}, overhead={})",
         total_fee, base_fee, overhead);
+
+    if total_fee == 0 {
+        balance_log!(LOG_INFO, "Zero-fee network — sealing proven tx with no dust intent");
+        let sealed_tx = proven_tx.seal(OsRng);
+        let mut result_bytes = Vec::new();
+        tagged_serialize(&sealed_tx, &mut result_bytes)
+            .map_err(|e| format!("Failed to serialize sealed transaction: {:?}", e))?;
+        let result_hex = hex::encode(&result_bytes);
+        // TEMP (InvalidProof capture): the exact sealed tx submitted to the node, so
+        // we can replay it through the ledger verifier offline. Chunked because
+        // logcat truncates long lines. Remove after diagnosis.
+        for (i, chunk) in result_hex.as_bytes().chunks(3500).enumerate() {
+            balance_log!(LOG_INFO, "CAPTURE_SUBMITTED_TX[{}]={}", i, std::str::from_utf8(chunk).unwrap_or(""));
+        }
+        // No dust spent → no nullifiers to record; dust state unchanged.
+        return Ok((result_hex, dust_state.clone(), Vec::new()));
+    }
 
     // ── Step 3: Create dust spends ──
 
@@ -315,49 +569,13 @@ fn balance_proven_transaction_impl(
         .map_err(|_| format!("Negative timestamp: {}", current_time_ms))?;
     let timestamp = Timestamp::from_secs(timestamp_secs);
 
-    let utxos: Vec<_> = dust_state.utxos().collect();
-    let mut current_state = dust_state.clone();
-    let mut dust_spends = Vec::new();
-    let mut fee_remaining = total_fee;
-
-    for (idx, utxo) in utxos.iter().enumerate() {
-        if fee_remaining == 0 {
-            break;
-        }
-
-        match current_state.spend(&dust_secret_key, utxo, fee_remaining, timestamp) {
-            Ok((new_state, dust_spend)) => {
-                // Diagnostic: log the Merkle roots used in the proof
-                if let Some(com_root) = current_state.commitment_root() {
-                    balance_log!(LOG_INFO, "Commitment root BEFORE spend: {:?}", com_root);
-                } else {
-                    balance_log!(LOG_ERROR, "Commitment root is None (tree not rehashed!)");
-                }
-                if let Some(gen_root) = current_state.generation_root() {
-                    balance_log!(LOG_INFO, "Generation root BEFORE spend: {:?}", gen_root);
-                } else {
-                    balance_log!(LOG_ERROR, "Generation root is None (tree not rehashed!)");
-                }
-                balance_log!(LOG_INFO, "Dust ctime (timestamp_secs): {}", timestamp_secs);
-                balance_log!(LOG_INFO, "UTXO count: {}, events replayed to state", utxos.len());
-                current_state = new_state;
-                dust_spends.push(dust_spend);
-                balance_log!(LOG_INFO, "Created DustSpend from UTXO {}: v_fee={}", idx, fee_remaining);
-                fee_remaining = 0;
-            }
-            Err(e) => {
-                balance_log!(LOG_INFO, "Skipping UTXO {} (insufficient balance: {:?})", idx, e);
-                continue;
-            }
-        }
-    }
-
-    if fee_remaining > 0 {
-        return Err(format!(
-            "Insufficient dust balance. Need {} specks, no UTXO has enough.",
-            total_fee
-        ));
-    }
+    let (current_state, dust_spends, spent_nullifiers) = select_dust_spends(
+        dust_state,
+        &dust_secret_key,
+        total_fee,
+        timestamp,
+        exclude_nullifiers,
+    )?;
 
     balance_log!(LOG_INFO, "Created {} dust spend(s) for total fee {}", dust_spends.len(), total_fee);
 
@@ -466,13 +684,7 @@ fn balance_proven_transaction_impl(
         prove_elapsed.as_secs_f64()
     );
 
-    // [ERROR_170_DEBUG] Output bytes — the balanced + sealed tx that gets
-    // submitted to the node. Paired with ERR170_INPUT_HEX upstream, these are
-    // the two artifacts a Rust unit test needs to reproduce / diff against
-    // a known-good (mn serve / mn transfer) tx. Remove after fix lands.
-    balance_log!(LOG_INFO, "ERR170_OUTPUT_HEX={}", result_hex);
-
-    Ok((result_hex, current_state))
+    Ok((result_hex, current_state, spent_nullifiers))
 }
 
 /// Strip the tag prefix from tagged SCALE serialization.
@@ -513,6 +725,7 @@ mod tests {
             0,
             ptr::null(),
             ptr::null(),
+            ptr::null(),
         );
         assert!(result.is_null());
     }
@@ -534,6 +747,7 @@ mod tests {
             0,
             keys_dir.as_ptr(),
             network.as_ptr(),
+            ptr::null(),
         );
         assert!(result.is_null());
     }
@@ -560,6 +774,7 @@ mod tests {
             1704067200000,
             keys_dir.as_ptr(),
             network.as_ptr(),
+            ptr::null(),
         );
         assert!(result.is_null(), "Should fail on invalid hex");
     }
@@ -819,6 +1034,117 @@ mod preprod_diagnostic {
         eprintln!("Spend with {} UTXOs: SUCCESS", utxo_count);
     }
 
+    /// Error-115 regression: a nullifier the wallet already spent must never be
+    /// re-selected. The dust event stream doesn't reliably reflect the wallet's own
+    /// fee spends, so the synced state still lists a consumed UTXO as available;
+    /// without the skip-set the balancer reselects it and the node rejects the tx
+    /// with "UTXO already spent" (error 115). With two funded UTXOs, excluding the
+    /// first-selected nullifier must make selection pick the other one.
+    #[tokio::test]
+    async fn select_dust_spends_skips_excluded_nullifier() {
+        use midnight_ledger::test_utilities::TestState;
+        use midnight_storage::db::InMemoryDB;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(0x115);
+        let mut state = TestState::<InMemoryDB>::new(&mut rng);
+        state.give_fee_token(&mut rng, 2).await;
+        let selectable = state.dust.utxos().count();
+        assert!(selectable >= 2, "test needs >= 2 funded UTXOs, got {}", selectable);
+
+        let none_excluded = std::collections::HashSet::new();
+
+        // First balance: no exclusions — selects one UTXO and reports its nullifier.
+        let (post1, spends1, spent1) =
+            select_dust_spends(&state.dust, &state.dust_key, 42, state.time, &none_excluded)
+                .expect("first selection succeeds");
+        assert_eq!(spends1.len(), 1, "one UTXO covers the fee");
+        assert_eq!(spent1.len(), 1, "exactly one spent nullifier reported");
+        let first_nullifier = spent1[0].clone();
+
+        // State-level 115 guard: the spent UTXO drops out of the selectable set.
+        assert_eq!(
+            post1.utxos().count(),
+            selectable - 1,
+            "spent UTXO still selectable -> next tx reselects it -> error 115",
+        );
+
+        // Second balance on the ORIGINAL state, now excluding the first nullifier:
+        // selection must pick the OTHER UTXO, never the excluded one.
+        let excluded = std::collections::HashSet::from([first_nullifier.clone()]);
+        let (_post2, _spends2, spent2) =
+            select_dust_spends(&state.dust, &state.dust_key, 42, state.time, &excluded)
+                .expect("second selection finds an alternative UTXO");
+        assert_eq!(spent2.len(), 1);
+        assert_ne!(
+            spent2[0], first_nullifier,
+            "selection re-picked an already-spent (excluded) nullifier -> error 115",
+        );
+    }
+
+    /// When the only funded UTXO is excluded, selection must fail cleanly with an
+    /// insufficient-balance error rather than silently re-spending it (which the
+    /// node would reject with error 115).
+    #[tokio::test]
+    async fn select_dust_spends_errors_when_only_utxo_is_excluded() {
+        use midnight_ledger::test_utilities::TestState;
+        use midnight_storage::db::InMemoryDB;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(0x116);
+        let mut state = TestState::<InMemoryDB>::new(&mut rng);
+        state.give_fee_token(&mut rng, 1).await;
+
+        // Learn the single UTXO's nullifier from an unconstrained selection.
+        let (_p, _s, spent) =
+            select_dust_spends(&state.dust, &state.dust_key, 42, state.time, &std::collections::HashSet::new())
+                .expect("baseline selection succeeds");
+        assert_eq!(spent.len(), 1);
+        let only_nullifier = spent[0].clone();
+
+        let excluded = std::collections::HashSet::from([only_nullifier]);
+        let result =
+            select_dust_spends(&state.dust, &state.dust_key, 42, state.time, &excluded);
+        assert!(
+            result.is_err(),
+            "excluding the only UTXO must fail cleanly, not reselect it",
+        );
+    }
+
+    /// `current_nullifiers` (the prune/fast-fail source) lists every UTXO once, and
+    /// the hex it produces is byte-identical to what the balancer records as spent —
+    /// the invariant the skip-set prune depends on. If these diverged, prune would
+    /// never drop confirmed-spent entries and fast-fail would misfire.
+    #[tokio::test]
+    async fn current_nullifiers_matches_what_the_balancer_spends() {
+        use midnight_ledger::test_utilities::TestState;
+        use midnight_storage::db::InMemoryDB;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(0x117);
+        let mut state = TestState::<InMemoryDB>::new(&mut rng);
+        state.give_fee_token(&mut rng, 3).await;
+        let selectable = state.dust.utxos().count();
+        assert!(selectable >= 3, "test needs >= 3 funded UTXOs, got {}", selectable);
+
+        let present = current_nullifiers(&state.dust, &state.dust_key)
+            .expect("listing current nullifiers succeeds");
+        assert_eq!(present.len(), selectable, "one nullifier per current UTXO");
+        let unique: std::collections::HashSet<_> = present.iter().collect();
+        assert_eq!(unique.len(), present.len(), "nullifiers are distinct");
+        assert!(present.iter().all(|n| n == &n.to_lowercase()), "lowercase hex");
+
+        // The nullifier the balancer reports as spent must be one this lists — so a
+        // recorded spend can later be pruned (or kept) by membership in this set.
+        let (_post, _spends, spent) =
+            select_dust_spends(&state.dust, &state.dust_key, 42, state.time, &std::collections::HashSet::new())
+                .expect("selection succeeds");
+        assert!(
+            present.contains(&spent[0]),
+            "balancer's spent nullifier not in current_nullifiers -> prune/fast-fail would break",
+        );
+    }
+
     /// CRITICAL: does chunked replay produce the same roots as single-pass replay?
     /// Our Android streaming replay does: replay(chunk1) → serialize → deserialize → replay(chunk2) → ...
     /// If this produces different roots than replay(all_events), THAT explains error 170.
@@ -916,6 +1242,517 @@ mod preprod_diagnostic {
         eprintln!("limits.block_limits: {:?}", params.limits.block_limits);
         eprintln!("\nfee_prices: {:?}", params.fee_prices);
         eprintln!("\ncost_model.baseline_cost: {:?}", params.cost_model.baseline_cost);
+    }
+
+    /// Reproduce the reveal that the node rejected (error 115 = InvalidProof) / crashed
+    /// on. Loads the exact sealed reveal tx + the contract state it proved against,
+    /// captured on-device (see CAPTURE_SUBMITTED_TX / CAPTURE_STATE_HEX). First step:
+    /// deserialize + dump the structure to find the malformation. Run with:
+    ///   cargo test -p kuira-crypto-ffi inspect_reveal_invalidproof -- --nocapture
+    #[test]
+    fn inspect_reveal_invalidproof() {
+        use midnight_transient_crypto::commitment::PureGeneratorPedersen;
+        type SealedTx = Transaction<Signature, ProofMarker, PureGeneratorPedersen, DefaultDB>;
+
+        let tx_hex = include_str!("../test-fixtures/reveal_invalidproof_tx.hex").trim();
+        let bytes = hex::decode(tx_hex).expect("tx hex decodes");
+        eprintln!("reveal tx: {} bytes", bytes.len());
+
+        let tx: SealedTx = tagged_deserialize(&bytes[..]).expect("reveal tx deserializes");
+
+        match &tx {
+            Transaction::Standard(stx) => {
+                eprintln!("network_id={:?}", stx.network_id);
+                eprintln!("guaranteed_coins={} fallible_coins={}",
+                    stx.guaranteed_coins.is_some(), stx.fallible_coins.iter().count());
+                for entry in stx.intents.iter() {
+                    let (seg, intent) = &*entry;
+                    eprintln!(
+                        "intent seg={:?}: actions={} guar_unshielded={} fall_unshielded={} dust={} ttl={:?}",
+                        seg,
+                        intent.actions.iter().count(),
+                        intent.guaranteed_unshielded_offer.is_some(),
+                        intent.fallible_unshielded_offer.is_some(),
+                        intent.dust_actions.is_some(),
+                        intent.ttl,
+                    );
+                    for action in intent.actions.iter() {
+                        eprintln!("  action = {:?}", action);
+                    }
+                }
+            }
+            other => eprintln!("non-standard tx: {:?}", other),
+        }
+
+        let state_hex = include_str!("../test-fixtures/reveal_invalidproof_state.hex").trim();
+        eprintln!("contract state: {} bytes", hex::decode(state_hex).expect("state hex").len());
+    }
+
+    /// THE decisive offline repro of node error 115 (InvalidProof).
+    ///
+    /// `proof_verify` (structure.rs:435, gated behind the default `proof-verifying`
+    /// feature) pulls ONLY the verifier key from the ledger's contract state; the
+    /// public inputs are derived ENTIRELY from the tx's own transcript
+    /// (`ContractCall::public_inputs`, verify.rs:1869). So a 115 is a VK-vs-proof
+    /// mismatch or a structurally-invalid proof — NOT a state-data divergence
+    /// (that surfaces later at transcript-apply as a different code).
+    ///
+    /// This test rebuilds exactly what the node does at submit:
+    ///   1. deserialize the captured sealed reveal tx,
+    ///   2. deserialize the captured indexer contract state (holds the on-chain VK),
+    ///   3. seat that state in a LedgerState at the call's address,
+    ///   4. run `well_formed` with contract-proof verification ON, everything else
+    ///      OFF (so the ONLY thing that can fail is the ZK proof check).
+    ///
+    /// PASS (well_formed Ok)  => the proof verifies against the indexer's VK; the
+    ///   node must hold a different VK/state — divergence is upstream of the proof.
+    /// FAIL (InvalidProof)    => the proof genuinely doesn't verify against the
+    ///   on-chain VK — a prover-key / verifier-key version mismatch in our build.
+    ///
+    /// Run with:
+    ///   cargo test -p kuira-crypto-ffi well_formed_reveal_invalidproof -- --nocapture
+    #[test]
+    fn well_formed_reveal_invalidproof() {
+        use midnight_ledger::structure::{ContractAction, LedgerState};
+        use midnight_ledger::verify::{ProofVerificationMode, WellFormedStrictness};
+        use midnight_onchain_runtime::state::ContractState;
+        use midnight_transient_crypto::commitment::PureGeneratorPedersen;
+        type SealedTx = Transaction<Signature, ProofMarker, PureGeneratorPedersen, DefaultDB>;
+
+        // 1. The sealed reveal tx the node rejected with 115.
+        let tx_bytes = hex::decode(
+            include_str!("../test-fixtures/reveal_invalidproof_tx.hex").trim(),
+        )
+        .expect("tx hex decodes");
+        let tx: SealedTx = tagged_deserialize(&tx_bytes[..]).expect("reveal tx deserializes");
+
+        // 2. The contract state (from the indexer) the proof was built against.
+        let state_bytes = hex::decode(
+            include_str!("../test-fixtures/reveal_invalidproof_state.hex").trim(),
+        )
+        .expect("state hex decodes");
+        let contract_state: ContractState<DefaultDB> =
+            tagged_deserialize(&state_bytes[..]).expect("contract state deserializes");
+
+        // Pull network id, the call's address + entry point, and the intent ttl
+        // straight out of the captured tx so the LedgerState matches it exactly.
+        let stx = match &tx {
+            Transaction::Standard(stx) => stx,
+            other => panic!("expected Standard tx, got {:?}", other),
+        };
+        let network_id = stx.network_id.clone();
+
+        let mut call_address = None;
+        let mut tblock = Timestamp::from_secs(0);
+        for entry in stx.intents.iter() {
+            let (_seg, intent) = &*entry;
+            tblock = intent.ttl; // tblock == ttl satisfies ttl_check_weak both ways
+            for action in intent.actions.iter() {
+                if let ContractAction::Call(call) = &*action {
+                    eprintln!(
+                        "reveal call: address={:?} entry_point={:?}",
+                        call.address, call.entry_point,
+                    );
+                    call_address = Some(call.address);
+                }
+            }
+        }
+        let address = call_address.expect("reveal tx must contain a contract Call");
+
+        // Sanity: the captured state must actually hold a VK for the entry point
+        // the call invokes. If it doesn't, well_formed would fail with
+        // VerifierKeyNotPresent (a different cause than InvalidProof).
+        eprintln!(
+            "contract state operations: {:?}",
+            contract_state
+                .operations
+                .iter()
+                .map(|kv| kv.0.clone())
+                .collect::<std::vec::Vec<_>>(),
+        );
+
+        // 3. Seat the captured contract state in a fresh ledger at the call address.
+        let mut ledger: LedgerState<DefaultDB> = LedgerState::new(network_id);
+        ledger.contract = ledger.contract.insert(address, contract_state);
+
+        // 4. Verify ONLY the contract proof — disable every other check so the
+        //    sole possible failure is the ZK proof verification (node code 115).
+        let mut strictness = WellFormedStrictness::default();
+        strictness.enforce_balancing = false;
+        strictness.verify_native_proofs = false;
+        strictness.verify_contract_proofs = true;
+        strictness.verify_signatures = false;
+        strictness.enforce_limits = false;
+        strictness.proof_verification_mode = ProofVerificationMode::Real;
+
+        eprintln!("running well_formed (contract-proof verification only)...");
+        match tx.well_formed(&ledger, strictness, tblock) {
+            Ok(_) => eprintln!(
+                "RESULT: well_formed OK — proof verifies against the indexer's VK. \
+                 115 originates UPSTREAM of proof verification (node holds a \
+                 different VK/state, or rejects for a non-proof reason)."
+            ),
+            Err(e) => eprintln!(
+                "RESULT: well_formed FAILED — {:?}. If this is InvalidProof, the \
+                 proof does not verify against the on-chain VK => prover/verifier \
+                 key version mismatch in our build.",
+                e
+            ),
+        }
+    }
+
+    /// CONTROL: the commitRegulation proof was ACCEPTED on-chain, so it MUST verify
+    /// offline against the real VK. If this fails, the offline harness itself is the
+    /// false positive (wrong PARAMS_VERIFIER / public_inputs reconstruction) and the
+    /// reveal "InvalidProof" is an artifact, not the real bug.
+    ///
+    /// Run with:
+    ///   cargo test -p kuira-crypto-ffi control_commit_proof_verifies -- --nocapture
+    #[test]
+    fn control_commit_proof_verifies() {
+        use midnight_ledger::structure::{ContractAction, PedersenDowngradeable, ProofVersioned, Transaction};
+        use midnight_onchain_runtime::state::ContractState;
+        use midnight_transient_crypto::commitment::{PedersenRandomness, Pedersen};
+        use midnight_transient_crypto::proofs::PARAMS_VERIFIER;
+
+        type PreSealTx = Transaction<Signature, ProofMarker, PedersenRandomness, DefaultDB>;
+
+        let pre: PreSealTx = tagged_deserialize(
+            &hex::decode(include_str!("../test-fixtures/commit_preseal_tx.hex").trim()).unwrap()[..],
+        ).expect("commit preseal deserializes");
+        let state: ContractState<DefaultDB> = tagged_deserialize(
+            &hex::decode(include_str!("../test-fixtures/reveal_paired_state.hex").trim()).unwrap()[..],
+        ).expect("state deserializes");
+
+        let stx = match &pre { Transaction::Standard(s) => s, _ => panic!("not standard") };
+        let (call, binding_pr, ep) = {
+            let mut found = None;
+            for e in stx.intents.iter() {
+                let (_seg, intent) = &*e;
+                for a in intent.actions.iter() {
+                    if let ContractAction::Call(c) = &*a {
+                        found = Some((c.clone(), intent.binding_commitment.clone(), format!("{:?}", c.entry_point)));
+                    }
+                }
+            }
+            found.expect("commit call")
+        };
+        eprintln!("control call entry_point = {ep}");
+
+        let vk = state.operations.iter()
+            .find(|kv| format!("{:?}", kv.0) == ep)
+            .and_then(|kv| (*kv.1).v2.clone())
+            .expect("vk present");
+        let proof = match &call.proof {
+            ProofVersioned::V2(p) => p.clone(),
+            other => panic!("unexpected proof version: {:?}", other),
+        };
+        let binding_down: Pedersen = PedersenDowngradeable::<DefaultDB>::downgrade(&binding_pr);
+        let res = vk.verify(&PARAMS_VERIFIER, &proof, call.public_inputs(binding_down).into_iter());
+        eprintln!("CONTROL commit proof verify: {}",
+            if res.is_ok() { "VERIFIES ✓ (harness is sound)" } else { "FAILS ✗ (harness false-positive!)" });
+        eprintln!("  raw: {:?}", res);
+    }
+
+    /// Pinpoint WHICH part of the public inputs the reveal proof disagrees with.
+    /// `prove()` (ledger prove.rs:277-360) inserts Op::Noop runs into the transcript
+    /// and binds the proof to `binding_input` over the noop-augmented call; each
+    /// Noop{n} contributes `n` zero field elements to `public_inputs` (ops.rs:403).
+    /// We verify the captured reveal proof against:
+    ///   (a) the embedded transcript as-is  (= what the node does -> expect FAIL),
+    ///   (b) the transcript with Noop ops stripped from public_inputs,
+    ///   (c) binding via `downgrade` vs `Into<Pedersen>`.
+    /// Whichever variant verifies names the exact divergence and the fix.
+    ///
+    /// Run with:
+    ///   cargo test -p kuira-crypto-ffi pinpoint_reveal_pubinputs -- --nocapture
+    #[test]
+    fn pinpoint_reveal_pubinputs() {
+        use midnight_ledger::structure::{ContractAction, PedersenDowngradeable, ProofVersioned, Transaction};
+        use midnight_onchain_runtime::state::ContractState;
+        use midnight_onchain_runtime::transcript::Transcript;
+        use midnight_onchain_vm::ops::Op;
+        use midnight_onchain_vm::result_mode::ResultModeVerify;
+        use midnight_storage::arena::Sp;
+        use midnight_transient_crypto::commitment::{PedersenRandomness, Pedersen};
+        use midnight_transient_crypto::curve::Fr;
+        use midnight_transient_crypto::proofs::PARAMS_VERIFIER;
+
+        type PreSealTx = Transaction<Signature, ProofMarker, PedersenRandomness, DefaultDB>;
+
+        let pre: PreSealTx = tagged_deserialize(
+            &hex::decode(include_str!("../test-fixtures/reveal_preseal_tx.hex").trim()).unwrap()[..],
+        ).expect("preseal deserializes");
+        let state: ContractState<DefaultDB> = tagged_deserialize(
+            &hex::decode(include_str!("../test-fixtures/reveal_paired_state.hex").trim()).unwrap()[..],
+        ).expect("state deserializes");
+
+        let stx = match &pre { Transaction::Standard(s) => s, _ => panic!("not standard") };
+        let (call, binding_pr) = {
+            let mut found = None;
+            for e in stx.intents.iter() {
+                let (_seg, intent) = &*e;
+                for a in intent.actions.iter() {
+                    if let ContractAction::Call(c) = &*a {
+                        found = Some((c.clone(), intent.binding_commitment.clone()));
+                    }
+                }
+            }
+            found.expect("reveal call")
+        };
+
+        let vk = state.operations.iter()
+            .find(|kv| format!("{:?}", kv.0) == "revealRegulation")
+            .and_then(|kv| (*kv.1).v2.clone())
+            .expect("revealRegulation vk");
+        let proof = match &call.proof {
+            ProofVersioned::V2(p) => p.clone(),
+            other => panic!("unexpected proof version: {:?}", other),
+        };
+
+        let binding_down: Pedersen = PedersenDowngradeable::<DefaultDB>::downgrade(&binding_pr);
+        let binding_into: Pedersen = binding_pr.clone().into();
+        eprintln!("binding downgrade == into ? {}", binding_down == binding_into);
+
+        let verify = |label: &str, pis: Vec<Fr>| {
+            let res = vk.verify(&PARAMS_VERIFIER, &proof, pis.into_iter());
+            eprintln!("  {label}: {}", if res.is_ok() { "VERIFIES ✓" } else { "fails" });
+        };
+
+        // (a) embedded transcript, downgrade binding (the node's exact computation)
+        verify("(a) full + downgrade", call.public_inputs(binding_down));
+        // (c) embedded transcript, Into binding
+        verify("(c) full + Into     ", call.public_inputs(binding_into));
+
+        // (b) strip Noop ops from the fallible transcript, recompute public inputs
+        let stripped_call = {
+            let mut c = (*call).clone();
+            if let Some(ft) = &call.fallible_transcript {
+                let kept: std::vec::Vec<Op<ResultModeVerify, DefaultDB>> = ft.program
+                    .iter().map(|o| (*o).clone())
+                    .filter(|op| !matches!(op, Op::Noop { .. }))
+                    .collect();
+                let n_total: u32 = ft.program.iter()
+                    .map(|o| if let Op::Noop { n } = &*o { *n } else { 0 }).sum();
+                eprintln!("fallible: {} ops, stripped to {} (removed {} noop-field-elems)",
+                    ft.program.len(), kept.len(), n_total);
+                c.fallible_transcript = Some(Sp::new(Transcript {
+                    gas: ft.gas,
+                    effects: ft.effects.clone(),
+                    program: kept.into(),
+                    version: ft.version.clone(),
+                }));
+            }
+            c
+        };
+        verify("(b) no-noop + downgrade", stripped_call.public_inputs(binding_down));
+    }
+
+    /// Localize error 115 across the seal boundary, using a MATCHED pre/post pair
+    /// captured from the SAME reveal balance call (CAPTURE_PRESEAL_TX before seal,
+    /// CAPTURE_SUBMITTED_TX after seal). Both carry the same proof + transcript; only
+    /// the intent binding commitment representation changes (PedersenRandomness =
+    /// "embedded-fr" -> PureGeneratorPedersen = "pedersen-schnorr").
+    ///
+    ///   pre-seal verifies, post-seal doesn't  => seal mutates the binding the proof
+    ///       was bound to => bug is in balance_ffi's seal path.
+    ///   neither verifies                       => the prover committed to a different
+    ///       transcript than was embedded => snapshot-timing bug upstream (compact).
+    ///
+    /// Run with:
+    ///   cargo test -p kuira-crypto-ffi well_formed_across_seal -- --nocapture
+    #[test]
+    fn well_formed_across_seal() {
+        use midnight_ledger::structure::{ContractAction, LedgerState, Transaction};
+        use midnight_ledger::verify::{ProofVerificationMode, WellFormedStrictness};
+        use midnight_onchain_runtime::state::ContractState;
+        use midnight_transient_crypto::commitment::{PedersenRandomness, PureGeneratorPedersen};
+
+        type PreSealTx = Transaction<Signature, ProofMarker, PedersenRandomness, DefaultDB>;
+        type SealedTx = Transaction<Signature, ProofMarker, PureGeneratorPedersen, DefaultDB>;
+
+        let pre_bytes = hex::decode(
+            include_str!("../test-fixtures/reveal_preseal_tx.hex").trim(),
+        )
+        .expect("preseal hex");
+        let post_bytes = hex::decode(
+            include_str!("../test-fixtures/reveal_sealed_tx.hex").trim(),
+        )
+        .expect("sealed hex");
+        let state_bytes = hex::decode(
+            include_str!("../test-fixtures/reveal_paired_state.hex").trim(),
+        )
+        .expect("state hex");
+
+        let pre: PreSealTx = tagged_deserialize(&pre_bytes[..]).expect("preseal deserializes");
+        let post: SealedTx = tagged_deserialize(&post_bytes[..]).expect("sealed deserializes");
+        let contract_state: ContractState<DefaultDB> =
+            tagged_deserialize(&state_bytes[..]).expect("state deserializes");
+
+        // Address + ttl come from the sealed tx.
+        let (address, network_id, tblock) = {
+            let stx = match &post {
+                Transaction::Standard(s) => s,
+                o => panic!("post not standard: {:?}", o),
+            };
+            let mut addr = None;
+            let mut tb = Timestamp::from_secs(0);
+            for e in stx.intents.iter() {
+                let (_seg, intent) = &*e;
+                tb = intent.ttl;
+                for a in intent.actions.iter() {
+                    if let ContractAction::Call(c) = &*a {
+                        addr = Some(c.address);
+                    }
+                }
+            }
+            (addr.expect("call addr"), stx.network_id.clone(), tb)
+        };
+
+        // Compare the downgraded binding commitment (the Pedersen point that actually
+        // enters binding_input) on each side of the seal. If these differ, seal moved
+        // the binding the proof was bound to.
+        use midnight_ledger::structure::PedersenDowngradeable;
+        if let Transaction::Standard(s) = &pre {
+            for e in s.intents.iter() {
+                eprintln!("PRE  intent binding (downgraded) = {:?}",
+                    PedersenDowngradeable::<DefaultDB>::downgrade(&(*e).1.binding_commitment));
+            }
+        }
+        if let Transaction::Standard(s) = &post {
+            for e in s.intents.iter() {
+                eprintln!("POST intent binding (downgraded) = {:?}",
+                    PedersenDowngradeable::<DefaultDB>::downgrade(&(*e).1.binding_commitment));
+            }
+        }
+
+        let mut strictness = WellFormedStrictness::default();
+        strictness.enforce_balancing = false;
+        strictness.verify_native_proofs = false;
+        strictness.verify_contract_proofs = true;
+        strictness.verify_signatures = false;
+        strictness.enforce_limits = false;
+        strictness.proof_verification_mode = ProofVerificationMode::Real;
+
+        let ledger: LedgerState<DefaultDB> = {
+            let mut l = LedgerState::new(network_id);
+            l.contract = l.contract.insert(address, contract_state);
+            l
+        };
+
+        let pre_res = pre.well_formed(&ledger, strictness, tblock);
+        eprintln!("PRE-seal  well_formed: {:?}", pre_res.map(|_| "OK"));
+        let post_res = post.well_formed(&ledger, strictness, tblock);
+        eprintln!("POST-seal well_formed: {:?}", post_res.map(|_| "OK"));
+    }
+
+    /// Dump the reveal call's transcript ops, focusing on `Popeq` read results
+    /// (`AlignedValue`). The reveal reads the evolved `p1Commitment`; if that read
+    /// landed in the transcript as an EMPTY/zeroed `result` while the prover proved
+    /// the real value, the verifier's field_repr diverges => InvalidProof. This
+    /// surfaces transcript-content corruption directly.
+    ///
+    /// Run with:
+    ///   cargo test -p kuira-crypto-ffi dump_reveal_transcript -- --nocapture
+    #[test]
+    fn dump_reveal_transcript() {
+        use midnight_ledger::structure::{ContractAction, Transaction};
+        use midnight_transient_crypto::commitment::PureGeneratorPedersen;
+        type SealedTx = Transaction<Signature, ProofMarker, PureGeneratorPedersen, DefaultDB>;
+
+        let tx_bytes = hex::decode(
+            include_str!("../test-fixtures/reveal_invalidproof_tx.hex").trim(),
+        )
+        .expect("tx hex decodes");
+        let tx: SealedTx = tagged_deserialize(&tx_bytes[..]).expect("reveal tx deserializes");
+
+        let stx = match &tx {
+            Transaction::Standard(stx) => stx,
+            other => panic!("expected Standard tx, got {:?}", other),
+        };
+
+        for entry in stx.intents.iter() {
+            let (_seg, intent) = &*entry;
+            for action in intent.actions.iter() {
+                if let ContractAction::Call(call) = &*action {
+                    eprintln!("== call {:?} ==", call.entry_point);
+                    eprintln!("communication_commitment = {:?}", call.communication_commitment);
+                    for (label, t) in [
+                        ("guaranteed", call.guaranteed_transcript.as_ref()),
+                        ("fallible", call.fallible_transcript.as_ref()),
+                    ] {
+                        let Some(t) = t else {
+                            eprintln!("  {label}: <none>");
+                            continue;
+                        };
+                        eprintln!("  {label}: {} ops, version={:?}", t.program.len(), t.version);
+                        for (i, op) in t.program.iter().enumerate() {
+                            eprintln!("    [{i}] {:?}", &*op);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Smoking-gun check for the 115/InvalidProof: does the verifier key the
+    /// contract was DEPLOYED with (on-chain `op.v2`, from the captured indexer
+    /// state) byte-match the verifier key the app currently PROVES against
+    /// (`assets/keys/<entry>.verifier`)?
+    ///
+    /// commit succeeds + reveal fails, so we expect commitRegulation to match and
+    /// revealRegulation to DIFFER — proving the deployed reveal VK is from a
+    /// different compile than the app's current reveal proving key.
+    ///
+    /// Run with:
+    ///   cargo test -p kuira-crypto-ffi compare_onchain_vks_to_app_keys -- --nocapture
+    #[test]
+    fn compare_onchain_vks_to_app_keys() {
+        use midnight_onchain_runtime::state::ContractState;
+        use midnight_serialize::tagged_serialize;
+
+        let state_bytes = hex::decode(
+            include_str!("../test-fixtures/reveal_invalidproof_state.hex").trim(),
+        )
+        .expect("state hex decodes");
+        let contract_state: ContractState<DefaultDB> =
+            tagged_deserialize(&state_bytes[..]).expect("contract state deserializes");
+
+        let keys_dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../examples/midnight-kicks/app/src/main/assets/keys/"
+        );
+
+        for op_entry in contract_state.operations.iter() {
+            let entry_point = format!("{:?}", op_entry.0);
+            let op = &*op_entry.1;
+            let vk = match &op.v2 {
+                Some(vk) => vk,
+                None => {
+                    eprintln!("{entry_point}: NO on-chain VK (v2 = None)");
+                    continue;
+                }
+            };
+            let mut onchain = std::vec::Vec::new();
+            tagged_serialize(vk, &mut onchain).expect("serialize on-chain VK");
+
+            let file_path = format!("{keys_dir}{entry_point}.verifier");
+            let app = match std::fs::read(&file_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("{entry_point}: app key unreadable ({e})");
+                    continue;
+                }
+            };
+
+            let matches = onchain == app;
+            eprintln!(
+                "{entry_point}: on-chain={}B app={}B  =>  {}",
+                onchain.len(),
+                app.len(),
+                if matches { "MATCH" } else { "*** DIFFERS ***" },
+            );
+        }
     }
 
     /// Decode an SDK-built transaction (sealed = PureGeneratorPedersen) and print its

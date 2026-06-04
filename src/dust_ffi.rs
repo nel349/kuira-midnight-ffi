@@ -698,26 +698,28 @@ pub extern "C" fn dust_replay_events_from_file(
             total += 1;
 
             if chunk.len() == CHUNK_SIZE {
-                state = match state.replay_events(&sk, chunk.iter()) {
-                    Ok(s) => s,
+                let wc = match state.replay_events_with_changes(&sk, chunk.iter()) {
+                    Ok(w) => w,
                     Err(e) => {
                         android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Chunk replay failed at event {}: {:?}", total, e);
                         return ptr::null_mut();
                     }
                 };
+                state = wc.result;
                 chunk.clear();
             }
         }
 
         // Replay the final partial chunk.
         if !chunk.is_empty() {
-            state = match state.replay_events(&sk, chunk.iter()) {
-                Ok(s) => s,
+            let wc = match state.replay_events_with_changes(&sk, chunk.iter()) {
+                Ok(w) => w,
                 Err(e) => {
                     android_log!(ANDROID_LOG_ERROR, "KuiraDustFFI", "Final chunk replay failed at event {}: {:?}", total, e);
                     return ptr::null_mut();
                 }
             };
+            state = wc.result;
         }
 
         android_log!(ANDROID_LOG_INFO, "KuiraDustFFI", "Streamed {} bytes, replayed {} events in {}-event chunks", bytes_read, total, CHUNK_SIZE);
