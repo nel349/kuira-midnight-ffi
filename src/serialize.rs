@@ -53,7 +53,7 @@ use midnight_base_crypto::hash::HashOutput;
 use midnight_transient_crypto::commitment::{Pedersen, PedersenRandomness, PureGeneratorPedersen};
 use midnight_transient_crypto::curve::EmbeddedFr;
 use midnight_transient_crypto::proofs::ProvingKeyMaterial;
-use midnight_serialize::{Serializable, Deserializable};
+use midnight_serialize::Deserializable;
 use serde::{Deserialize as SerdeDeserialize, Serialize};
 use rand::Rng;
 
@@ -511,7 +511,7 @@ pub fn build_and_serialize_intent(
     // Store lengths for logging
     let input_count = inputs.len();
     let output_count = outputs.len();
-    let signature_count = signatures.len();
+    let _signature_count = signatures.len();
 
     // Build UnshieldedOffer (EXACT same pattern as diagnostic program)
     let unshielded_offer = UnshieldedOffer::<Signature, DefaultDB> {

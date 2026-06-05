@@ -1286,7 +1286,7 @@ pub extern "C" fn zswap_build_shielded_transaction_with_dust(
 
         // Build and merge dust if dust params provided
         if !dust_state_ptr.is_null() && !dust_seed_ptr.is_null() && !dust_utxos_json.is_null() && dust_seed_len == 32 {
-            use midnight_ledger::dust::{DustActions, DustLocalState as DustState, DustSecretKey, Seed as DustSeed};
+            use midnight_ledger::dust::{DustActions, DustLocalState as DustState, DustSecretKey};
             use midnight_storage::storage::Array as StorageArray;
 
             let dust_state = &*(dust_state_ptr as *const DustState<InMemoryDB>);
