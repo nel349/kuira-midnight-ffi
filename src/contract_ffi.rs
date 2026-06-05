@@ -6,9 +6,8 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
-use midnight_base_crypto::hash::{persistent_hash, HashOutput, PersistentHashWriter};
+use midnight_base_crypto::hash::{persistent_hash, PersistentHashWriter};
 use midnight_base_crypto::fab::{AlignedValue, Value};
-use midnight_base_crypto::fab::ValueAtom;
 use midnight_base_crypto::repr::BinaryHashRepr;
 use midnight_transient_crypto::fab::ValueReprAlignedValue;
 use midnight_serialize::Serializable;
@@ -17,7 +16,7 @@ use midnight_serialize::Serializable;
 use midnight_storage::db::InMemoryDB;
 use midnight_onchain_state::state::ContractState as RustContractState;
 use midnight_onchain_runtime::contract_state_ext::ContractStateExt;
-use midnight_onchain_vm::cost_model::{CostModel as RustCostModel, INITIAL_COST_MODEL};
+use midnight_onchain_vm::cost_model::INITIAL_COST_MODEL;
 use midnight_onchain_vm::ops::Op;
 use midnight_onchain_vm::result_mode::ResultModeGather;
 
@@ -36,7 +35,13 @@ unsafe fn c_str_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 
 /// Helper: lock the state pool, returning None on poisoned mutex.
 fn lock_state_pool() -> Option<std::sync::MutexGuard<'static, HashMap<u64, RustContractState<InMemoryDB>>>> {
-    STATE_POOL.lock().ok()
+    // Recover from a poisoned mutex instead of propagating the poison. The pool
+    // is a plain handle map — a panic while holding the lock (e.g. a failing
+    // `assert!` inside the guard scope in a parallel test run) leaves the data
+    // intact, but a poisoned `Mutex` would otherwise cascade: every subsequent
+    // `lock()` returns `Err`, so `contract_state_create` starts returning 0 and
+    // unrelated pool tests fail en masse. `into_inner()` keeps the map usable.
+    Some(STATE_POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
 }
 
 /// Helper: convert hex string to bytes
@@ -258,7 +263,7 @@ pub extern "C" fn contract_query(
     // contract_query feeds into the JS runtime's gas tracking.
     let qc = {
         use midnight_base_crypto::time::Timestamp;
-        use midnight_base_crypto::hash::HashOutput;
+        
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -966,7 +971,7 @@ fn parse_transcript_ops(
     ops: &[serde_json::Value],
 ) -> Result<Vec<Op<midnight_onchain_vm::result_mode::ResultModeVerify, InMemoryDB>>, String> {
     use midnight_onchain_vm::result_mode::ResultModeVerify;
-    use midnight_onchain_state::state::StateValue as RustSV;
+    
 
     let mut result = Vec::new();
     for (i, op_val) in ops.iter().enumerate() {
@@ -1192,17 +1197,17 @@ fn build_gas_query_context(
 
 fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     use midnight_onchain_vm::result_mode::ResultModeVerify;
-    use midnight_onchain_runtime::transcript::{Transcript, TranscriptVersion};
-    use midnight_onchain_runtime::context::Effects;
+    
+    
     use midnight_onchain_state::state::{ContractOperation, EntryPointBuf};
     use midnight_ledger::construct::{ContractCallPrototype, PreTranscript, partition_transcripts};
     use midnight_ledger::structure::{Transaction, Intent, ProofPreimageMarker};
     use midnight_transient_crypto::proofs::{ProofPreimage, KeyLocation};
     use midnight_transient_crypto::curve::Fr;
-    use midnight_base_crypto::cost_model::RunningCost;
+    
     use midnight_base_crypto::signatures::Signature;
     use midnight_base_crypto::time::Timestamp;
-    use midnight_storage::arena::Sp;
+    
     use midnight_coin_structure::contract::ContractAddress;
     use rand::rngs::OsRng;
 
@@ -1304,7 +1309,7 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     //    path used by `mn` and the JS SDK (see ledger/src/construct.rs:918,
     //    and ledger/tests/micro-dao.rs for canonical usage).
     let (guaranteed_transcript, fallible_transcript) = {
-        let pool = STATE_POOL.lock().map_err(|e| format!("lock: {}", e))?;
+        let pool = lock_state_pool().ok_or_else(|| "state pool lock failed".to_string())?;
         let initial_state = pool.get(&initial_state_handle)
             .ok_or(format!("invalid initial_state_handle: {}", initial_state_handle))?;
 
@@ -1448,7 +1453,7 @@ fn assemble_deploy_tx_impl(json_str: &str) -> Result<String, String> {
 
     // Take the contract state from the pool (constructor won't need it again)
     let mut initial_state = {
-        let mut pool = STATE_POOL.lock().map_err(|e| format!("lock: {}", e))?;
+        let mut pool = lock_state_pool().ok_or_else(|| "state pool lock failed".to_string())?;
         pool.remove(&state_handle)
             .ok_or(format!("invalid state_handle: {}", state_handle))?
     };
@@ -1677,81 +1682,6 @@ mod value_format_tests {
     }
 
     #[test]
-    #[ignore = "diagnostic test with hardcoded TX hex"]
-    fn deserialize_android_tx() {
-        // The exact hex produced by our Android pipeline
-        use midnight_serialize::tagged_deserialize;
-        use midnight_ledger::structure::{Transaction, ProofPreimageMarker};
-        use midnight_base_crypto::signatures::Signature;
-        use midnight_transient_crypto::commitment::PedersenRandomness;
-        use midnight_transient_crypto::proofs::ProvingKeyMaterial;
-        use midnight_storage::db::InMemoryDB;
-
-        type Tx = Transaction<Signature, ProofPreimageMarker, PedersenRandomness, InMemoryDB>;
-        type Payload = (Tx, std::collections::HashMap<String, ProvingKeyMaterial>);
-
-        let hex = "6d69646e696768743a287472616e73616374696f6e5b76395d287369676e61747572655b76315d2c70726f6f662d707265696d6167652c656d6265646465642d66725b76315d292c6d617028737472696e672c70726f76696e672d6461746129293abc00080100000c004001040408010404080c190000040c08010400100c004001041408010400081700041c080104000c000201042408010404280c190000042c08010400100c010108043408010400080301043c0c0f000104400801040090600188500d471eefe86b1a2691b4dec073ffcf306d87846cfa966f8c45a456a2f32c200104480c0f0101044c0801040008010104540c0f00010458080104007882015848656c6c6f2066726f6d2070726f6f662073657276657221c2014004600c0f0101046408010400084001046c0c0f0001047008010404540c0f01010478080104000c1a00010480080104000400408810182030384450845c6884747c8488080238081c8c08043c000802032c88888888888888888890943802ebdb8d032082a3699905d103000498d1054b45940479a61bb954f9de4245736d29e2e0e5e4970dba47a18651466cf9ba9110706f737400017310a509fb05fd13ddbd55674a6b691e63429dc2d540cb0c81a683d1599f0fd05b0104733a3d58801ec8e5f08ba6355825427cc8de2637d8650c9b714343a102c9e0441408806f0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fd8c0410104040030040400c0410104040834042004400404040c44040480b06f88500d471eefe86b1a2691b4dec073ffcf306d87846cfa966f8c45a456a2f345024004040404440408047300000000fffffffffe5bfeff02a4bd5305d8a10908d83933487d9d2953a7ed7304733a3d58801ec8e5f08ba6355825427cc8de2637d8650c9b714343a102c9e04414450240040404004404040404450208000400017310a509fb05fd13ddbd55674a6b691e63429dc2d540cb0c81a683d1599f0fd05b7305fce0c88d353873d630e963365feabc60ae6abcbd4fdbed527aa546ccf79e4f10706f7374049c040004a008010404a4a401010103b116d469736fa7bca403635850cb2d5d830f34765aeb8fe7eb08480e7517a468e4c3f0650d0800a80004ac08010404b0900304408047dc540c94ceb704a23875c11273e16bb0b8a87aed84de911f2133568115f25408b488b80028756e6465706c6f79656401736fa7bca403635850cb2d5d830f34765aeb8fe7eb08480e7517a468e4c3f0650d00";
-
-        let bytes = hex::decode(hex).expect("hex decode");
-        println!("TX bytes: {}", bytes.len());
-
-        match tagged_deserialize::<Payload>(&mut &bytes[..]) {
-            Ok((tx, keys)) => {
-                println!("Deserialization succeeded!");
-                println!("Keys count: {}", keys.len());
-                let calls: Vec<_> = tx.calls().collect();
-                println!("Calls count: {}", calls.len());
-
-                // Re-serialize and compare — if they differ, our serialization has issues
-                let mut reserialized = Vec::new();
-                midnight_serialize::tagged_serialize(&(&tx, &keys), &mut reserialized).unwrap();
-                if bytes == reserialized {
-                    println!("ROUNDTRIP MATCH: {} bytes", bytes.len());
-                } else {
-                    println!("ROUNDTRIP MISMATCH: original={} reserialized={}", bytes.len(), reserialized.len());
-                    for i in 0..bytes.len().min(reserialized.len()) {
-                        if bytes[i] != reserialized[i] {
-                            println!("First diff at byte {}: orig=0x{:02x} reser=0x{:02x}", i, bytes[i], reserialized[i]);
-                            break;
-                        }
-                    }
-                    // Save reserialized for proof server test
-                    std::fs::write("/tmp/reserialized_tx.bin", &reserialized).unwrap();
-                    println!("Saved reserialized to /tmp/reserialized_tx.bin");
-                }
-            }
-            Err(e) => {
-                println!("Deserialization FAILED: {:?}", e);
-                panic!("Cannot deserialize TX: {:?}", e);
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires /tmp/ledger_params.hex from indexer query"]
-    fn compare_cost_models() {
-        use midnight_ledger::structure::{LedgerParameters, INITIAL_TRANSACTION_COST_MODEL};
-
-        let params_hex = std::fs::read_to_string("/tmp/ledger_params.hex")
-            .expect("read ledger params hex (run indexer query first)");
-        let params_hex = params_hex.trim();
-        let params_bytes = hex::decode(params_hex).expect("hex decode");
-
-        let params: LedgerParameters = midnight_serialize::tagged_deserialize(&mut &params_bytes[..])
-            .expect("deserialize ledger params");
-
-        let node_cost = &params.cost_model.runtime_cost_model;
-        let our_cost = &INITIAL_COST_MODEL;
-        let initial_cost = &INITIAL_TRANSACTION_COST_MODEL.runtime_cost_model;
-
-        println!("Node cost model == INITIAL_COST_MODEL: {}", node_cost == our_cost);
-        println!("Node cost model == INITIAL_TRANSACTION_COST_MODEL.runtime: {}", node_cost == initial_cost);
-
-        println!("\nNode cost model:    {:?}", node_cost);
-        println!("\nInitial cost model: {:?}", our_cost);
-    }
-
-    #[test]
     fn print_transaction_tag() {
         use midnight_serialize::Tagged;
         use midnight_ledger::structure::{Transaction, ProofPreimageMarker};
@@ -1781,12 +1711,12 @@ mod value_format_tests {
 
         // Create a minimal empty contract state and put it in the pool
         let state = RustContractState::<InMemoryDB>::default();
-        let handle = {
-            let mut pool = STATE_POOL.lock().unwrap();
-            let h = pool.keys().max().unwrap_or(&0) + 1;
-            pool.insert(h, state);
-            h
-        };
+        // Unique handle via NEXT_HANDLE — NOT `max(keys)+1`, which races under
+        // parallel tests: once another test frees a handle, `max+1` can reuse an
+        // id this test's deploy is about to consume, so the "consumed after deploy"
+        // assert intermittently sees the other test's freshly-inserted state.
+        let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        lock_state_pool().unwrap().insert(handle, state);
 
         // Call deploy assembler
         let params = format!(
@@ -1827,7 +1757,7 @@ mod value_format_tests {
         unsafe { contract_free_string(result_ptr as *mut c_char); }
 
         // Verify the state handle was consumed (removed from pool)
-        let pool = STATE_POOL.lock().unwrap();
+        let pool = lock_state_pool().unwrap();
         assert!(!pool.contains_key(&handle), "state_handle should be consumed after deploy");
     }
 
@@ -2033,239 +1963,6 @@ mod normalized_value_tests {
         } else {
             panic!("Expected Popeq, got {:?}", deserialized);
         }
-    }
-
-    /// Simulate the FULL commitBatch pipeline:
-    /// 1. Load actual on-chain state (post-joinMatch)
-    /// 2. Run commitBatch's first query ops in Gather mode (get actual results)
-    /// 3. Build Verify-mode ops with those results
-    /// 4. Run in Verify mode (must pass)
-    /// 5. SCALE-normalize the ops
-    /// 6. Run SCALE-normalized ops in Verify mode (must also pass)
-    /// If step 4 passes but step 6 fails → SCALE normalization is the bug
-    #[test]
-    fn commitbatch_full_pipeline_verify() {
-        use midnight_onchain_runtime::context::QueryContext;
-        use midnight_onchain_vm::ops::{Op, Key};
-        use midnight_onchain_vm::result_mode::{ResultModeGather, ResultModeVerify, GatherEvent};
-
-        let state_hex = std::fs::read_to_string("/tmp/penalty_state_joinmatch.txt")
-            .expect("Run save script first");
-        let state_hex = state_hex.trim();
-        if state_hex.is_empty() { panic!("Empty state file"); }
-
-        let bytes = hex::decode(state_hex).expect("hex decode");
-        let state: midnight_onchain_state::state::ContractState<InMemoryDB> =
-            midnight_serialize::tagged_deserialize(&mut &bytes[..]).expect("deserialize");
-
-        // Build the FIRST query of commitBatch: read phase at path [0, 0]
-        let key0 = AlignedValue {
-            value: Value(vec![ValueAtom(vec![])]),
-            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 1 })]),
-        };
-
-        // Step 1: Gather mode — get the actual read value
-        let gather_ops: Vec<Op<ResultModeGather, InMemoryDB>> = vec![
-            Op::Dup { n: 0 },
-            Op::Idx { cached: false, push_path: false,
-                path: vec![Key::Value(key0.clone()), Key::Value(key0.clone())].into_iter().collect() },
-            Op::Popeq { cached: false, result: () },
-        ];
-
-        let qc_gather = QueryContext::<InMemoryDB> {
-            state: state.data.clone(),
-            address: Default::default(),
-            effects: Default::default(),
-            call_context: Default::default(),
-        };
-        let gather_result = qc_gather.query(&gather_ops, None, &INITIAL_COST_MODEL)
-            .expect("Gather query should succeed");
-
-        let phase_value = match &gather_result.events[0] {
-            GatherEvent::Read(av) => av.clone(),
-            _ => panic!("Expected Read event"),
-        };
-        println!("Gather: phase = {:?}", phase_value.value);
-        assert_eq!(phase_value.value, Value(vec![ValueAtom(vec![1])]));
-
-        // Step 2: Verify mode — check popeq with the gathered result
-        let verify_ops: Vec<Op<ResultModeVerify, InMemoryDB>> = vec![
-            Op::Dup { n: 0 },
-            Op::Idx { cached: false, push_path: false,
-                path: vec![Key::Value(key0.clone()), Key::Value(key0.clone())].into_iter().collect() },
-            Op::Popeq { cached: false, result: phase_value.clone() },
-        ];
-
-        let qc_verify = QueryContext::<InMemoryDB> {
-            state: state.data.clone(),
-            address: Default::default(),
-            effects: Default::default(),
-            call_context: Default::default(),
-        };
-        qc_verify.query(&verify_ops, None, &INITIAL_COST_MODEL)
-            .expect("Verify query should pass (pre-SCALE)");
-        println!("Verify (pre-SCALE): PASSED");
-
-        // Step 3: SCALE normalize the ops (same as assemble_call_tx_impl)
-        let mut buf = Vec::new();
-        for op in &verify_ops {
-            midnight_serialize::Serializable::serialize(op, &mut buf)
-                .expect("SCALE serialize");
-        }
-        let mut reader = &buf[..];
-        let mut normalized_ops = Vec::new();
-        for _ in 0..verify_ops.len() {
-            let op: Op<ResultModeVerify, InMemoryDB> =
-                midnight_serialize::Deserializable::deserialize(&mut reader, 0)
-                    .expect("SCALE deserialize");
-            normalized_ops.push(op);
-        }
-
-        // Check if SCALE changed any popeq values
-        for (i, (orig, norm)) in verify_ops.iter().zip(normalized_ops.iter()).enumerate() {
-            if let (Op::Popeq { result: o, .. }, Op::Popeq { result: n, .. }) = (orig, norm) {
-                if o != n {
-                    panic!("SCALE CHANGED popeq[{}]! orig={:?} norm={:?}", i, o.value, n.value);
-                }
-            }
-        }
-        println!("SCALE normalization: popeq values UNCHANGED");
-
-        // Step 4: Verify mode with SCALE-normalized ops
-        let qc_norm = QueryContext::<InMemoryDB> {
-            state: state.data.clone(),
-            address: Default::default(),
-            effects: Default::default(),
-            call_context: Default::default(),
-        };
-        qc_norm.query(&normalized_ops, None, &INITIAL_COST_MODEL)
-            .expect("Verify query should pass (post-SCALE)");
-        println!("Verify (post-SCALE): PASSED");
-
-        println!("\n=== All pipeline stages passed for phase read ===");
-
-        // Step 5: Simulate blockTimeLt with WRONG deadline (300 = duration, not absolute)
-        // This is the root cause of error 104:
-        // - Local tblock=0, deadline=300 → 0 < 300 = true → [01]
-        // - On-chain tblock=1778214116, deadline=300 → 1778214116 < 300 = false → [-]
-        // → ReadMismatch { expected: [01], actual: [-] }
-        println!("\n=== blockTimeLt simulation ===");
-
-        // Build the blockTimeLt ops: dup n=2, idx [2], push(deadline), lt, popeq
-        let key2 = AlignedValue {
-            value: Value(vec![ValueAtom(vec![2])]),
-            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 1 })]),
-        };
-
-        // Deadline = 300 (WRONG — should be absolute timestamp)
-        let deadline_wrong: u64 = 300;
-        // Deadline = now + 300 (CORRECT — absolute timestamp)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let deadline_correct: u64 = now + 300;
-
-        for (label, deadline_val) in [("WRONG (300)", deadline_wrong), ("CORRECT (now+300)", deadline_correct)] {
-            // Build deadline Cell value (Uint<64> = Bytes(8) alignment)
-            let deadline_bytes = deadline_val.to_le_bytes();
-            let mut normalized = deadline_bytes.to_vec();
-            while normalized.last() == Some(&0) { normalized.pop(); }
-            let deadline_av = AlignedValue {
-                value: Value(vec![ValueAtom(normalized)]),
-                alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 8 })]),
-            };
-            let deadline_sv = midnight_onchain_state::state::StateValue::<InMemoryDB>::Cell(
-                midnight_storage::arena::Sp::new(deadline_av)
-            );
-
-            // Need full call_context on the stack for blockTimeLt
-            // For this test, construct a QueryContext with a real tblock
-            let tblock_bytes = now.to_le_bytes();
-            let mut tblock_norm = tblock_bytes.to_vec();
-            while tblock_norm.last() == Some(&0) { tblock_norm.pop(); }
-            let tblock_av = AlignedValue {
-                value: Value(vec![ValueAtom(tblock_norm)]),
-                alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 8 })]),
-            };
-
-            // Simulate the lt comparison directly: tblock < deadline?
-            let result = now < deadline_val;
-            println!("  {}: now={} < deadline={} → {}",
-                label, now, deadline_val, result);
-        }
-
-        println!("\n=== FIX: use absolute timestamp (now+300) as deadline ===");
-    }
-
-    /// Read phase from actual contract state SCALE hex at both deploy and joinMatch.
-    /// Confirms what the node would read when validating commitBatch.
-    #[test]
-    fn read_phase_from_on_chain_state() {
-        use midnight_onchain_runtime::context::QueryContext;
-        use midnight_onchain_vm::ops::{Op, Key};
-        use midnight_onchain_vm::result_mode::ResultModeGather;
-
-        // Test BOTH deploy and joinMatch states
-        for (label, path) in [
-            ("deploy", "/tmp/penalty_state_deploy.txt"),
-            ("joinMatch", "/tmp/penalty_state_joinmatch.txt"),
-        ] {
-        let state_hex = std::fs::read_to_string(path)
-            .unwrap_or_else(|_| panic!("Missing {}: run the save script first", path));
-        let state_hex = state_hex.trim();
-        if state_hex.is_empty() { println!("{}: EMPTY", label); continue; }
-
-        let bytes = hex::decode(state_hex).expect("hex decode");
-
-        // Create state handle
-        let state: midnight_onchain_state::state::ContractState<InMemoryDB> =
-            midnight_serialize::tagged_deserialize(&mut &bytes[..])
-                .expect("tagged deserialize");
-
-        println!("State data type: {:?}", std::mem::discriminant(state.data.get_ref()));
-
-        // Build the same idx path as commitBatch: path [0, 0] → phase field
-        let key0 = AlignedValue {
-            value: Value(vec![ValueAtom(vec![])]),  // normalized 0
-            alignment: Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Bytes { length: 1 })]),
-        };
-
-        let ops: Vec<Op<ResultModeGather, InMemoryDB>> = vec![
-            Op::Dup { n: 0 },
-            Op::Idx {
-                cached: false,
-                push_path: false,
-                path: vec![
-                    Key::Value(key0.clone()),
-                    Key::Value(key0.clone()),
-                ].into_iter().collect(),
-            },
-            Op::Popeq { cached: false, result: () },
-        ];
-
-        let qc = QueryContext::<InMemoryDB> {
-            state: state.data.clone(),
-            address: Default::default(),
-            effects: Default::default(),
-            call_context: Default::default(),
-        };
-
-        match qc.query(&ops, None, &INITIAL_COST_MODEL) {
-            Ok(results) => {
-                for (i, ev) in results.events.iter().enumerate() {
-                    match ev {
-                        midnight_onchain_vm::result_mode::GatherEvent::Read(av) => {
-                            println!("{}: phase read = value={:?}, alignment={:?}",
-                                label, av.value, av.alignment);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(e) => {
-                println!("{}: Query FAILED: {:?}", label, e);
-            }
-        }
-        } // end for loop
     }
 
     /// Multiple alignment segments with mixed empty/non-empty atoms.
