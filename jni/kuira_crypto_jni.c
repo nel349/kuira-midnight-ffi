@@ -99,6 +99,9 @@ extern void free_byte_array(uint8_t* ptr);
 extern size_t dust_utxo_count(const void* state_ptr);
 extern char* dust_get_utxo_at(const void* state_ptr, size_t index);
 
+/* Per-UTXO registration: filter NIGHT UTXOs to those not yet generating dust */
+extern char* dust_filter_unregistered_night(const void* state_ptr, const char* night_utxos_json);
+
 /* Dust event replay (Phase 2D-4) */
 extern void* dust_replay_events(const void* state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* events_hex);
 
@@ -1773,6 +1776,55 @@ Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustGetUtxoAt(
     /* Free native memory */
     free_c_string(utxo_hex);
 
+    return jresult;
+}
+
+/**
+ * Filter NIGHT UTXOs to those not yet generating dust (per-UTXO registration loop).
+ *
+ *       external fun nativeFilterUnregisteredNight(statePtr: Long, nightUtxosJson: String): String?
+ *
+ * @param state_ptr DustLocalState pointer (as long)
+ * @param night_utxos_json JSON array of NIGHT UTXOs [{value,intent_hash,output_no,ctime}]
+ * @return JSON array of the subset not yet generating dust, or NULL on error
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeFilterUnregisteredNight(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr,
+    jstring night_utxos_json
+) {
+    if (state_ptr == 0) {
+        LOGE("nativeFilterUnregisteredNight: state_ptr is 0 (null)");
+        return NULL;
+    }
+    if (night_utxos_json == NULL) {
+        LOGE("nativeFilterUnregisteredNight: night_utxos_json is null");
+        return NULL;
+    }
+
+    const char* json_c = (*env)->GetStringUTFChars(env, night_utxos_json, NULL);
+    if (json_c == NULL) {
+        LOGE("nativeFilterUnregisteredNight: GetStringUTFChars failed");
+        return NULL;
+    }
+
+    void* state = (void*)(uintptr_t)state_ptr;
+    char* result = dust_filter_unregistered_night(state, json_c);
+
+    (*env)->ReleaseStringUTFChars(env, night_utxos_json, json_c);
+
+    if (result == NULL) {
+        LOGD("nativeFilterUnregisteredNight: filter returned null");
+        return NULL;
+    }
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    if (jresult == NULL) {
+        LOGE("nativeFilterUnregisteredNight: NewStringUTF failed");
+    }
+    free_c_string(result);
     return jresult;
 }
 

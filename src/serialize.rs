@@ -395,7 +395,7 @@ struct JsonUtxoOutput {
 /// Simplified UTXO input for dust registration.
 /// Owner and token type are derived internally (owner = night verifying key,
 /// type = NIGHT = all-zero 32 bytes), so only value and UTXO location needed.
-#[derive(Debug, SerdeDeserialize)]
+#[derive(Debug, SerdeDeserialize, Serialize, Clone)]
 struct JsonDustUtxo {
     value: String,        // u128 as string
     intent_hash: String,  // hex-encoded intent hash (32 bytes)
@@ -1261,6 +1261,95 @@ pub extern "C" fn build_dust_registration_transaction(
     }
 }
 
+/// Filter NIGHT UTXOs down to those NOT yet generating dust (i.e. unregistered).
+///
+/// Drives the per-UTXO registration loop: register exactly the UTXOs this returns,
+/// and terminate when it returns empty. A NIGHT UTXO generates dust iff its
+/// `initial_nonce` is the backing-night of some dust UTXO in `dust_state` — the same
+/// value `apply_registration` stamps onto the generated dust output. We compute each
+/// candidate's `UtxoSpend::initial_nonce()` and keep only those absent from the
+/// generating set. All comparison is `InitialNonce`-in-Rust, so there is no
+/// cross-language hex matching (synced DustTokens are placeholders and unreliable).
+///
+/// # Safety
+/// - `dust_state_ptr` must be a valid `DustLocalState` pointer (or null → null return)
+/// - `night_utxos_json` must be a valid C string `[{value,intent_hash,output_no,ctime}]`
+/// - Caller frees the returned string via `free_serialized_transaction`
+#[no_mangle]
+pub extern "C" fn dust_filter_unregistered_night(
+    dust_state_ptr: *const DustLocalState<DefaultDB>,
+    night_utxos_json: *const c_char,
+) -> *mut c_char {
+    if dust_state_ptr.is_null() || night_utxos_json.is_null() {
+        log_error!("[Kuira FFI] dust_filter_unregistered_night: null argument");
+        return std::ptr::null_mut();
+    }
+
+    let json_str = match unsafe { CStr::from_ptr(night_utxos_json).to_str() } {
+        Ok(s) => s,
+        Err(e) => {
+            log_error!("[Kuira FFI] filter: invalid UTF-8 in night utxos: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+    let night_utxos: Vec<JsonDustUtxo> = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            log_error!("[Kuira FFI] filter: bad night utxos json: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let state = unsafe { &*dust_state_ptr };
+    // Generating backing-nights, as raw 32-byte InitialNonce values.
+    let generating: std::collections::HashSet<[u8; 32]> =
+        state.utxos().map(|u| u.backing_night.0.0).collect();
+
+    // Owner is irrelevant to initial_nonce (it hashes only output_no + intent_hash);
+    // a fixed dummy verifying key keeps UtxoSpend construction cheap.
+    let dummy_owner = match midnight_base_crypto::signatures::SigningKey::from_bytes(&[1u8; 32]) {
+        Ok(k) => k.verifying_key(),
+        Err(e) => {
+            log_error!("[Kuira FFI] filter: dummy key derivation failed: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let unregistered: Vec<JsonDustUtxo> = night_utxos
+        .into_iter()
+        .filter(|u| {
+            let ih = match hex::decode(&u.intent_hash) {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            let intent_hash = match IntentHash::deserialize(&mut &ih[..], 32) {
+                Ok(h) => h,
+                Err(_) => return false,
+            };
+            let spend = UtxoSpend {
+                value: 0,
+                owner: dummy_owner.clone(),
+                type_: UnshieldedTokenType(HashOutput([0u8; 32])), // NIGHT
+                intent_hash,
+                output_no: u.output_no,
+            };
+            !generating.contains(&spend.initial_nonce().0 .0)
+        })
+        .collect();
+
+    log_info!(
+        "[Kuira FFI] dust_filter_unregistered_night: {} of {} NIGHT UTXOs not yet generating",
+        unregistered.len(),
+        generating.len() + unregistered.len()
+    );
+
+    let out = serde_json::to_string(&unregistered).unwrap_or_else(|_| "[]".to_string());
+    match CString::new(out) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 fn build_dust_registration_transaction_impl(
     night_private_key: &[u8; 32],
     dust_public_key_hex: &str,
@@ -1311,52 +1400,52 @@ fn build_dust_registration_transaction_impl(
     const GENERATION_DECAY_RATE: u128 = 8_267;
 
     let user_address = UserAddress::from(verifying_key.clone());
-    let mut total_night_value: u128 = 0;
-    let mut total_dust_value: u128 = 0;
-    let mut utxo_inputs: Vec<UtxoSpend> = Vec::new();
 
+    // Include only the SINGLE highest-dust NIGHT UTXO in the registration offer.
+    //
+    // Each unshielded input adds ~7ms of validation `cost_to_dismiss`, and the ledger's
+    // `min_time_to_dismiss` budget is 15ms (small txs are floored there and can't earn
+    // more budget by size). Two inputs already exceed it, so a multi-UTXO offer is
+    // rejected by enforcing nodes (PreProd) as MalformedError::FeeCalculation — RPC
+    // "Custom error: 168". Registration is key-level, so one UTXO suffices: it registers
+    // the night key (every UTXO of that key generates dust afterward), and one mature
+    // UTXO's generationless dust far exceeds the registration fee.
+    //
+    // Per-UTXO generationless dust (= the allow_fee_payment ceiling), from
+    // generationless_fee_availability() in dust.rs: min(dt * value * decay_rate,
+    // value * night_dust_ratio).
+    let mut best: Option<(UtxoSpend, u128, u128)> = None; // (spend, night_value, dust)
     for json_utxo in &json_utxos {
         let value: u128 = json_utxo.value.parse()
             .map_err(|e| format!("Invalid UTXO value '{}': {}", json_utxo.value, e))?;
-
-        // Calculate dust generated by this UTXO since its creation.
-        // Formula from generationless_fee_availability() in dust.rs:1123-1163:
-        //   vfull = value * night_dust_ratio  (max capacity)
-        //   rate  = value * generation_decay_rate  (Specks/second)
-        //   dt    = dust_actions.ctime - utxo.ctime  (seconds elapsed)
-        //   generated = min(dt * rate, vfull)
         let vfull = value.saturating_mul(NIGHT_DUST_RATIO);
         let rate = value.saturating_mul(GENERATION_DECAY_RATE);
         let dt = current_time_secs.saturating_sub(json_utxo.ctime) as u128;
         let generated = u128::min(dt.saturating_mul(rate), vfull);
-        total_dust_value = total_dust_value.saturating_add(generated);
-        total_night_value = total_night_value.checked_add(value)
-            .ok_or_else(|| "UTXO values overflow u128".to_string())?;
 
         let intent_hash_bytes = hex::decode(&json_utxo.intent_hash)
             .map_err(|e| format!("Invalid intent_hash hex: {}", e))?;
         let intent_hash = IntentHash::deserialize(&mut &intent_hash_bytes[..], 32)
             .map_err(|e| format!("Invalid intent hash: {:?}", e))?;
 
-        utxo_inputs.push(UtxoSpend {
+        let spend = UtxoSpend {
             value,
             owner: verifying_key.clone(),
             type_: UnshieldedTokenType(HashOutput([0u8; 32])),  // NIGHT
             intent_hash,
             output_no: json_utxo.output_no,
-        });
+        };
+        if best.as_ref().map_or(true, |(_, _, d)| generated > *d) {
+            best = Some((spend, value, generated));
+        }
     }
 
-    // Sort inputs (required by midnight-ledger verify.rs)
-    utxo_inputs.sort();
-
+    let (selected_spend, total_night_value, allow_fee_payment) = best
+        .ok_or_else(|| "No NIGHT UTXOs available for dust registration".to_string())?;
+    let utxo_inputs: Vec<UtxoSpend> = vec![selected_spend];
     let input_count = utxo_inputs.len();
-    // allow_fee_payment = total dust generated from all NIGHT UTXOs.
-    // Must satisfy: fees <= allow_fee_payment <= dust_in (server-calculated).
-    // We compute the same formula as generationless_fee_availability() in dust.rs.
-    let allow_fee_payment = total_dust_value;
-    log_info!("[Kuira FFI] Dust registration: {} NIGHT UTXOs, total_night={}, allow_fee_payment={}",
-        input_count, total_night_value, allow_fee_payment);
+    log_info!("[Kuira FFI] Dust registration: selected 1 of {} NIGHT UTXOs, night={}, allow_fee_payment={}",
+        json_utxos.len(), total_night_value, allow_fee_payment);
 
     // Single output: consolidate all NIGHT back to same owner
     let utxo_output = UtxoOutput {
@@ -1646,6 +1735,105 @@ mod tests {
         );
 
         eprintln!("All signature verifications passed (dust registration + offer)");
+    }
+
+    /// Regression for PreProd `Custom error: 168` (MalformedError::FeeCalculation /
+    /// OutsideTimeToDismiss): the dust-registration builder must emit a SINGLE-input tx
+    /// regardless of how many NIGHT UTXOs it is handed, so its cost-to-dismiss stays under
+    /// the ledger's enforced budget. Before the per-UTXO fix an all-UTXOs registration
+    /// exceeded the budget and the node rejected it. Dust registration carries no ZK
+    /// proofs, so the unproven tx's cost == what the node computes on the proven tx.
+    #[test]
+    fn dust_registration_is_single_input_under_budget() {
+        use midnight_ledger::dust::{DustSecretKey, DustPublicKey, Seed};
+        use midnight_ledger::structure::INITIAL_PARAMETERS;
+        use midnight_serialize::Serializable;
+
+        let night_private_key: [u8; 32] = [42u8; 32];
+
+        let seed: Seed = [7u8; 32];
+        let dust_sk = DustSecretKey::derive_secret_key(&seed);
+        let dust_pk = DustPublicKey::from(dust_sk);
+        let mut pk_bytes = Vec::new();
+        dust_pk.serialize(&mut pk_bytes).unwrap();
+        let dust_pk_hex = hex::encode(&pk_bytes);
+
+        let ttl_millis = 1737658800000u64;
+        let current_time_millis = 1737658700000i64;
+        let current_time_secs = (current_time_millis / 1000) as u64;
+        // 2 weeks old → past full dust capacity (saturated), matching the PreProd case
+        let utxo_ctime = current_time_secs - (2 * 604800);
+
+        // 2 NIGHT UTXOs totalling 6_000_000_000 — mirrors the failing logcat
+        let utxos_json = format!(
+            r#"[{{"value":"3000000000","intent_hash":"ab6642ef7dd8420c4673a56c57da96adeeedfc5a98140c8a42500b8369464fed","output_no":0,"ctime":{c}}},{{"value":"3000000000","intent_hash":"cd6642ef7dd8420c4673a56c57da96adeeedfc5a98140c8a42500b8369464fed","output_no":1,"ctime":{c}}}]"#,
+            c = utxo_ctime
+        );
+
+        let hex = build_dust_registration_transaction_impl(
+            &night_private_key,
+            &dust_pk_hex,
+            "0",
+            ttl_millis,
+            current_time_millis,
+            utxos_json.as_str(),
+            "undeployed",
+        )
+        .expect("build should succeed");
+
+        let tx_bytes = hex::decode(&hex).unwrap();
+        let (tx, _proof_data): (
+            Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>,
+            std::collections::HashMap<String, ProvingKeyMaterial>,
+        ) = tagged_deserialize(&tx_bytes[..]).expect("deserialize");
+
+        // Post-fix invariant: the builder selects a single NIGHT UTXO, so the tx is
+        // single-input and clears the ledger's enforced time-to-dismiss budget — the
+        // OutsideTimeToDismiss / FeeCalculation that the node surfaced as Custom error 168.
+        let intent = tx
+            .intents()
+            .find(|(seg, _)| *seg == 1)
+            .expect("segment 1")
+            .1;
+        let offer = intent
+            .guaranteed_unshielded_offer
+            .as_ref()
+            .expect("offer");
+        assert_eq!(offer.inputs.len(), 1, "2-UTXO registration must be single-input");
+        assert!(
+            tx.cost(&INITIAL_PARAMETERS, true).is_ok(),
+            "single-input registration must clear cost(enforce_ttd) — was Custom error 168"
+        );
+
+        // The invariant holds however many NIGHT UTXOs the builder is handed: still one
+        // input, still under budget (an all-UTXOs registration is what tripped 168).
+        for n in 1..=6usize {
+            let utxos: String = {
+                let items: Vec<String> = (0..n)
+                    .map(|i| format!(
+                        r#"{{"value":"3000000000","intent_hash":"{:02x}6642ef7dd8420c4673a56c57da96adeeedfc5a98140c8a42500b8369464fed","output_no":{},"ctime":{}}}"#,
+                        0xa0 + i, i, utxo_ctime
+                    ))
+                    .collect();
+                format!("[{}]", items.join(","))
+            };
+            let hx = build_dust_registration_transaction_impl(
+                &night_private_key, &dust_pk_hex, "0", ttl_millis, current_time_millis,
+                utxos.as_str(), "undeployed",
+            ).expect("build");
+            let b = hex::decode(&hx).unwrap();
+            let (t, _): (
+                Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>,
+                std::collections::HashMap<String, ProvingKeyMaterial>,
+            ) = tagged_deserialize(&b[..]).unwrap();
+            let inputs = t.intents().find(|(s, _)| *s == 1).unwrap().1
+                .guaranteed_unshielded_offer.as_ref().unwrap().inputs.len();
+            assert_eq!(inputs, 1, "registration from {n} NIGHT UTXOs must be single-input");
+            assert!(
+                t.cost(&INITIAL_PARAMETERS, true).is_ok(),
+                "{n}-UTXO registration must clear cost(enforce_ttd)"
+            );
+        }
     }
 
     /// Test that mirrors midnight-ledger/ledger/tests/dust.rs `test_registration_dust_payment`.
