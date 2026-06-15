@@ -1018,6 +1018,15 @@ fn build_intent_and_get_signature_data(
         });
     }
 
+    // CRITICAL: sort inputs/outputs into the ledger's canonical order (UtxoSpend/UtxoOutput
+    // derive Ord) BEFORE computing data_to_sign — the serialize paths
+    // (build_and_serialize_intent[_with_dust]) sort identically, and the ledger requires a
+    // sorted offer (verify.rs InputsNotSorted/OutputsNotSorted). If we sign the caller's
+    // (e.g. largest-first) order while the submitted tx is sorted, data_to_sign won't match
+    // and the node rejects with IntentSignatureVerificationFailure (custom error 175).
+    inputs.sort();
+    outputs.sort();
+
     // Build UnshieldedOffer WITHOUT signatures (we're generating the data to sign)
     let unshielded_offer = UnshieldedOffer::<Signature, DefaultDB> {
         inputs: inputs.into_iter().collect(),
