@@ -1028,14 +1028,15 @@ fn build_intent_and_get_signature_data(
     // Build Intent (WITH signatures initially, will be erased)
     // Use provided binding_commitment or generate a random one
     let binding_randomness: PedersenRandomness = if let Some(ref hex) = binding_randomness_hex {
-        // Deserialize binding_commitment from hex
         let commitment_bytes = hex::decode(hex)
             .map_err(|e| format!("Invalid binding_commitment hex: {}", e))?;
-        // Deserialize directly as PedersenRandomness
-        // NOTE: When deserializing from Pedersen bytes, we lose the randomness property
-        // but this is OK since we're reusing a commitment that was already randomly generated
-        <PedersenRandomness as Deserializable>::deserialize(&mut &commitment_bytes[..], 32)
-            .map_err(|e| format!("Invalid PedersenRandomness: {:?}", e))?
+        // CRITICAL: reconstruct from the RAW 32-byte field element via from_le_bytes — the
+        // exact inverse of the `.0.to_bytes()` we return below. SCALE `Deserializable`
+        // expects a compact length prefix and does NOT round-trip these raw scalar bytes
+        // (it yields a DIFFERENT scalar), which silently breaks multi-input signing: every
+        // input must sign the SAME binding. Mirrors build_and_serialize_intent's reuse path.
+        EmbeddedFr::from_le_bytes(&commitment_bytes)
+            .ok_or_else(|| "Failed to parse binding_randomness as EmbeddedFr".to_string())?
     } else {
         // Generate random binding_commitment as per midnight-ledger construct.rs:172
         let mut rng = rand::thread_rng();

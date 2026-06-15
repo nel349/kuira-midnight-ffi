@@ -1026,7 +1026,8 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeGetSignin
     jstring inputs_json,
     jstring outputs_json,
     jint input_index,
-    jlong ttl)
+    jlong ttl,
+    jstring binding_commitment_hex)
 {
     /* Validate inputs */
     if (inputs_json == NULL || outputs_json == NULL) {
@@ -1058,20 +1059,39 @@ Java_com_midnight_kuira_core_ledger_api_FfiTransactionSerializer_nativeGetSignin
         return NULL;
     }
 
+    /* Optional binding commitment. A multi-input transaction must sign ONE
+     * shared binding: the caller passes NULL for the first input (Rust samples a
+     * fresh binding and returns it), then passes that same hex back for every
+     * remaining input so all signatures cover the same commitment. */
+    const char* binding_c = NULL;
+    if (binding_commitment_hex != NULL) {
+        binding_c = (*env)->GetStringUTFChars(env, binding_commitment_hex, NULL);
+        if (binding_c == NULL) {
+            LOGE("nativeGetSigningMessageForInput: GetStringUTFChars failed for binding");
+            (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
+            (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+            return NULL;
+        }
+    }
+
     LOGI("Getting signing message for input %d", input_index);
 
-    /* Call Rust FFI to generate signing message (pass NULL to generate random binding_commitment) */
+    /* Call Rust FFI. binding_c == NULL → Rust generates a fresh binding_commitment
+     * and returns it; non-NULL → Rust reuses the supplied one. */
     char* json_response = get_signing_message_for_input(
         inputs_c,
         outputs_c,
         (uint32_t)input_index,
         (uint64_t)ttl,
-        NULL  /* Generate random binding_commitment */
+        binding_c
     );
 
     /* Release Java string buffers */
     (*env)->ReleaseStringUTFChars(env, inputs_json, inputs_c);
     (*env)->ReleaseStringUTFChars(env, outputs_json, outputs_c);
+    if (binding_c != NULL) {
+        (*env)->ReleaseStringUTFChars(env, binding_commitment_hex, binding_c);
+    }
 
     if (json_response == NULL) {
         LOGE("nativeGetSigningMessageForInput: Rust FFI returned null");
