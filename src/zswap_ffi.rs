@@ -220,6 +220,151 @@ pub extern "C" fn zswap_replay_events(
     }
 }
 
+/// Replay `events` onto `base` in `chunk_size` batches, chaining the evolving
+/// state across chunks.
+///
+/// This is the single chunking primitive shared by [`zswap_replay_events_from_file`]
+/// (chunk_size = 500) and the equivalence test (small chunk_size, real events),
+/// so "what the device runs" and "what the test verifies" are the same code.
+///
+/// Chunked replay is the dust side's proven pattern: replaying N events as
+/// `ceil(N / chunk_size)` calls produces the same coin set as a single call,
+/// while bounding the peak work per call. `chunk_size` is clamped to >= 1.
+fn replay_zswap_events_chunked(
+    base: &ZswapState<InMemoryDB>,
+    keys: &SecretKeys,
+    events: &[Event<InMemoryDB>],
+    chunk_size: usize,
+) -> Result<ZswapState<InMemoryDB>, String> {
+    let mut state = base.clone();
+    for chunk in events.chunks(chunk_size.max(1)) {
+        state = state
+            .replay_events(keys, chunk.iter())
+            .map_err(|e| format!("zswap chunk replay failed: {:?}", e))?;
+    }
+    Ok(state)
+}
+
+/// Replays zswap events from a file in 500-event chunks, discovering shielded coins.
+///
+/// Mirrors [`dust_replay_events_from_file`](crate::dust_ffi). The cold/full shielded
+/// sync at PREPROD scale must NOT materialize the whole event log as one giant hex
+/// String — that JVM allocation storm triggers GC pauses that freeze the UI thread
+/// (the send-screen / wallet-pill animations). The caller streams events to a file
+/// (one tagged-serialized event hex per line — the form `ShieldedRepository` writes),
+/// and this reads them back, holding only the parsed events plus one chunk at a time.
+///
+/// Each line is parsed with `tagged_deserialize`, which reads the event tag rather
+/// than string-splitting on the `midnight:event[v9]:` prefix — robust to that prefix
+/// appearing inside an event's SCALE binary body (the false-split hazard the in-memory
+/// [`zswap_replay_events`] path carries).
+///
+/// # Parameters
+/// - `state_ptr`: base state replayed on top of (not consumed — a NEW state is returned)
+/// - `seed_ptr` / `seed_len`: 32-byte zswap seed
+/// - `file_path`: null-terminated path to the hex events file (one event per line)
+///
+/// # Returns
+/// New state pointer on success, null on failure. Caller frees with `free_zswap_local_state`.
+///
+/// # Safety
+/// - `state_ptr` must be a valid ZswapLocalState pointer
+/// - `seed_ptr` must point to 32 valid bytes
+/// - `file_path` must be a valid null-terminated C string path to a readable file
+#[no_mangle]
+pub extern "C" fn zswap_replay_events_from_file(
+    state_ptr: *const ZswapState<InMemoryDB>,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    file_path: *const c_char,
+) -> *mut ZswapState<InMemoryDB> {
+    if state_ptr.is_null() || seed_ptr.is_null() || file_path.is_null() {
+        android_log!(ANDROID_LOG_ERROR, TAG, "Null pointer in zswap_replay_events_from_file");
+        return ptr::null_mut();
+    }
+    if seed_len != 32 {
+        android_log!(ANDROID_LOG_ERROR, TAG, "Seed must be 32 bytes, got {}", seed_len);
+        return ptr::null_mut();
+    }
+
+    unsafe {
+        let seed_slice = std::slice::from_raw_parts(seed_ptr, seed_len);
+        let mut seed_array = [0u8; 32];
+        seed_array.copy_from_slice(seed_slice);
+        let secret_keys = SecretKeys::from(Seed::from(seed_array));
+        seed_array.fill(0); // wipe local copy of seed material
+
+        let path_str = match std::ffi::CStr::from_ptr(file_path).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                android_log!(ANDROID_LOG_ERROR, TAG, "Invalid UTF-8 in file path: {}", e);
+                return ptr::null_mut();
+            }
+        };
+
+        use std::io::BufRead;
+        let file = match std::fs::File::open(path_str) {
+            Ok(f) => f,
+            Err(e) => {
+                android_log!(ANDROID_LOG_ERROR, TAG, "Failed to open zswap events file: {}", e);
+                return ptr::null_mut();
+            }
+        };
+        let reader = std::io::BufReader::new(file);
+
+        // Parse the file line-by-line into events. Replacing the JVM-side giant
+        // concatenated String with a file read is what removes the GC-storm freeze;
+        // the replay itself then runs in chunks below.
+        let mut events: Vec<Event<InMemoryDB>> = Vec::new();
+        for (i, line_res) in reader.lines().enumerate() {
+            let line = match line_res {
+                Ok(l) => l,
+                Err(e) => {
+                    android_log!(ANDROID_LOG_ERROR, TAG, "Error reading zswap events file at line {}: {}", i, e);
+                    return ptr::null_mut();
+                }
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let event_bytes = match hex::decode(trimmed) {
+                Ok(b) => b,
+                Err(e) => {
+                    android_log!(ANDROID_LOG_ERROR, TAG, "Error decoding zswap event {} hex: {}", i, e);
+                    return ptr::null_mut();
+                }
+            };
+            let event: Event<InMemoryDB> = match midnight_serialize::tagged_deserialize(&event_bytes[..]) {
+                Ok(e) => e,
+                Err(e) => {
+                    android_log!(ANDROID_LOG_ERROR, TAG, "Error deserializing zswap event {}: {}", i, e);
+                    return ptr::null_mut();
+                }
+            };
+            events.push(event);
+        }
+
+        const CHUNK_SIZE: usize = 500;
+        let base = &*state_ptr;
+        let new_state = match replay_zswap_events_chunked(base, &secret_keys, &events, CHUNK_SIZE) {
+            Ok(s) => s,
+            Err(e) => {
+                android_log!(ANDROID_LOG_ERROR, TAG, "Error replaying zswap events: {}", e);
+                return ptr::null_mut();
+            }
+        };
+
+        let coin_count = new_state.coins.iter().count();
+        android_log!(
+            ANDROID_LOG_INFO, TAG,
+            "Replay-from-file complete: {} events in {}-event chunks, {} coins",
+            events.len(), CHUNK_SIZE, coin_count
+        );
+        Box::into_raw(Box::new(new_state))
+    }
+}
+
 // ── Balance Queries ──
 
 /// Returns shielded balances as JSON: {"token_type_hex": "balance_string", ...}
@@ -1496,6 +1641,170 @@ mod tests {
 
         free_zswap_local_state(new_state);
         free_zswap_local_state(state);
+    }
+
+    /// Empty file → returns a clone of the base (coin count unchanged), mirroring
+    /// `zswap_replay_events("")`. Guards the no-events edge of the streaming path.
+    #[test]
+    fn test_zswap_replay_from_file_empty() {
+        let base = create_zswap_local_state();
+        let file = std::env::temp_dir().join("zswap_empty_events_test.hex");
+        std::fs::write(&file, b"").unwrap();
+
+        let seed = [3u8; 32];
+        let path_c = CString::new(file.to_str().unwrap()).unwrap();
+        let new_state = zswap_replay_events_from_file(base, seed.as_ptr(), 32, path_c.as_ptr());
+
+        assert!(!new_state.is_null(), "empty file must return a state");
+        assert_eq!(zswap_get_coin_count(new_state), 0);
+
+        free_zswap_local_state(base);
+        free_zswap_local_state(new_state);
+        std::fs::remove_file(&file).ok();
+    }
+
+    /// CRITICAL (#290): chunked replay must produce the SAME shielded state as single-pass.
+    ///
+    /// The cold PreProd shielded sync moved from one giant single-pass `replay_events`
+    /// call to a streamed, 500-event-chunked file replay (to kill the GC-storm UI freeze).
+    /// This proves the change is behavior-preserving: mint real shielded coins to a
+    /// seed-derived wallet, capture the ledger events, then assert
+    ///   single-pass (reference)  ==  chunked helper  ==  the FFI file path
+    /// at the serialized-state level — with a small chunk size so chunk boundaries are
+    /// actually crossed. (The dust side verified the same property on-device vs WASM.)
+    #[test]
+    fn test_zswap_chunked_and_file_replay_match_single_pass() {
+        use midnight_ledger::test_utilities::TestState;
+        use midnight_ledger::verify::WellFormedStrictness;
+        use midnight_zswap::Delta;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        fn serialize_zswap(state: &ZswapState<InMemoryDB>) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            midnight_serialize::Serializable::serialize(state, &mut bytes).expect("serialize");
+            bytes
+        }
+
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let mut ts = TestState::<InMemoryDB>::new(&mut rng);
+
+        // Wallet keys derived the SAME way the FFI does (seed → SecretKeys), so the
+        // seed handed to the file path discovers the coins minted below.
+        let seed = [7u8; 32];
+        let keys = SecretKeys::from(Seed::from(seed));
+
+        // Mint several shielded coins to our keys, capturing the ledger events. >chunk_size
+        // events ensures the chunk boundary is crossed in the assertions below.
+        // WellFormedStrictness is #[non_exhaustive] (defined in midnight_ledger) so it
+        // can't be built with a struct literal from this crate — default + set the field.
+        let mut strictness = WellFormedStrictness::default();
+        strictness.enforce_balancing = false;
+        let mut events: Vec<Event<InMemoryDB>> = Vec::new();
+        for i in 0..5u128 {
+            let token: ShieldedTokenType = rng.r#gen();
+            let amount = 1_000u128 + i;
+            let coin = CoinInfo {
+                nonce: rng.r#gen(),
+                value: amount,
+                type_: token,
+            };
+            let output = Output::<_, InMemoryDB>::new(
+                &mut rng,
+                &coin,
+                Some(0u16),
+                &keys.coin_public_key(),
+                Some(keys.enc_public_key()),
+            )
+            .expect("output creation");
+            let offer = Offer {
+                inputs: vec![].into(),
+                outputs: vec![output].into(),
+                transient: vec![].into(),
+                deltas: vec![Delta {
+                    token_type: token,
+                    value: -(amount as i128),
+                }]
+                .into(),
+            };
+            let tx = Transaction::<(), _, _, InMemoryDB>::new(
+                "local-test",
+                StorageHashMap::new(),
+                Some(offer),
+                StorageHashMap::new(),
+            );
+            let result = ts.apply(&tx, strictness).expect("apply reward tx");
+            events.extend(result.events().iter().cloned());
+        }
+        assert!(!events.is_empty(), "minting must produce events");
+
+        // Reference: single-pass replay (the historical shielded path).
+        let single = ZswapState::<InMemoryDB>::new()
+            .replay_events(&keys, events.iter())
+            .expect("single-pass replay");
+        let single_coins = single.coins.iter().count();
+        assert!(single_coins > 0, "wallet must discover its own minted coins");
+
+        // Chunked helper with a deliberately small chunk size → crosses boundaries.
+        let chunked = replay_zswap_events_chunked(&ZswapState::new(), &keys, &events, 2)
+            .expect("chunked replay");
+        assert_eq!(
+            serialize_zswap(&single),
+            serialize_zswap(&chunked),
+            "chunked replay must equal single-pass byte-for-byte",
+        );
+
+        // FFI file path: write one tagged-serialized event hex per line (the form
+        // ShieldedRepository writes), then replay from the file (chunks by 500 internally).
+        let file = std::env::temp_dir().join("zswap_chunk_equiv_test.hex");
+        {
+            use std::io::Write;
+            let mut w = std::fs::File::create(&file).unwrap();
+            for ev in &events {
+                let mut bytes = Vec::new();
+                midnight_serialize::tagged_serialize(ev, &mut bytes).expect("tagged_serialize");
+                writeln!(w, "{}", hex::encode(&bytes)).unwrap();
+            }
+        }
+        let base = create_zswap_local_state();
+        let path_c = CString::new(file.to_str().unwrap()).unwrap();
+        let from_file = zswap_replay_events_from_file(base, seed.as_ptr(), 32, path_c.as_ptr());
+        assert!(!from_file.is_null(), "file replay must succeed");
+        let from_file_state = unsafe { &*from_file };
+        assert_eq!(
+            serialize_zswap(&single),
+            serialize_zswap(from_file_state),
+            "file (tagged-parse + chunked) replay must equal single-pass byte-for-byte",
+        );
+
+        // Parity with the LEGACY in-memory FFI path (concatenated hex → split-by-prefix →
+        // v0 deserialize → single replay_events). This is the exact path the instrumented
+        // `genesisSerialize()` uses, so proving it here on host guarantees the on-device
+        // `fullSyncFromGenesisWritesACheckpoint` comparison (file path == genesis replay) holds.
+        let concatenated: String = events
+            .iter()
+            .map(|ev| {
+                let mut bytes = Vec::new();
+                midnight_serialize::tagged_serialize(ev, &mut bytes).expect("tagged_serialize");
+                hex::encode(&bytes)
+            })
+            .collect();
+        let in_mem_base = create_zswap_local_state();
+        let concat_c = CString::new(concatenated).unwrap();
+        let in_mem = zswap_replay_events(in_mem_base, seed.as_ptr(), 32, concat_c.as_ptr());
+        assert!(!in_mem.is_null(), "in-memory replay must succeed");
+        let in_mem_state = unsafe { &*in_mem };
+        assert_eq!(
+            serialize_zswap(&single),
+            serialize_zswap(in_mem_state),
+            "legacy in-memory (split+v0) must equal single-pass — guards the instrumented genesis comparison",
+        );
+
+        free_zswap_local_state(base);
+        free_zswap_local_state(from_file);
+        free_zswap_local_state(in_mem_base);
+        free_zswap_local_state(in_mem);
+        std::fs::remove_file(&file).ok();
     }
 
     #[test]

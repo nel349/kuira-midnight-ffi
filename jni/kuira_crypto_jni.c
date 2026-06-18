@@ -2455,6 +2455,46 @@ Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeReplayEvents(
     return (jlong)(intptr_t)new_state;
 }
 
+extern void* zswap_replay_events_from_file(const void* state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* file_path);
+
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeReplayEventsFromFile(
+    JNIEnv* env, jobject obj, jlong statePtr, jbyteArray seed, jstring filePath) {
+    if (statePtr == 0 || seed == NULL || filePath == NULL) {
+        LOGE("nativeZswapReplayEventsFromFile: null parameter");
+        return 0;
+    }
+
+    jsize seed_len = (*env)->GetArrayLength(env, seed);
+    if (seed_len != 32) {
+        LOGE("nativeZswapReplayEventsFromFile: seed must be 32 bytes, got %d", seed_len);
+        return 0;
+    }
+
+    jbyte* seed_buf = (*env)->GetByteArrayElements(env, seed, NULL);
+    if (seed_buf == NULL) return 0;
+
+    const char* path_c = (*env)->GetStringUTFChars(env, filePath, NULL);
+    if (path_c == NULL) {
+        (*env)->ReleaseByteArrayElements(env, seed, seed_buf, JNI_ABORT);
+        return 0;
+    }
+
+    void* new_state = zswap_replay_events_from_file(
+        (void*)(intptr_t)statePtr,
+        (const uint8_t*)seed_buf,
+        32,
+        path_c
+    );
+
+    (*env)->ReleaseStringUTFChars(env, filePath, path_c);
+    /* Securely wipe seed from JNI buffer without copying back to Java array */
+    memset(seed_buf, 0, seed_len);
+    (*env)->ReleaseByteArrayElements(env, seed, seed_buf, JNI_ABORT);
+
+    return (jlong)(intptr_t)new_state;
+}
+
 JNIEXPORT jstring JNICALL
 Java_com_midnight_kuira_core_crypto_shielded_ZswapLocalState_nativeGetBalances(
     JNIEnv* env, jobject obj, jlong statePtr) {
