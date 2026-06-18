@@ -342,6 +342,27 @@ pub extern "C" fn dust_generation_root(state_ptr: *const DustState) -> *mut c_ch
     }
 }
 
+/// Returns the dust state's `sync_time` — the block time it has replayed up to — in
+/// milliseconds since epoch, or -1 if the pointer is null.
+///
+/// A dust spend's `ctime` MUST anchor to THIS, not the chain tip. The node validates a
+/// spend via `dust.root_history.get(ctime)` (predecessor lookup by block time), so
+/// anchoring to our own synced block guarantees the looked-up root equals our local
+/// commitment root — regardless of how far the indexer/node tip has advanced past us.
+/// Anchoring to the tip instead is what produced the intermittent error 170 (#287).
+///
+/// # Safety
+///
+/// - `state_ptr` must be a valid DustLocalState pointer
+#[no_mangle]
+pub extern "C" fn dust_sync_time(state_ptr: *const DustState) -> i64 {
+    if state_ptr.is_null() {
+        return -1;
+    }
+    // Timestamp is second-precision; ctime is carried as millis across the FFI.
+    unsafe { ((*state_ptr).sync_time.to_secs() as i64).saturating_mul(1000) }
+}
+
 /// Frees a DustLocalState pointer.
 ///
 /// # Safety

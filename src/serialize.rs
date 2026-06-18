@@ -163,8 +163,15 @@ pub extern "C" fn serialize_unshielded_transaction_with_dust(
     // Derive DustSecretKey from seed
     let dust_secret_key = DustSecretKey::derive_secret_key(&seed_array);
 
-    // Get DustLocalState reference
-    let dust_state = unsafe { &*dust_state_ptr };
+    // Get DustLocalState, re-keyed under the CURRENT nullifier encoding.
+    //
+    // #286: a persisted checkpoint can carry `dust_utxos` keyed by an OLDER dust
+    // nullifier encoding (e.g. across an SDK upgrade); a delta resume never re-keys
+    // the existing entries, so `spend()`'s `dust_utxos.get(utxo.nullifier(sk))`
+    // misses and wrongly reports `DustUtxoNotTracked` even though the UTXO is
+    // present. Re-deriving each key from its stored value + the current secret key
+    // repairs that; it is idempotent (a no-op when the keys are already current).
+    let dust_state = unsafe { &*dust_state_ptr }.rekey_dust_utxos(&dust_secret_key);
 
     // Parse dust UTXO selections
     #[derive(SerdeDeserialize)]

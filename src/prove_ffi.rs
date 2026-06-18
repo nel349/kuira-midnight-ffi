@@ -54,6 +54,39 @@ macro_rules! prove_log {
 const LOG_INFO: std::os::raw::c_int = 4;
 const LOG_ERROR: std::os::raw::c_int = 6;
 
+/// Cap rayon's global thread pool to leave one CPU core for the UI thread (#288).
+///
+/// Local proving is rayon-parallel and otherwise spans every core, starving the
+/// app's Main thread for the ~1s it runs — the sending-screen animation freezes
+/// until proving finishes. Reserving a core keeps the UI responsive at the cost of
+/// one proving thread. Idempotent and must run before the first rayon use: a
+/// [`Once`](std::sync::Once) runs it once at the first proving call, and
+/// `build_global` is a no-op-with-error if the pool already exists (logged, never
+/// fatal).
+pub(crate) fn init_proving_thread_pool() {
+    use std::sync::Once;
+    static RAYON_INIT: Once = Once::new();
+    RAYON_INIT.call_once(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let threads = cores.saturating_sub(1).max(1);
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+        {
+            Ok(()) => prove_log!(
+                LOG_INFO,
+                "rayon pool capped to {threads}/{cores} threads (UI headroom)"
+            ),
+            Err(e) => prove_log!(
+                LOG_ERROR,
+                "rayon pool already initialized ({e}); proving may use all cores"
+            ),
+        }
+    });
+}
+
 // ── Local File Resolver ──
 
 /// Resolves proving keys from local filesystem + transaction-specific HashMap.
@@ -168,6 +201,9 @@ pub extern "C" fn zkir_prove_transaction_local(
         prove_log!(LOG_ERROR, "Null pointer in zkir_prove_transaction_local");
         return ptr::null();
     }
+
+    // #288: cap rayon to leave a core for the UI before proving spins up all cores.
+    init_proving_thread_pool();
 
     // SAFETY: Pointers validated non-null above. JNI-provided C strings.
     unsafe {

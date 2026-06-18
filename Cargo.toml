@@ -26,6 +26,11 @@ midnight-onchain-state = { path = "./midnight-ledger/onchain-state" }
 midnight-zkir = { path = "./midnight-ledger/zkir" }
 tokio = { version = "1", features = ["rt"] }
 
+# Proving parallelism (already in the dependency tree transitively via the proving
+# crates). Declared directly so the FFI can cap the global pool and leave a CPU core
+# for the UI thread during local proving (#288).
+rayon = "1.11"
+
 # For state handle pool
 once_cell = "1.19"
 

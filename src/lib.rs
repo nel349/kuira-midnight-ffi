@@ -28,10 +28,17 @@ fn init_logging() {
     // No-op on non-Android platforms
 }
 
-/// Initialize the library (called from JNI_OnLoad)
+/// Initialize the library. Called from the JNI glue's `JNI_OnLoad`
+/// (`jni/kuira_crypto_jni.c`) the moment `System.loadLibrary("kuira_crypto_ffi")`
+/// loads the `.so`, before any native method runs.
 #[no_mangle]
 pub extern "C" fn kuira_crypto_init() {
     init_logging();
+    // #288: cap rayon's global pool to leave a CPU core for the UI thread, so local
+    // proving doesn't freeze the foreground animation. Done at load time because the
+    // ledger (not just proving) uses rayon — `build_global` must run before the first
+    // rayon use anywhere.
+    prove_ffi::init_proving_thread_pool();
 }
 
 // Transaction signing FFI

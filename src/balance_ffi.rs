@@ -129,6 +129,9 @@ pub extern "C" fn balance_proven_transaction(
         return ptr::null_mut();
     }
 
+    // #288: cap rayon to leave a core for the UI before proving spins up all cores.
+    crate::prove_ffi::init_proving_thread_pool();
+
     // Convert C strings to Rust
     // SAFETY: All pointers validated non-null above. JNI guarantees valid C strings.
     let proven_hex = match unsafe { CStr::from_ptr(proven_tx_hex).to_str() } {

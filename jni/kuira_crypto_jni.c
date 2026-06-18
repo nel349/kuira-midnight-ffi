@@ -90,6 +90,7 @@ extern void* create_dust_local_state(void);
 extern char* dust_wallet_balance(const void* state_ptr, int64_t time_millis);
 extern char* dust_commitment_root(const void* state_ptr);
 extern char* dust_generation_root(const void* state_ptr);
+extern int64_t dust_sync_time(const void* state_ptr);
 extern uint8_t* serialize_dust_state(const void* state_ptr);
 extern void* deserialize_dust_state(const uint8_t* data_ptr, size_t data_len);
 extern void free_dust_local_state(void* ptr);
@@ -1442,6 +1443,28 @@ Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustCommitmentRoot
     }
     free_c_string(root_str);
     return jresult;
+}
+
+/**
+ * Returns the dust state's sync_time (block time it has replayed up to) in
+ * milliseconds, or -1 if the pointer is null.
+ *
+ *   external fun nativeDustSyncTime(statePtr: Long): Long
+ */
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_crypto_dust_DustLocalState_nativeDustSyncTime(
+    JNIEnv* env,
+    jobject obj,
+    jlong state_ptr
+) {
+    (void)env;
+    (void)obj;
+    if (state_ptr == 0) {
+        LOGE("nativeDustSyncTime: state_ptr is 0 (null)");
+        return -1;
+    }
+    void* state = (void*)(uintptr_t)state_ptr;
+    return (jlong)dust_sync_time(state);
 }
 
 /**
