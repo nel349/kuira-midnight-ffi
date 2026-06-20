@@ -155,6 +155,7 @@ extern const char* contract_value_to_big_int(const char* value_json);
 extern void contract_free_string(char* ptr);
 extern const char* contract_assemble_call_tx(const char* params_json);
 extern const char* contract_assemble_deploy_tx(const char* params_json);
+extern int64_t ledger_params_global_ttl_secs(const char* params_hex);
 extern uint64_t contract_state_clone(uint64_t handle);
 
 /* Transaction signing (Phase 2D-FFI) */
@@ -189,7 +190,7 @@ extern char* calculate_transaction_fee(const char* tx_hex, const char* params_he
 extern char* build_dust_registration_transaction(const uint8_t* night_private_key_ptr, size_t night_private_key_len, const char* dust_public_key_hex, const char* allow_fee_payment_str, uint64_t ttl_millis, int64_t current_time_millis, const char* utxos_json, const char* network_id);
 
 /* Transaction balancing — balance proven tx with dust fees (balance_ffi.rs) */
-extern char* balance_proven_transaction(const char* proven_tx_hex, void* dust_state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* ledger_params_hex, int64_t current_time_ms, const char* keys_dir, const char* network_id, const char* exclude_nullifiers_hex);
+extern char* balance_proven_transaction(const char* proven_tx_hex, void* dust_state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* ledger_params_hex, int64_t current_time_ms, const char* keys_dir, const char* network_id, const char* exclude_nullifiers_hex, int64_t ttl_anchor_ms);
 extern void free_balanced_transaction(char* ptr);
 /* List current dust UTXO nullifiers (balance_ffi.rs) — for skip-set prune / fast-fail */
 extern char* dust_current_nullifiers(const void* state_ptr, const uint8_t* seed_ptr, size_t seed_len);
@@ -3231,6 +3232,24 @@ Java_com_midnight_kuira_core_compact_ContractRuntime_nativeAssembleDeployTx(
     return jresult;
 }
 
+/*
+ * Read global_ttl (seconds) from SCALE-encoded ledger parameters. Returns -1 on error.
+ * Callers size a transaction's TTL to this live chain limit (custom error 182 otherwise).
+ */
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeGlobalTtlSecs(
+    JNIEnv* env, jclass clazz, jstring paramsHex) {
+
+    if (paramsHex == NULL) return -1;
+
+    const char* hex_c = (*env)->GetStringUTFChars(env, paramsHex, NULL);
+    if (hex_c == NULL) return -1;
+
+    jlong secs = (jlong)ledger_params_global_ttl_secs(hex_c);
+    (*env)->ReleaseStringUTFChars(env, paramsHex, hex_c);
+    return secs;
+}
+
 /**
  * Balance a proven transaction with dust fee payment (SDK — balance_ffi.rs)
  *
@@ -3263,7 +3282,8 @@ Java_com_midnight_kuira_sdk_TransactionBalancerNative_nativeBalanceProvenTransac
     jlong current_time_ms,
     jstring keys_dir,
     jstring network_id,
-    jstring exclude_nullifiers)
+    jstring exclude_nullifiers,
+    jlong ttl_anchor_ms)
 {
     /* Validate inputs. exclude_nullifiers is optional (null = skip nothing). */
     if (proven_tx_hex == NULL || dust_state_ptr == 0 || seed == NULL ||
@@ -3341,7 +3361,8 @@ Java_com_midnight_kuira_sdk_TransactionBalancerNative_nativeBalanceProvenTransac
         current_time_ms,
         keys_c,
         network_c,
-        exclude_c
+        exclude_c,
+        (int64_t)ttl_anchor_ms
     );
 
     /* Zeroize sensitive data */

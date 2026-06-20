@@ -1411,6 +1411,34 @@ pub extern "C" fn contract_assemble_deploy_tx(
     }
 }
 
+/// Reads `global_ttl` (in seconds) from SCALE-encoded ledger parameters.
+///
+/// The node rejects an intent whose TTL sits more than `global_ttl` ahead of
+/// chain time (custom error 182 / `IntentTtlTooFarInFuture`). Networks set very
+/// different ceilings — a localnet runs ~100s, PreProd ~1h — so callers size a
+/// transaction's TTL to this live value instead of a fixed window.
+///
+/// Returns the seconds value, or `-1` if the parameters can't be decoded.
+#[no_mangle]
+pub extern "C" fn ledger_params_global_ttl_secs(params_hex: *const c_char) -> i64 {
+    // SAFETY: params_hex comes from JNI GetStringUTFChars, guaranteed a valid C string.
+    let hex_str = match unsafe { c_str_to_str(params_hex) } {
+        Some(s) => s,
+        None => return -1,
+    };
+    let bytes = match hex::decode(hex_str) {
+        Ok(b) => b,
+        Err(_) => return -1,
+    };
+    let params: midnight_ledger::structure::LedgerParameters =
+        match midnight_serialize::tagged_deserialize(&bytes[..]) {
+            Ok(p) => p,
+            Err(_) => return -1,
+        };
+    let secs = params.global_ttl.as_seconds();
+    if (0..=i64::MAX as i128).contains(&secs) { secs as i64 } else { -1 }
+}
+
 /// Returns JSON: `{"tx_hex":"...", "contract_address":"..."}`
 ///
 /// Input JSON now supports optional `verifier_keys` map to register circuit
@@ -1785,6 +1813,36 @@ mod value_format_tests {
         assert!(result_str.contains("error"), "missing state_handle should error: {}", result_str);
 
         unsafe { contract_free_string(result_ptr as *mut c_char); }
+    }
+
+    #[test]
+    fn test_global_ttl_secs_reads_default_params() {
+        // Round-trip the chain's INITIAL_PARAMETERS (global_ttl = 3600s) through the getter.
+        let params = midnight_ledger::structure::INITIAL_PARAMETERS;
+        let mut bytes = Vec::new();
+        midnight_serialize::tagged_serialize(&params, &mut bytes).expect("serialize params");
+        let hex_c = std::ffi::CString::new(hex::encode(&bytes)).unwrap();
+        assert_eq!(ledger_params_global_ttl_secs(hex_c.as_ptr()), 3600);
+    }
+
+    #[test]
+    fn test_global_ttl_secs_reads_tight_localnet_value() {
+        // A tight ceiling (a localnet runs ~100s) must read back exactly — this is the value the
+        // adaptive TTL sizing depends on to keep a tx under the node's limit (custom error 182).
+        let mut params = midnight_ledger::structure::INITIAL_PARAMETERS;
+        params.global_ttl = midnight_base_crypto::time::Duration::from_secs(100);
+        let mut bytes = Vec::new();
+        midnight_serialize::tagged_serialize(&params, &mut bytes).expect("serialize params");
+        let hex_c = std::ffi::CString::new(hex::encode(&bytes)).unwrap();
+        assert_eq!(ledger_params_global_ttl_secs(hex_c.as_ptr()), 100);
+    }
+
+    #[test]
+    fn test_global_ttl_secs_invalid_input_returns_negative() {
+        // Bad hex, valid-hex-but-not-params, and empty all yield -1 so callers fall back safely.
+        assert_eq!(ledger_params_global_ttl_secs(std::ffi::CString::new("not-hex").unwrap().as_ptr()), -1);
+        assert_eq!(ledger_params_global_ttl_secs(std::ffi::CString::new("deadbeef").unwrap().as_ptr()), -1);
+        assert_eq!(ledger_params_global_ttl_secs(std::ffi::CString::new("").unwrap().as_ptr()), -1);
     }
 }
 

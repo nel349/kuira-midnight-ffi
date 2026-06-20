@@ -56,6 +56,32 @@ const LOG_ERROR: std::os::raw::c_int = 6;
 const FEE_OVERHEAD_PERCENT: u128 = 1;
 const DEFAULT_FEE_BLOCKS_MARGIN: usize = 5;
 
+/// Headroom subtracted from the chain's `global_ttl` when sizing the dust intent's TTL — absorbs
+/// the client/chain clock gap so the TTL lands strictly under the ceiling. Mirrors Kotlin IntentTtl.
+const DUST_TTL_MARGIN_SECS: i128 = 15;
+/// Upper bound on the dust intent's TTL window (30 min) even when `global_ttl` is generous.
+const DUST_TTL_MAX_WINDOW_SECS: i128 = 30 * 60;
+
+/// TTL window (seconds) for the balancer's dust intent that fits under the chain's `global_ttl`.
+///
+/// The node rejects an intent whose TTL sits more than `global_ttl` ahead of chain time (custom
+/// error 182 / `IntentTtlTooFarInFuture`). A fixed 30-min window overshoots a tight node (a
+/// localnet runs ~100s), so size it to the live ceiling. Mirrors Kotlin `IntentTtl.windowSeconds`.
+fn dust_intent_ttl_window_secs(global_ttl_secs: i128) -> u64 {
+    let capped = (global_ttl_secs - DUST_TTL_MARGIN_SECS).min(DUST_TTL_MAX_WINDOW_SECS);
+    let window = if capped > 0 { capped } else { global_ttl_secs / 2 };
+    window.max(0) as u64
+}
+
+/// Total dust fee to charge: the original tx's fee PLUS the dust-fee intent's own cost, plus a
+/// small safety margin. The node charges the fee on the merged `(original + dust intent)` tx, so
+/// sizing on `base_fee` alone under-pays it → the node rejects with `BalanceCheckOverspend`
+/// (custom error 138) the moment the chain charges a real fee.
+fn merged_total_fee(base_fee: u128, dust_intent_fee: u128) -> u128 {
+    let merged = base_fee + dust_intent_fee;
+    merged + merged * FEE_OVERHEAD_PERCENT / 100
+}
+
 // ── FFI Entry Point ──
 
 /// Balance a proven transaction by adding dust fee payment, then seal it.
@@ -110,6 +136,10 @@ pub extern "C" fn balance_proven_transaction(
     keys_dir: *const c_char,
     network_id: *const c_char,
     exclude_nullifiers_hex: *const c_char,
+    // Chain-tip time (ms) for the dust-fee intent's TTL. Distinct from current_time_ms (the dust
+    // SYNC time, which the ctime must match for the dust root): the sync time lags the chain on
+    // a chain with infrequent dust events, so a sync-anchored TTL expires (custom error 182).
+    ttl_anchor_ms: i64,
 ) -> *mut c_char {
     // Null checks. `exclude_nullifiers_hex` is intentionally NOT required — a null
     // or empty value means "no UTXOs to skip" (the common case before any spend).
@@ -205,6 +235,7 @@ pub extern "C" fn balance_proven_transaction(
         &keys_path,
         network_id_str,
         &exclude_nullifiers,
+        ttl_anchor_ms,
     ) {
         Ok((balanced_hex, updated_state, spent_nullifiers)) => {
             // Write the post-spend state back to the cached pointer. `spend()` marks
@@ -431,6 +462,52 @@ fn select_dust_spends<D: DB>(
     Ok((current_state, dust_spends, spent_nullifiers))
 }
 
+/// Build the dust-only unproven transaction that pays the fee: one intent at a random segment
+/// carrying [spends] as its dust actions. Used twice — once as a DRAFT to measure the dust
+/// intent's own fee contribution, once for real — so the spend can be sized to the merged-tx fee.
+fn build_dust_fee_intent_tx(
+    spends: Vec<DustSpend<ProofPreimageMarker, DefaultDB>>,
+    ctime: Timestamp,
+    ttl: Timestamp,
+    network_id: &str,
+) -> Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
+    use midnight_storage::arena::Sp;
+    use midnight_storage::storage::Array as StorageArray;
+
+    let spends_array: StorageArray<_, DefaultDB> = spends.into_iter().collect();
+    let registrations_array: StorageArray<
+        midnight_ledger::dust::DustRegistration<Signature, DefaultDB>,
+        DefaultDB,
+    > = std::iter::empty().collect();
+
+    let dust_actions = DustActions {
+        spends: spends_array,
+        registrations: registrations_array,
+        ctime,
+    };
+
+    // Random segment ID for the dust intent (avoids collision with original tx segments).
+    let dust_segment_id: u16 = OsRng.gen_range(2..u16::MAX);
+
+    let dust_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
+        guaranteed_unshielded_offer: None,
+        fallible_unshielded_offer: None,
+        actions: std::iter::empty().collect(),
+        dust_actions: Some(Sp::new(dust_actions)),
+        ttl,
+        binding_commitment: OsRng.gen(), // random binding (matches facade's Intent::new)
+    };
+
+    let dust_intents_map = StorageHashMap::default().insert(dust_segment_id, dust_intent);
+
+    Transaction::new(
+        network_id,
+        dust_intents_map,
+        None,
+        midnight_storage::storage::HashMap::new(),
+    )
+}
+
 fn balance_proven_transaction_impl(
     proven_hex: &str,
     dust_state: &DustLocalState<DefaultDB>,
@@ -440,10 +517,8 @@ fn balance_proven_transaction_impl(
     keys_path: &PathBuf,
     network_id: &str,
     exclude_nullifiers: &std::collections::HashSet<String>,
+    ttl_anchor_ms: i64,
 ) -> Result<(String, DustLocalState<DefaultDB>, Vec<String>), String> {
-    use midnight_storage::arena::Sp;
-    use midnight_storage::storage::Array as StorageArray;
-
     balance_log!(LOG_INFO, "Starting balance: proven_tx={} chars, keys_dir={:?}",
         proven_hex.len(), keys_path);
 
@@ -503,15 +578,9 @@ fn balance_proven_transaction_impl(
         .fees_with_margin(&params, DEFAULT_FEE_BLOCKS_MARGIN)
         .map_err(|e| format!("Fee calculation failed: {:?}", e))?;
 
-    balance_log!(LOG_INFO, "Fee from ledger params: {} specks", base_fee);
+    balance_log!(LOG_INFO, "Fee of original tx: {} specks", base_fee);
 
-    let overhead = base_fee * FEE_OVERHEAD_PERCENT / 100;
-    let total_fee: u128 = base_fee + overhead;
-
-    balance_log!(LOG_INFO, "Calculated fee: {} specks (base={}, overhead={})",
-        total_fee, base_fee, overhead);
-
-    if total_fee == 0 {
+    if base_fee == 0 {
         balance_log!(LOG_INFO, "Zero-fee network — sealing proven tx with no dust intent");
         let sealed_tx = proven_tx.seal(OsRng);
         let mut result_bytes = Vec::new();
@@ -522,60 +591,53 @@ fn balance_proven_transaction_impl(
         return Ok((result_hex, dust_state.clone(), Vec::new()));
     }
 
-    // ── Step 3: Create dust spends ──
+    // ── Step 3: Size the fee to the MERGED transaction ──
+    // The node charges the fee on (original tx + dust-fee intent), not the original alone — and the
+    // dust intent has its OWN cost. Estimate that with a DRAFT dust intent, then size the real spend
+    // to cover base + dust-intent fee. The old `base_fee + 1%` under-paid the moment the chain
+    // charged a real fee: the node saw the (Dust, segment 0) balance go negative and rejected the tx
+    // as BalanceCheckOverspend (custom error 138); a ~zero-fee chain had hidden it.
 
     let dust_secret_key = DustSecretKey::derive_secret_key(seed);
     let timestamp_secs = u64::try_from(current_time_ms / 1000)
         .map_err(|_| format!("Negative timestamp: {}", current_time_ms))?;
     let timestamp = Timestamp::from_secs(timestamp_secs);
-
-    let (current_state, dust_spends, spent_nullifiers) = select_dust_spends(
-        dust_state,
-        &dust_secret_key,
-        total_fee,
-        timestamp,
-        exclude_nullifiers,
-    )?;
-
-    balance_log!(LOG_INFO, "Created {} dust spend(s) for total fee {}", dust_spends.len(), total_fee);
-
-    // ── Step 4: Build dust-only unproven transaction ──
-
-    let spends_array: StorageArray<_, DefaultDB> = dust_spends.into_iter().collect();
-    let registrations_array: StorageArray<
-        midnight_ledger::dust::DustRegistration<Signature, DefaultDB>,
-        DefaultDB,
-    > = std::iter::empty().collect();
-
-    let dust_actions = DustActions {
-        spends: spends_array,
-        registrations: registrations_array,
-        ctime: timestamp,
+    // Size the dust intent's TTL to the chain's global_ttl, anchored to the CHAIN TIP (ttl_anchor)
+    // — NOT the dust sync time (timestamp_secs). The sync time lags the chain when dust events are
+    // sparse, so a sync-anchored TTL is already in the past → the node rejects it as expired
+    // (custom error 182 / IntentTtlExpired). The ctime + dust spend keep using the sync time so the
+    // dust root still resolves (#287). Fall back to the sync time only if no anchor was supplied.
+    let ttl_anchor_secs = if ttl_anchor_ms > 0 {
+        (ttl_anchor_ms / 1000) as u64
+    } else {
+        timestamp_secs
     };
-
-    // Random segment ID for the dust intent (avoids collision with original tx segments)
-    let dust_segment_id: u16 = OsRng.gen_range(2..u16::MAX);
-
-    // Dust intent: no unshielded offers, no circuit actions, only dust
-    let dust_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> {
-        guaranteed_unshielded_offer: None,
-        fallible_unshielded_offer: None,
-        actions: std::iter::empty().collect(),
-        dust_actions: Some(Sp::new(dust_actions)),
-        ttl: Timestamp::from_secs(timestamp_secs + 1800), // 30 min TTL
-        binding_commitment: OsRng.gen(), // random binding (matches facade's Intent::new)
-    };
-
-    let dust_intents_map = StorageHashMap::default().insert(dust_segment_id, dust_intent);
-
-    let dust_tx = Transaction::new(
-        network_id,
-        dust_intents_map,
-        None,
-        midnight_storage::storage::HashMap::new(),
+    let dust_ttl = Timestamp::from_secs(
+        ttl_anchor_secs + dust_intent_ttl_window_secs(params.global_ttl.as_seconds()),
     );
 
-    balance_log!(LOG_INFO, "Built dust-only unproven tx at segment {}", dust_segment_id);
+    // Draft: a representative dust intent so we can read its fee contribution. The dust spend's
+    // value is a fixed-size field, so the draft's structure (and thus its fee) matches the real one.
+    let (_, draft_spends, _) =
+        select_dust_spends(dust_state, &dust_secret_key, base_fee, timestamp, exclude_nullifiers)?;
+    let draft_dust_tx = build_dust_fee_intent_tx(draft_spends, timestamp, dust_ttl, network_id);
+    let dust_intent_fee = draft_dust_tx
+        .erase_proofs()
+        .fees_with_margin(&params, DEFAULT_FEE_BLOCKS_MARGIN)
+        .map_err(|e| format!("Dust-intent fee calculation failed: {:?}", e))?;
+
+    let total_fee = merged_total_fee(base_fee, dust_intent_fee);
+    balance_log!(LOG_INFO,
+        "Fee sized to merged tx: base={} + dust_intent={} (+{}%) = {} specks",
+        base_fee, dust_intent_fee, FEE_OVERHEAD_PERCENT, total_fee);
+
+    // ── Step 4: Real dust spends + dust intent (covering the merged-tx fee) ──
+    let (current_state, dust_spends, spent_nullifiers) =
+        select_dust_spends(dust_state, &dust_secret_key, total_fee, timestamp, exclude_nullifiers)?;
+    balance_log!(LOG_INFO, "Created {} dust spend(s) for total fee {}", dust_spends.len(), total_fee);
+
+    let dust_tx = build_dust_fee_intent_tx(dust_spends, timestamp, dust_ttl, network_id);
+    balance_log!(LOG_INFO, "Built dust-only unproven tx");
 
     // ── Step 5: Prove the dust transaction locally ──
     // Prove the dust tx directly (no serialize/deserialize round-trip).
@@ -675,6 +737,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_dust_intent_ttl_window_fits_tight_global_ttl() {
+        // localnet ~100s: the dust intent's window must land strictly under global_ttl (error 182).
+        assert_eq!(dust_intent_ttl_window_secs(100), 85); // 100 - 15s margin
+        assert!(dust_intent_ttl_window_secs(100) < 100);
+    }
+
+    #[test]
+    fn test_dust_intent_ttl_window_caps_at_30min() {
+        // PreProd ~1h: cap at the historical 30-min window rather than handing out a 1h TTL.
+        assert_eq!(dust_intent_ttl_window_secs(3600), 30 * 60);
+    }
+
+    #[test]
+    fn test_dust_intent_ttl_window_halves_tiny_global_ttl() {
+        // global_ttl below the margin: half the ceiling keeps the window positive and under it.
+        assert_eq!(dust_intent_ttl_window_secs(10), 5);
+    }
+
+    #[test]
+    fn test_merged_total_fee_covers_dust_intent_cost() {
+        // REGRESSION GUARD — custom error 138 (BalanceCheckOverspend). The fee must cover the
+        // MERGED tx (original + the dust-fee intent's own cost), not the original alone. The old
+        // sizing was `base + 1%`, which under-paid once the chain charged a real fee.
+        let base = 1_000_000u128;
+        let dust_intent = 400_000u128;
+
+        let total = merged_total_fee(base, dust_intent);
+        assert!(total >= base + dust_intent, "total {total} must cover base+dust {}", base + dust_intent);
+        // A non-zero dust-intent cost MUST raise the total above the base-only (old, buggy) sizing.
+        assert!(total > merged_total_fee(base, 0), "dust-intent cost must be included in the fee");
+    }
+
+    #[test]
     fn test_null_safety() {
         let result = balance_proven_transaction(
             ptr::null(),
@@ -686,6 +781,7 @@ mod tests {
             ptr::null(),
             ptr::null(),
             ptr::null(),
+            0, // ttl_anchor_ms
         );
         assert!(result.is_null());
     }
@@ -708,6 +804,7 @@ mod tests {
             keys_dir.as_ptr(),
             network.as_ptr(),
             ptr::null(),
+            0, // ttl_anchor_ms
         );
         assert!(result.is_null());
     }
@@ -735,6 +832,7 @@ mod tests {
             keys_dir.as_ptr(),
             network.as_ptr(),
             ptr::null(),
+            1704067200000, // ttl_anchor_ms
         );
         assert!(result.is_null(), "Should fail on invalid hex");
     }
