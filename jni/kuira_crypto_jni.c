@@ -187,7 +187,7 @@ extern char* get_transaction_hash(const char* sealed_tx_hex);
 extern char* calculate_transaction_fee(const char* tx_hex, const char* params_hex, uint32_t fee_blocks_margin);
 
 /* Dust registration transaction builder (serialize.rs) */
-extern char* build_dust_registration_transaction(const uint8_t* night_private_key_ptr, size_t night_private_key_len, const char* dust_public_key_hex, const char* allow_fee_payment_str, uint64_t ttl_millis, int64_t current_time_millis, const char* utxos_json, const char* network_id);
+extern char* build_dust_registration_transaction(const uint8_t* night_private_key_ptr, size_t night_private_key_len, const char* dust_public_key_hex, const char* allow_fee_payment_str, uint64_t ttl_millis, int64_t current_time_millis, const char* utxos_json, const char* network_id, const char* params_hex);
 
 /* Transaction balancing — balance proven tx with dust fees (balance_ffi.rs) */
 extern char* balance_proven_transaction(const char* proven_tx_hex, void* dust_state_ptr, const uint8_t* seed_ptr, size_t seed_len, const char* ledger_params_hex, int64_t current_time_ms, const char* keys_dir, const char* network_id, const char* exclude_nullifiers_hex, int64_t ttl_anchor_ms);
@@ -2244,7 +2244,9 @@ Java_com_midnight_kuira_core_ledger_fee_DustSpendCreator_nativeCreateDustSpend(
  *           allowFeePayment: String,
  *           ttlMillis: Long,
  *           currentTimeMillis: Long,
- *           utxosJson: String
+ *           utxosJson: String,
+ *           networkId: String,
+ *           paramsHex: String?  // live ledger params for the maturity gate; null = skip
  *       ): String?
  *   }
  *
@@ -2268,7 +2270,8 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
     jlong ttl_millis,
     jlong current_time_millis,
     jstring utxos_json,
-    jstring network_id
+    jstring network_id,
+    jstring params_hex
 ) {
     /* Validate inputs */
     if (night_private_key == NULL) {
@@ -2349,6 +2352,22 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
         return NULL;
     }
 
+    /* params_hex is OPTIONAL (Kotlin may pass null when no live params are available);
+     * a NULL ptr makes Rust skip the maturity gate. */
+    const char* params_c = NULL;
+    if (params_hex != NULL) {
+        params_c = (*env)->GetStringUTFChars(env, params_hex, NULL);
+        if (params_c == NULL) {
+            LOGE("nativeBuildDustRegistrationTransaction: GetStringUTFChars failed for params_hex");
+            (*env)->ReleaseStringUTFChars(env, network_id, network_id_c);
+            (*env)->ReleaseStringUTFChars(env, utxos_json, utxos_c);
+            (*env)->ReleaseStringUTFChars(env, allow_fee_payment, fee_c);
+            (*env)->ReleaseStringUTFChars(env, dust_public_key_hex, dust_pk_c);
+            secure_memzero(key_buf, 32);
+            return NULL;
+        }
+    }
+
     /* Call Rust FFI */
     char* tx_hex = build_dust_registration_transaction(
         key_buf,
@@ -2358,7 +2377,8 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
         (uint64_t)ttl_millis,
         (int64_t)current_time_millis,
         utxos_c,
-        network_id_c
+        network_id_c,
+        params_c
     );
 
     /* SECURITY: Zeroize key after use */
@@ -2369,6 +2389,9 @@ Java_com_midnight_kuira_core_ledger_dust_DustRegistrationBuilder_nativeBuildDust
     (*env)->ReleaseStringUTFChars(env, allow_fee_payment, fee_c);
     (*env)->ReleaseStringUTFChars(env, utxos_json, utxos_c);
     (*env)->ReleaseStringUTFChars(env, network_id, network_id_c);
+    if (params_c != NULL) {
+        (*env)->ReleaseStringUTFChars(env, params_hex, params_c);
+    }
 
     if (tx_hex == NULL) {
         LOGE("nativeBuildDustRegistrationTransaction: Rust FFI returned NULL");

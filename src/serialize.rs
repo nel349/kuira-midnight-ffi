@@ -1191,6 +1191,7 @@ pub extern "C" fn build_dust_registration_transaction(
     current_time_millis: i64,
     utxos_json: *const c_char,
     network_id: *const c_char,
+    params_hex: *const c_char,
 ) -> *mut c_char {
     // Validate inputs
     if night_private_key_ptr.is_null() {
@@ -1205,6 +1206,7 @@ pub extern "C" fn build_dust_registration_transaction(
         log_error!("[Kuira FFI] build_dust_registration_transaction: null string parameter");
         return std::ptr::null_mut();
     }
+    // params_hex may legitimately be null (caller has no live params → skip maturity gate).
 
     // Convert inputs — copy key to mutable buffer for zeroization
     use zeroize::Zeroize;
@@ -1248,6 +1250,20 @@ pub extern "C" fn build_dust_registration_transaction(
         }
     };
 
+    // Optional: live ledger params for the maturity gate. Null → "" → check skipped.
+    let params_str = if params_hex.is_null() {
+        ""
+    } else {
+        match unsafe { CStr::from_ptr(params_hex).to_str() } {
+            Ok(s) => s,
+            Err(e) => {
+                key_buf.zeroize();
+                log_error!("[Kuira FFI] Invalid UTF-8 in params_hex: {}", e);
+                return std::ptr::null_mut();
+            }
+        }
+    };
+
     let result = build_dust_registration_transaction_impl(
         &key_buf,
         dust_pk_str,
@@ -1256,23 +1272,31 @@ pub extern "C" fn build_dust_registration_transaction(
         current_time_millis,
         utxos_str,
         network_id_str,
+        params_str,
     );
 
     // SECURITY: Always zeroize key buffer before returning
     key_buf.zeroize();
 
-    match result {
-        Ok(hex) => {
-            match CString::new(hex) {
-                Ok(c_str) => c_str.into_raw(),
-                Err(e) => {
-                    log_error!("[Kuira FFI] Failed to create C string: {}", e);
-                    std::ptr::null_mut()
-                }
-            }
+    // On the typed "not matured" signal, return the sentinel string (NOT null) so the
+    // caller can distinguish "coin too fresh, wait and retry" from a hard build failure.
+    // Every other error stays null (the caller's existing failure contract).
+    let payload = match result {
+        Ok(hex) => hex,
+        Err(e) if e.starts_with(DUST_NOT_MATURED_PREFIX) => {
+            log_info!("[Kuira FFI] build_dust_registration_transaction: {} (returning sentinel for retry)", e);
+            e
         }
         Err(e) => {
             log_error!("[Kuira FFI] build_dust_registration_transaction failed: {}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    match CString::new(payload) {
+        Ok(c_str) => c_str.into_raw(),
+        Err(e) => {
+            log_error!("[Kuira FFI] Failed to create C string: {}", e);
             std::ptr::null_mut()
         }
     }
@@ -1367,6 +1391,36 @@ pub extern "C" fn dust_filter_unregistered_night(
     }
 }
 
+/// Sentinel prefix the impl returns (as an `Err`) when the selected NIGHT coin has
+/// not yet generated enough "generationless" dust to self-pay the registration tx's
+/// own fee (node would reject as BalanceCheckOverspend / Custom error 138). The
+/// shortfall (required_fee - allow_fee_payment, in Specks) follows the colon so the
+/// caller can log/size a backoff. Surfaced to Kotlin verbatim so the SDK can wait for
+/// the coin to mature and retry, instead of building an underpaying tx.
+pub(crate) const DUST_NOT_MATURED_PREFIX: &str = "DUST_NOT_MATURED:";
+
+/// Block-margin for the registration's self-pay fee check — matches the margin the
+/// balance path uses when sizing dust fees (`DEFAULT_FEE_BLOCKS_MARGIN` in fee_ffi/
+/// balance_ffi). Keeping it identical means the maturity gate requires exactly the
+/// amount the node will later charge, with the same safety headroom.
+const DUST_REGISTRATION_FEE_BLOCKS_MARGIN: usize = 5;
+
+/// Strip the tag prefix from tagged SCALE bytes for the raw-deserialize fallback,
+/// mirroring `balance_ffi::strip_tag_prefix`. Tagged ledger-parameters look like
+/// `midnight:ledger-parameters[v4]:<scale-data>`; if the `midnight:` prefix is present
+/// this returns everything after the tag/data `:` separator, else the bytes unchanged.
+fn strip_tag_prefix(bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.len() < 9 || &bytes[0..9] != b"midnight:" {
+        return bytes;
+    }
+    for i in 9..bytes.len() - 1 {
+        if (bytes[i] == b')' || bytes[i] == b']') && bytes[i + 1] == b':' {
+            return bytes[i + 2..].to_vec();
+        }
+    }
+    bytes
+}
+
 fn build_dust_registration_transaction_impl(
     night_private_key: &[u8; 32],
     dust_public_key_hex: &str,
@@ -1375,6 +1429,11 @@ fn build_dust_registration_transaction_impl(
     current_time_millis: i64,
     utxos_json: &str,
     network_id: &str,
+    // Hex-encoded SCALE LedgerParameters from the indexer (`getCurrentBlockWithParams().ledgerParameters`).
+    // When supplied, the builder computes the registration tx's ACTUAL fee and refuses to emit a tx the
+    // selected coin's generationless dust can't cover (returns `DUST_NOT_MATURED:<shortfall>`). Pass `""`
+    // to skip the check (matured-coin unit tests that don't have live params).
+    params_hex: &str,
 ) -> Result<String, String> {
     use midnight_ledger::dust::{DustRegistration, DustActions, DustPublicKey};
     use midnight_storage::storage::Array as StorageArray;
@@ -1578,6 +1637,47 @@ fn build_dust_registration_transaction_impl(
         midnight_storage::storage::HashMap::new(),  // No fallible_coins
     );
 
+    // 16b. Maturity gate: a dust registration SELF-PAYS its own fee from the selected NIGHT
+    //      coin's "generationless" dust (allow_fee_payment, computed above). The node caps the
+    //      payable fee at min(allow_fee_payment, dust_in) (dust.rs:1024-1027), so if the coin is
+    //      too fresh — dt≈0 → allow_fee_payment≈0 — the fee can't be covered and the node rejects
+    //      the whole tx as BalanceCheckOverspend (Custom error 138). Compute the tx's ACTUAL fee
+    //      here (it carries no ZK proofs, so the unproven fee == what the node charges) and refuse
+    //      to emit an underpaying tx; surface a typed "not matured" signal with the shortfall so
+    //      the caller can wait for the coin to age and retry. Skipped when no params are supplied
+    //      (matured-coin unit tests).
+    if !params_hex.is_empty() {
+        let params_bytes = hex::decode(params_hex)
+            .map_err(|e| format!("Failed to decode ledger params hex: {}", e))?;
+        let params: midnight_ledger::structure::LedgerParameters =
+            match tagged_deserialize(&params_bytes[..]) {
+                Ok(p) => p,
+                Err(tag_err) => {
+                    let stripped = strip_tag_prefix(params_bytes.clone());
+                    midnight_serialize::Deserializable::deserialize(&mut &stripped[..], 0)
+                        .map_err(|e| format!(
+                            "Failed to deserialize ledger parameters: {:?} (tagged also failed: {})",
+                            e, tag_err
+                        ))?
+                }
+            };
+        let fee = transaction
+            .fees_with_margin(&params, DUST_REGISTRATION_FEE_BLOCKS_MARGIN)
+            .map_err(|e| format!("Registration fee calculation failed: {:?}", e))?;
+        log_info!(
+            "[Kuira FFI] Dust registration fee check: fee={} allow_fee_payment={} (margin={})",
+            fee, allow_fee_payment, DUST_REGISTRATION_FEE_BLOCKS_MARGIN
+        );
+        if allow_fee_payment < fee {
+            let shortfall = fee - allow_fee_payment;
+            log_error!(
+                "[Kuira FFI] Dust coin not matured: need {} Specks, have {} (short {})",
+                fee, allow_fee_payment, shortfall
+            );
+            return Err(format!("{}{}", DUST_NOT_MATURED_PREFIX, shortfall));
+        }
+    }
+
     // 17. Serialize as (Transaction, HashMap<String, ProvingKeyMaterial>) tuple
     // Proof server expects this format — empty proof data for dust registration
     let proof_data = std::collections::HashMap::<String, ProvingKeyMaterial>::new();
@@ -1674,6 +1774,7 @@ mod tests {
             current_time_millis,
             utxos_json,
             "undeployed",
+            "", // no live params → maturity gate skipped
         );
 
         let hex = result.expect("Dust registration transaction build should succeed");
@@ -1795,6 +1896,7 @@ mod tests {
             current_time_millis,
             utxos_json.as_str(),
             "undeployed",
+            "", // matured-coin invariant test — no live params, skip the gate
         )
         .expect("build should succeed");
 
@@ -1836,7 +1938,7 @@ mod tests {
             };
             let hx = build_dust_registration_transaction_impl(
                 &night_private_key, &dust_pk_hex, "0", ttl_millis, current_time_millis,
-                utxos.as_str(), "undeployed",
+                utxos.as_str(), "undeployed", "",
             ).expect("build");
             let b = hex::decode(&hx).unwrap();
             let (t, _): (
@@ -1851,6 +1953,64 @@ mod tests {
                 "{n}-UTXO registration must clear cost(enforce_ttd)"
             );
         }
+    }
+
+    /// Bug 1 regression (node error 138 on a FRESH wallet's dust registration): when live
+    /// ledger params are supplied, the builder must REFUSE to emit a registration tx whose
+    /// self-pay budget (`allow_fee_payment` = the coin's generationless dust) can't cover the
+    /// tx's own fee — a brand-new coin has dt≈0 → allow_fee_payment≈0 → the node would reject
+    /// it as BalanceCheckOverspend (138). Instead it returns the typed `DUST_NOT_MATURED:`
+    /// signal with the shortfall. A coin aged past dust-cap, same params, still builds fine.
+    #[test]
+    fn dust_registration_fresh_coin_gated_matured_coin_passes() {
+        use midnight_ledger::dust::{DustSecretKey, DustPublicKey, Seed};
+        use midnight_ledger::structure::INITIAL_PARAMETERS;
+        use midnight_serialize::Serializable;
+
+        let night_private_key: [u8; 32] = [42u8; 32];
+        let seed: Seed = [7u8; 32];
+        let dust_sk = DustSecretKey::derive_secret_key(&seed);
+        let dust_pk = DustPublicKey::from(dust_sk);
+        let mut pk_bytes = Vec::new();
+        dust_pk.serialize(&mut pk_bytes).unwrap();
+        let dust_pk_hex = hex::encode(&pk_bytes);
+
+        // Real LedgerParameters hex, exactly as the indexer hands us (tagged SCALE).
+        let mut params_bytes = Vec::new();
+        tagged_serialize(&INITIAL_PARAMETERS, &mut params_bytes).unwrap();
+        let params_hex = hex::encode(&params_bytes);
+
+        let ttl_millis = 1737658800000u64;
+        let current_time_millis = 1737658700000i64;
+        let current_time_secs = (current_time_millis / 1000) as u64;
+
+        // FRESH coin: ctime == now → dt = 0 → generationless dust = 0 → can't self-pay.
+        let fresh_json = format!(
+            r#"[{{"value":"3000000000","intent_hash":"ab6642ef7dd8420c4673a56c57da96adeeedfc5a98140c8a42500b8369464fed","output_no":0,"ctime":{}}}]"#,
+            current_time_secs
+        );
+        let fresh = build_dust_registration_transaction_impl(
+            &night_private_key, &dust_pk_hex, "0", ttl_millis, current_time_millis,
+            fresh_json.as_str(), "undeployed", params_hex.as_str(),
+        );
+        let err = fresh.expect_err("fresh coin must be gated, not built");
+        assert!(
+            err.starts_with(DUST_NOT_MATURED_PREFIX),
+            "fresh coin must return the typed not-matured signal, got: {err}"
+        );
+
+        // MATURED coin: 2 weeks old → generationless dust at cap → covers the fee → builds.
+        let matured_ctime = current_time_secs - (2 * 604800);
+        let matured_json = format!(
+            r#"[{{"value":"3000000000","intent_hash":"ab6642ef7dd8420c4673a56c57da96adeeedfc5a98140c8a42500b8369464fed","output_no":0,"ctime":{}}}]"#,
+            matured_ctime
+        );
+        let matured = build_dust_registration_transaction_impl(
+            &night_private_key, &dust_pk_hex, "0", ttl_millis, current_time_millis,
+            matured_json.as_str(), "undeployed", params_hex.as_str(),
+        );
+        let hex = matured.expect("matured coin must build even with the gate active");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "matured build must be hex");
     }
 
     /// Test that mirrors midnight-ledger/ledger/tests/dust.rs `test_registration_dust_payment`.
@@ -1971,6 +2131,7 @@ mod tests {
             1737658700000,
             utxos_json,
             "undeployed",
+            "",
         );
         assert!(result.is_err(), "Should fail on invalid dust public key hex");
     }
@@ -1997,6 +2158,7 @@ mod tests {
             1737658700000,
             utxos_json,
             "undeployed",
+            "",
         );
         assert!(result.is_err(), "Should fail with empty UTXOs");
         assert!(result.unwrap_err().contains("At least one NIGHT UTXO"));
@@ -2027,6 +2189,7 @@ mod tests {
             ctime_millis,
             utxos_json,
             "undeployed",
+            "",
         ).expect("Should succeed");
 
         // Deserialize and verify timestamps
@@ -2119,6 +2282,7 @@ mod tests {
             current_time_ms,
             &utxos_json,
             "local-test", // matches TestState's LedgerState network_id
+            "", // coin aged to dust-cap above; the well_formed gate is the check here
         )
         .expect("FFI should produce a serialized tx");
 
@@ -2176,6 +2340,7 @@ mod tests {
                 1737658700000i64,
                 utxos_json,
                 expected,
+                "",
             )
             .unwrap_or_else(|e| panic!("Should succeed for {expected}: {e}"));
 
