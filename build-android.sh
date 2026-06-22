@@ -61,6 +61,7 @@ echo "Using Android NDK: $ANDROID_NDK"
 #   "i686-linux-android:24"         # x86 (32-bit Intel emulators)
 declare -a TARGETS=(
     "aarch64-linux-android:24"      # ARM64 (64-bit ARM, API 24+) — shipped
+    "x86_64-linux-android:24"       # x86_64 (Intel emulators / CI) — shipped (#45: device-less dev support)
 )
 
 # Build flags
