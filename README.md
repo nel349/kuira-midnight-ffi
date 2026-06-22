@@ -158,14 +158,15 @@ Transaction fee estimation.
 
 ### Prerequisites
 
-1. **Rust toolchain** with the Android target:
+1. **Rust toolchain** with the Android targets:
    ```bash
-   rustup target add aarch64-linux-android
+   rustup target add aarch64-linux-android x86_64-linux-android
    ```
-   Only `arm64-v8a` is built — the Gradle build pins
-   `abiFilters = ["arm64-v8a"]`, so any other ABI compiles but is never
-   packaged. Add the matching `rustup target add` line (and widen
-   `abiFilters`) if you re-enable an ABI in `build-android.sh`.
+   Both `arm64-v8a` and `x86_64` are built and packaged — `arm64-v8a` for real
+   devices + Apple-Silicon emulators, `x86_64` so the SDK loads on Intel
+   emulators / CI. The Gradle build pins `abiFilters = ["arm64-v8a", "x86_64"]`
+   to match `build-android.sh`'s `TARGETS`; keep the two in sync if you add or
+   drop an ABI.
 
 2. **Android NDK 26+** (LLVM toolchain)
 
@@ -173,7 +174,7 @@ Transaction fee estimation.
 
 ### Build Commands
 
-**Build the shipped ABI (arm64-v8a):**
+**Build the shipped ABIs (arm64-v8a + x86_64):**
 ```bash
 ./build-android.sh
 ```
