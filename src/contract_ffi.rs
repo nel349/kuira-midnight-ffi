@@ -549,6 +549,23 @@ mod tests {
     }
 
     #[test]
+    fn serde_handles_stack_key() {
+        // alpha05 / issue #3: the JS compact-runtime emits {tag:"stack"} for the
+        // idx ops that unshielded value transfers generate. The hand-written
+        // parse_key rejected it ("unknown key tag: stack"). Prove upstream serde
+        // already round-trips it — i.e. the hand parser is redundant for this.
+        use midnight_onchain_vm::ops::Key;
+        // round-trip (format-agnostic)
+        let s = serde_json::to_string(&Key::Stack).unwrap();
+        let back: Key = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, Key::Stack));
+        // the exact shape the JS shim emits must deserialize
+        let from_shim: Key = serde_json::from_str(r#"{"tag":"stack"}"#)
+            .expect("JS-shim stack shape must deserialize");
+        assert!(matches!(from_shim, Key::Stack));
+    }
+
+    #[test]
     fn test_persistent_hash_aligned() {
         // Test with a simple field value (0n encoded as 32-byte LE)
         // This should match what the WASM persistentHash produces
