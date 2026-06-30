@@ -566,6 +566,65 @@ mod tests {
     }
 
     #[test]
+    fn stack_key_idx_transcript_deserializes() {
+        // alpha05 / issue #3: receiveUnshielded/sendUnshielded emit an idx op whose
+        // path key is Key::Stack. The deleted hand parser rejected this ("unknown
+        // key tag: stack"); the serde path the assembler now uses accepts it.
+        use midnight_onchain_vm::ops::Op;
+        use midnight_onchain_vm::result_mode::ResultModeVerify;
+        let transcript = serde_json::json!([
+            { "idx": { "cached": false, "pushPath": false, "path": [ { "tag": "stack" } ] } }
+        ]);
+        let ops: Vec<Op<ResultModeVerify, InMemoryDB>> =
+            serde_json::from_str(&to_tag_first_json(&transcript))
+                .expect("stack-key idx transcript must deserialize via serde");
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(&ops[0], Op::Idx { .. }), "expected Op::Idx with a stack key");
+    }
+
+    #[test]
+    fn popeq_empty_atom_ok_but_trailing_zero_rejected() {
+        // The serde AlignedValue deserializer enforces normal form: an empty atom
+        // ([]) is the normal-form encoding of an empty/zero read and deserializes,
+        // while a trailing-zero atom ([0,..,0]) is rejected — exactly why the JS
+        // shim must emit [] for placeholder reads instead of zero-padding.
+        use midnight_onchain_vm::ops::Op;
+        use midnight_onchain_vm::result_mode::ResultModeVerify;
+        let field = serde_json::json!({ "tag": "atom", "value": { "tag": "field" } });
+        let empty = serde_json::json!([
+            { "popeq": { "cached": false, "result": { "value": [[]], "alignment": [field.clone()] } } }
+        ]);
+        let r: Result<Vec<Op<ResultModeVerify, InMemoryDB>>, _> =
+            serde_json::from_str(&to_tag_first_json(&empty));
+        assert!(r.is_ok(), "empty (normal-form) atom must deserialize: {:?}", r.err());
+
+        let zeros: Vec<u8> = vec![0; 32];
+        let padded = serde_json::json!([
+            { "popeq": { "cached": false, "result": { "value": [zeros], "alignment": [field] } } }
+        ]);
+        let r2: Result<Vec<Op<ResultModeVerify, InMemoryDB>>, _> =
+            serde_json::from_str(&to_tag_first_json(&padded));
+        assert!(r2.is_err(), "a trailing-zero (non-normal-form) atom must be rejected");
+    }
+
+    #[test]
+    fn key_variant_coverage_is_exhaustive() {
+        // Can't-lag guard for the enum issue #3 was about. Key is NOT
+        // #[non_exhaustive], so this non-wildcard match compiles only while Key is
+        // exactly {Value, Stack}; an upstream addition breaks the build — a prompt
+        // to confirm the JS shim emits it and add a serde test. (StateValue is
+        // #[non_exhaustive] and can't be guarded this way; serde's upstream
+        // Deserialize covers it regardless.)
+        use midnight_onchain_vm::ops::Key;
+        fn assert_covered(k: &Key) {
+            match k {
+                Key::Value(_) | Key::Stack => {}
+            }
+        }
+        assert_covered(&Key::Stack);
+    }
+
+    #[test]
     fn test_persistent_hash_aligned() {
         // Test with a simple field value (0n encoded as 32-byte LE)
         // This should match what the WASM persistentHash produces
@@ -967,163 +1026,35 @@ fn parse_alignment_segment(val: &serde_json::Value) -> Result<midnight_base_cryp
     }
 }
 
-/// Parse a Key from JSON for idx path entries.
-fn parse_key(val: &serde_json::Value) -> Result<midnight_onchain_vm::ops::Key, String> {
-    let tag = val["tag"].as_str().ok_or("key missing tag")?;
-    match tag {
-        "value" => {
-            let av = parse_aligned_value(&val["value"])?;
-            Ok(midnight_onchain_vm::ops::Key::Value(av))
-        }
-        other => Err(format!("unknown key tag: {}", other)),
-    }
-}
-
-/// Parse transcript ops from JSON into Vec<Op<ResultModeVerify, InMemoryDB>>.
+/// Re-emit a JSON value with the `tag` key first in every object.
 ///
-/// Op<ResultModeVerify> can't be JSON-deserialized via serde_json due to
-/// Midnight's Storable derive generating storage-aware serde. We parse
-/// each op manually and construct the Rust types directly.
-fn parse_transcript_ops(
-    ops: &[serde_json::Value],
-) -> Result<Vec<Op<midnight_onchain_vm::result_mode::ResultModeVerify, InMemoryDB>>, String> {
-    use midnight_onchain_vm::result_mode::ResultModeVerify;
-    
-
-    let mut result = Vec::new();
-    for (i, op_val) in ops.iter().enumerate() {
-        let op = if let Some(dup) = op_val.get("dup") {
-            let n = u8::try_from(dup["n"].as_u64().ok_or(format!("op[{}] dup missing n", i))?)
-                .map_err(|_| format!("op[{}] dup n out of range", i))?;
-            Op::<ResultModeVerify, InMemoryDB>::Dup { n }
-        } else if op_val.get("pop").is_some() {
-            Op::Pop
-        } else if let Some(popeq) = op_val.get("popeq") {
-            let cached = popeq["cached"].as_bool().unwrap_or(false);
-            let result_av = parse_aligned_value(&popeq["result"])
-                .map_err(|e| format!("op[{}] popeq.result: {}", i, e))?;
-            Op::Popeq { cached, result: result_av }
-        } else if let Some(push) = op_val.get("push") {
-            let storage = push["storage"].as_bool().unwrap_or(false);
-            let sv = parse_state_value(&push["value"])
-                .map_err(|e| format!("op[{}] push.value: {}", i, e))?;
-            Op::Push { storage, value: sv }
-        } else if let Some(idx) = op_val.get("idx") {
-            let cached = idx["cached"].as_bool().unwrap_or(false);
-            let push_path = idx.get("pushPath")
-                .or_else(|| idx.get("push_path"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let path_arr = idx["path"].as_array()
-                .ok_or(format!("op[{}] idx missing path", i))?;
-            let keys: Vec<midnight_onchain_vm::ops::Key> = path_arr.iter()
-                .enumerate()
-                .map(|(j, k)| parse_key(k).map_err(|e| format!("op[{}] path[{}]: {}", i, j, e)))
-                .collect::<Result<_, _>>()?;
-            Op::Idx { cached, push_path, path: keys.into_iter().collect() }
-        } else if let Some(ins) = op_val.get("ins") {
-            let cached = ins["cached"].as_bool().unwrap_or(false);
-            let n = u8::try_from(ins["n"].as_u64().unwrap_or(0)).unwrap_or(0);
-            Op::Ins { cached, n }
-        } else if op_val.get("lt").is_some() || op_val.as_str() == Some("lt") {
-            Op::Lt
-        } else if op_val.get("eq").is_some() || op_val.as_str() == Some("eq") {
-            Op::Eq
-        } else if let Some(noop) = op_val.get("noop") {
-            let n = u32::try_from(noop["n"].as_u64().unwrap_or(0)).unwrap_or(0);
-            Op::Noop { n }
-        } else if let Some(branch) = op_val.get("branch") {
-            let skip = u32::try_from(branch["skip"].as_u64().unwrap_or(0)).unwrap_or(0);
-            Op::Branch { skip }
-        } else if op_val.get("add").is_some() || op_val.as_str() == Some("add") {
-            Op::Add
-        } else if op_val.get("sub").is_some() || op_val.as_str() == Some("sub") {
-            Op::Sub
-        } else if let Some(concat) = op_val.get("concat") {
-            let cached = concat["cached"].as_bool().unwrap_or(false);
-            let n = u32::try_from(concat["n"].as_u64().unwrap_or(0)).unwrap_or(0);
-            Op::Concat { cached, n }
-        } else if let Some(swap) = op_val.get("swap") {
-            let n = u8::try_from(swap["n"].as_u64().unwrap_or(0)).unwrap_or(0);
-            Op::Swap { n }
-        } else if let Some(rem) = op_val.get("rem") {
-            let cached = rem["cached"].as_bool().unwrap_or(false);
-            Op::Rem { cached }
-        } else if op_val.get("ckpt").is_some() {
-            Op::Ckpt
-        } else if op_val.get("member").is_some() || op_val.as_str() == Some("member") {
-            Op::Member
-        } else if op_val.get("neg").is_some() || op_val.as_str() == Some("neg") {
-            Op::Neg
-        } else if op_val.get("and").is_some() || op_val.as_str() == Some("and") {
-            Op::And
-        } else if op_val.get("or").is_some() || op_val.as_str() == Some("or") {
-            Op::Or
-        } else if op_val.get("type").is_some() || op_val.as_str() == Some("type") {
-            Op::Type
-        } else if op_val.get("size").is_some() || op_val.as_str() == Some("size") {
-            Op::Size
-        } else if op_val.get("new").is_some() || op_val.as_str() == Some("new") {
-            Op::New
-        } else if op_val.get("log").is_some() || op_val.as_str() == Some("log") {
-            Op::Log
-        } else if op_val.get("root").is_some() || op_val.as_str() == Some("root") {
-            Op::Root
-        } else if let Some(jmp) = op_val.get("jmp") {
-            let skip = u32::try_from(jmp["skip"].as_u64().unwrap_or(0)).unwrap_or(0);
-            Op::Jmp { skip }
-        } else if let Some(addi) = op_val.get("addi") {
-            let imm = u32::try_from(addi["immediate"].as_u64().unwrap_or(0)).unwrap_or(0);
-            Op::Addi { immediate: imm }
-        } else if let Some(subi) = op_val.get("subi") {
-            let imm = u32::try_from(subi["immediate"].as_u64().unwrap_or(0)).unwrap_or(0);
-            Op::Subi { immediate: imm }
-        } else {
-            return Err(format!("op[{}] unknown format: {}", i,
-                serde_json::to_string(op_val).unwrap_or_default().chars().take(200).collect::<String>()));
-        };
-        result.push(op);
-    }
-    Ok(result)
-}
-
-/// Parse a StateValue from JSON.
-/// StateValue has custom Storable serde that doesn't round-trip through JSON.
-fn parse_state_value(val: &serde_json::Value) -> Result<midnight_onchain_state::state::StateValue<InMemoryDB>, String> {
-    use midnight_onchain_state::state::StateValue as SV;
-    use midnight_storage::arena::Sp;
-
-    if val.is_null() {
-        return Ok(SV::Null);
-    }
-
-    // Tagged format: { "tag": "null" } or { "tag": "cell", "content": {...} } etc.
-    if let Some(tag) = val.get("tag").and_then(|t| t.as_str()) {
-        return match tag {
-            "null" => Ok(SV::Null),
-            "cell" => {
-                let av = parse_aligned_value(&val["content"])
-                    .map_err(|e| format!("cell content: {}", e))?;
-                Ok(SV::Cell(Sp::new(av)))
+/// `serde_json::from_value` walks a `Value::Object`, which is a sorted `BTreeMap`
+/// here (the crate has no `preserve_order` feature) — so it yields `content`
+/// before `tag`. onchain-state's `StateValue` deserializer is order-sensitive and
+/// requires `tag` first ("StateValue tag must preceed contents",
+/// onchain-state/src/state.rs:333). Re-emitting tag-first and deserializing with
+/// `from_str` (which honors document order, unlike `from_value`) feeds the
+/// upstream serde impls the field order they require. `Key`/`AlignedValue` are
+/// order-independent, so tag-first is the only constraint to satisfy.
+fn to_tag_first_json(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut parts: Vec<String> = Vec::with_capacity(map.len());
+            if let Some(tag) = map.get("tag") {
+                parts.push(format!("\"tag\":{}", to_tag_first_json(tag)));
             }
-            "array" => {
-                let items = val["content"].as_array().ok_or("array missing content")?;
-                let values: Vec<SV<InMemoryDB>> = items.iter()
-                    .map(|item| parse_state_value(item))
-                    .collect::<Result<_, _>>()?;
-                Ok(SV::Array(values.into()))
+            for (k, val) in map {
+                if k != "tag" {
+                    parts.push(format!("{}:{}", serde_json::to_string(k).unwrap(), to_tag_first_json(val)));
+                }
             }
-            other => Err(format!("unknown StateValue tag: {}", other)),
-        };
+            format!("{{{}}}", parts.join(","))
+        }
+        serde_json::Value::Array(arr) => {
+            format!("[{}]", arr.iter().map(to_tag_first_json).collect::<Vec<_>>().join(","))
+        }
+        other => other.to_string(),
     }
-
-    // Simple null check
-    if val.as_str() == Some("null") {
-        return Ok(SV::Null);
-    }
-
-    Err(format!("unrecognized StateValue format: {}",
-        serde_json::to_string(val).unwrap_or_default().chars().take(100).collect::<String>()))
 }
 
 /// Convert ResultModeVerify ops to ResultModeGather for re-execution.
@@ -1266,14 +1197,14 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
         .map(|(i, v)| parse_aligned_value(v).map_err(|e| format!("private_output[{}]: {}", i, e)))
         .collect::<Result<_, _>>()?;
 
-    // 4. Parse public transcript ops manually.
-    //    Op<ResultModeVerify> can't be JSON-deserialized due to Midnight's
-    //    Storable derive generating storage-aware serde implementations.
-    //    We parse the JSON and construct ops by hand.
-    let transcript_array = proof_data["public_transcript"].as_array()
-        .ok_or("public_transcript is not an array")?;
-    let transcript_ops = parse_transcript_ops(transcript_array)
-        .map_err(|e| format!("transcript parse: {}", e))?;
+    // 4. Deserialize the public transcript ops via upstream serde.
+    //    Op<ResultModeVerify>/Key/StateValue all derive serde Deserialize
+    //    upstream, and the JS shim emits the matching shape in normal form, so
+    //    there is no hand-parsing (the old hand parser lagged upstream — it was
+    //    missing Key::Stack, which broke receiveUnshielded/sendUnshielded; see #3).
+    let transcript_ops: Vec<Op<ResultModeVerify, InMemoryDB>> =
+        serde_json::from_str(&to_tag_first_json(&proof_data["public_transcript"]))
+            .map_err(|e| format!("transcript deserialize: {}", e))?;
 
     // 5. Decode the live ledger parameters. Required for partition_transcripts,
     //    which uses params.limits.min_time_to_dismiss + params.cost_model to
@@ -2337,6 +2268,7 @@ mod persistent_commit_crosscheck {
 mod readmismatch_repro {
     use super::*;
     use std::ffi::CString;
+    use midnight_onchain_vm::result_mode::ResultModeVerify;
 
     const FIXTURE: &str = include_str!("../test-fixtures/readmismatch-post.json");
 
@@ -2417,7 +2349,9 @@ mod readmismatch_repro {
         // circuit claims it read for the Counter.
         let transcript_ops_json = fx["params"]["proof_data"]["public_transcript"]
             .as_array().unwrap();
-        let verify_ops = parse_transcript_ops(transcript_ops_json).expect("parse transcript");
+        let verify_ops: Vec<Op<ResultModeVerify, InMemoryDB>> = serde_json::from_str(
+            &to_tag_first_json(&fx["params"]["proof_data"]["public_transcript"]),
+        ).expect("deserialize transcript");
         let gather_ops = convert_verify_to_gather(&verify_ops);
 
         let qc = QueryContext::<InMemoryDB> {
@@ -2443,10 +2377,12 @@ mod readmismatch_repro {
         let native_counter = &reads[1];
         let native_nonzero = native_counter.iter().flatten().any(|&b| b != 0);
 
-        // The device transcript recorded that same Counter read (popeq[5]) as all-zero.
+        // The device transcript recorded that same Counter read (popeq[5]) as zero —
+        // now an empty atom ([], the normal-form encoding of zero) after the serde change.
         let device_counter = transcript_ops_json[5]["popeq"]["result"]["value"][0]
             .as_array().expect("device popeq[5] value");
-        let device_zero = device_counter.iter().all(|v| v.as_u64() == Some(0));
+        let device_zero = device_counter.is_empty()
+            || device_counter.iter().all(|v| v.as_u64() == Some(0));
         println!("device transcript b8 read: {:?}", device_counter);
 
         // The on-chain state reads Counter=1; the device transcript recorded 0. The
@@ -2479,8 +2415,8 @@ mod readmismatch_repro {
         let state: RustContractState<InMemoryDB> =
             midnight_serialize::tagged_deserialize(&mut &bytes[..]).unwrap();
 
-        let verify_ops = parse_transcript_ops(
-            fx["params"]["proof_data"]["public_transcript"].as_array().unwrap()
+        let verify_ops: Vec<Op<ResultModeVerify, InMemoryDB>> = serde_json::from_str(
+            &to_tag_first_json(&fx["params"]["proof_data"]["public_transcript"]),
         ).unwrap();
         let gather_ops = convert_verify_to_gather(&verify_ops);
         let chunks: [&[Op<ResultModeGather, InMemoryDB>]; 5] = [
