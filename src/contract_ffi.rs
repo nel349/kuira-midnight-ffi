@@ -41,7 +41,10 @@ fn lock_state_pool() -> Option<std::sync::MutexGuard<'static, HashMap<u64, RustC
     // intact, but a poisoned `Mutex` would otherwise cascade: every subsequent
     // `lock()` returns `Err`, so `contract_state_create` starts returning 0 and
     // unrelated pool tests fail en masse. `into_inner()` keeps the map usable.
-    Some(STATE_POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    Some(STATE_POOL.lock().unwrap_or_else(|poisoned| {
+        eprintln!("WARNING: lock_state_pool recovered a poisoned mutex — a prior panic poisoned the state pool; continuing with the intact map");
+        poisoned.into_inner()
+    }))
 }
 
 /// Helper: convert hex string to bytes
@@ -63,6 +66,18 @@ fn to_c_string(s: &str) -> *const c_char {
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null(),
     }
+}
+
+/// The midnight-ledger version this client links against. Used by the host to
+/// run a coherence check against the node's `midnight_ledgerVersion` so a
+/// client built behind the chain fails loudly instead of mis-decoding ops.
+/// keep in sync with the vendored midnight-ledger/Cargo.toml package.version
+const LEDGER_VERSION: &str = "8.0.3";
+
+/// Return the client's bundled midnight-ledger version (e.g. "8.0.3").
+#[no_mangle]
+pub extern "C" fn kuira_ledger_version() -> *const c_char {
+    to_c_string(LEDGER_VERSION)
 }
 
 // ── State Handle Pool ──
@@ -710,7 +725,13 @@ pub extern "C" fn contract_state_create_with_nulls(structure_json: *const c_char
 
     // Parse structure descriptor and build nested state
     let state_value = if let Ok(descriptor) = serde_json::from_str::<serde_json::Value>(input) {
-        build_state_from_descriptor::<InMemoryDB>(&descriptor)
+        match build_state_from_descriptor::<InMemoryDB>(&descriptor) {
+            Ok(sv) => sv,
+            Err(e) => {
+                eprintln!("ERROR: contract_state_create_with_nulls: {}", e);
+                return 0;
+            }
+        }
     } else if let Ok(num) = input.parse::<u32>() {
         // Backward compat: plain number = flat array of N nulls
         let items: Vec<RustSV<InMemoryDB>> = (0..num).map(|_| RustSV::Null).collect();
@@ -736,44 +757,53 @@ pub extern "C" fn contract_state_create_with_nulls(structure_json: *const c_char
 /// Safety: max 64 items per array, max 4 nesting depth to prevent OOM
 fn build_state_from_descriptor<D: midnight_storage::db::DB>(
     desc: &serde_json::Value,
-) -> midnight_onchain_state::state::StateValue<D> {
+) -> Result<midnight_onchain_state::state::StateValue<D>, String> {
     build_state_recursive::<D>(desc, 0)
 }
 
 fn build_state_recursive<D: midnight_storage::db::DB>(
     desc: &serde_json::Value,
     depth: usize,
-) -> midnight_onchain_state::state::StateValue<D> {
+) -> Result<midnight_onchain_state::state::StateValue<D>, String> {
     use midnight_onchain_state::state::StateValue as SV;
 
     if depth > 4 {
-        return SV::Null; // Prevent unbounded recursion
+        return Err("build_state_recursive: nesting too deep (>4)".into());
     }
 
     match desc {
-        serde_json::Value::Null => SV::Null,
+        serde_json::Value::Null => Ok(SV::Null),
         serde_json::Value::Object(obj) => {
             if let Some(items) = obj.get("array") {
                 if let serde_json::Value::Array(arr) = items {
                     let count = arr.len().min(64); // Cap at 64 items
                     let built: Vec<SV<D>> = arr.iter().take(count)
                         .map(|item| build_state_recursive(item, depth + 1))
-                        .collect();
-                    SV::Array(built.into())
+                        .collect::<Result<_, _>>()?;
+                    Ok(SV::Array(built.into()))
                 } else {
-                    SV::Null
+                    Err(format!(
+                        "build_state_recursive: unsupported state node at depth {}: \"array\" field is not an array: {}",
+                        depth, items
+                    ))
                 }
             } else {
-                SV::Null
+                Err(format!(
+                    "build_state_recursive: unsupported state node at depth {}: {}",
+                    depth, desc
+                ))
             }
         }
         // Number = flat array of N nulls (legacy)
         serde_json::Value::Number(n) => {
             let count = n.as_u64().unwrap_or(0).min(64) as usize;
             let items: Vec<SV<D>> = (0..count).map(|_| SV::Null).collect();
-            SV::Array(items.into())
+            Ok(SV::Array(items.into()))
         }
-        _ => SV::Null,
+        _ => Err(format!(
+            "build_state_recursive: unsupported state node at depth {}: {}",
+            depth, desc
+        )),
     }
 }
 
@@ -1061,8 +1091,8 @@ fn to_tag_first_json(v: &serde_json::Value) -> String {
 /// Strips popeq.result (AlignedValue → ()) since the VM recomputes results.
 fn convert_verify_to_gather(
     ops: &[Op<midnight_onchain_vm::result_mode::ResultModeVerify, InMemoryDB>],
-) -> Vec<Op<ResultModeGather, InMemoryDB>> {
-    ops.iter().map(|op| match op {
+) -> Result<Vec<Op<ResultModeGather, InMemoryDB>>, String> {
+    ops.iter().map(|op| Ok(match op {
         Op::Dup { n } => Op::Dup { n: *n },
         Op::Pop => Op::Pop,
         Op::Popeq { cached, .. } => Op::Popeq { cached: *cached, result: () },
@@ -1093,11 +1123,11 @@ fn convert_verify_to_gather(
         Op::Rem { cached } => Op::Rem { cached: *cached },
         Op::Addi { immediate } => Op::Addi { immediate: *immediate },
         Op::Subi { immediate } => Op::Subi { immediate: *immediate },
-        other => {
-            eprintln!("WARNING: convert_verify_to_gather encountered unknown op: {:?}", other);
-            Op::Noop { n: 0 }
-        }
-    }).collect()
+        other => return Err(format!(
+            "convert_verify_to_gather: unhandled op variant {:?} — client ledger may be behind the node",
+            other
+        )),
+    })).collect()
 }
 
 /// Build a QueryContext matching the on-chain VM's context for gas computation.
@@ -1112,23 +1142,39 @@ fn convert_verify_to_gather(
 fn build_gas_query_context(
     state: midnight_onchain_state::state::ChargedState<InMemoryDB>,
     contract_address_hex: &str,
-) -> midnight_onchain_runtime::context::QueryContext<InMemoryDB> {
+    block_time_secs: Option<i64>,
+) -> Result<midnight_onchain_runtime::context::QueryContext<InMemoryDB>, String> {
     use midnight_base_crypto::time::Timestamp;
     use midnight_base_crypto::hash::HashOutput;
     use midnight_coin_structure::contract::ContractAddress;
 
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // Anchor block time to the chain when the caller supplies it; only fall
+    // back to wall-clock when chain time is genuinely absent. Wall-clock can
+    // drift from the chain's notion of `tblock` and skew gas/TTL accounting.
+    let now_secs = match block_time_secs {
+        Some(t) if t > 0 => t as u64,
+        _ => {
+            eprintln!("WARNING: build_gas_query_context: chain block time absent — falling back to wall-clock for tblock");
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        }
+    };
 
-    let addr_bytes = hex::decode(contract_address_hex).unwrap_or_else(|_| vec![0u8; 32]);
+    let addr_bytes = hex::decode(contract_address_hex)
+        .map_err(|e| format!("invalid contract_address hex: {}", e))?;
+    if addr_bytes.len() != 32 {
+        return Err(format!(
+            "invalid contract_address: expected 32 bytes, got {}",
+            addr_bytes.len()
+        ));
+    }
     let mut addr_arr = [0u8; 32];
-    let copy_len = addr_bytes.len().min(32);
-    addr_arr[..copy_len].copy_from_slice(&addr_bytes[..copy_len]);
+    addr_arr.copy_from_slice(&addr_bytes);
     let addr = ContractAddress(HashOutput(addr_arr));
 
-    midnight_onchain_runtime::context::QueryContext {
+    Ok(midnight_onchain_runtime::context::QueryContext {
         state,
         address: addr,
         effects: Default::default(),
@@ -1140,7 +1186,7 @@ fn build_gas_query_context(
             last_block_time: Timestamp::from_secs(now_secs.saturating_sub(6)),
             ..Default::default()
         },
-    }
+    })
 }
 
 fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
@@ -1265,7 +1311,12 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
             return Err(format!("invalid state_handle: {}", state_handle));
         }
 
-        let qc = build_gas_query_context(initial_state.data.clone(), contract_address_hex);
+        let block_time_secs = params["block_time_secs"].as_i64();
+        let qc = build_gas_query_context(
+            initial_state.data.clone(),
+            contract_address_hex,
+            block_time_secs,
+        )?;
 
         let pre = PreTranscript {
             context: qc,
@@ -2352,7 +2403,7 @@ mod readmismatch_repro {
         let verify_ops: Vec<Op<ResultModeVerify, InMemoryDB>> = serde_json::from_str(
             &to_tag_first_json(&fx["params"]["proof_data"]["public_transcript"]),
         ).expect("deserialize transcript");
-        let gather_ops = convert_verify_to_gather(&verify_ops);
+        let gather_ops = convert_verify_to_gather(&verify_ops).expect("convert verify→gather");
 
         let qc = QueryContext::<InMemoryDB> {
             state: state.data.clone(),
@@ -2418,7 +2469,7 @@ mod readmismatch_repro {
         let verify_ops: Vec<Op<ResultModeVerify, InMemoryDB>> = serde_json::from_str(
             &to_tag_first_json(&fx["params"]["proof_data"]["public_transcript"]),
         ).unwrap();
-        let gather_ops = convert_verify_to_gather(&verify_ops);
+        let gather_ops = convert_verify_to_gather(&verify_ops).expect("convert verify→gather");
         let chunks: [&[Op<ResultModeGather, InMemoryDB>]; 5] = [
             &gather_ops[0..3],   // read state
             &gather_ops[3..6],   // read sequence  ← watch this one
@@ -2475,5 +2526,90 @@ mod readmismatch_repro {
         lock_state_pool().unwrap().remove(&handle);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
         v.get(2).cloned().unwrap_or(serde_json::Value::Null)
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use midnight_onchain_vm::ops::Op;
+    use midnight_onchain_vm::result_mode::ResultModeVerify;
+    use midnight_storage::db::InMemoryDB;
+    use midnight_base_crypto::fab::{
+        AlignedValue, Value, Alignment, AlignmentSegment, AlignmentAtom,
+    };
+    use midnight_onchain_state::state::StateValue;
+
+    /// Every handled `Op` variant must survive `convert_verify_to_gather` — none
+    /// may silently collapse to `Noop` (which would corrupt the re-gathered
+    /// transcript). Build one of each handled variant and assert the conversion
+    /// succeeds and preserves length.
+    #[test]
+    fn gather_conversion_covers_every_op() {
+        use midnight_transient_crypto::curve::Fr;
+
+        // An AlignedValue for the Popeq result (ResultModeVerify::ReadResult).
+        let zero_fr = Fr::from_le_bytes(&[0u8]).unwrap();
+        let field_align = Alignment(vec![AlignmentSegment::Atom(AlignmentAtom::Field)]);
+        let aligned_zero = AlignedValue {
+            value: Value::from(zero_fr),
+            alignment: field_align.clone(),
+        };
+
+        // A Key for the Idx path.
+        let key = midnight_onchain_vm::ops::Key::Value(AlignedValue {
+            value: Value::from(zero_fr),
+            alignment: field_align,
+        });
+
+        let ops: Vec<Op<ResultModeVerify, InMemoryDB>> = vec![
+            Op::Dup { n: 1 },
+            Op::Pop,
+            Op::Idx { cached: false, push_path: false, path: vec![key].into_iter().collect() },
+            Op::Ins { cached: false, n: 1 },
+            Op::Lt,
+            Op::Eq,
+            Op::Add,
+            Op::Sub,
+            Op::Neg,
+            Op::And,
+            Op::Or,
+            Op::Type,
+            Op::Size,
+            Op::New,
+            Op::Log,
+            Op::Root,
+            Op::Member,
+            Op::Ckpt,
+            Op::Noop { n: 0 },
+            Op::Branch { skip: 0 },
+            Op::Jmp { skip: 0 },
+            Op::Concat { cached: false, n: 1 },
+            Op::Swap { n: 0 },
+            Op::Rem { cached: false },
+            Op::Addi { immediate: 1 },
+            Op::Subi { immediate: 1 },
+            Op::Popeq { cached: false, result: aligned_zero },
+            Op::Push { storage: false, value: StateValue::Null },
+        ];
+        let expected_len = ops.len();
+
+        let gathered = convert_verify_to_gather(&ops)
+            .expect("every handled op variant must convert");
+        assert_eq!(
+            gathered.len(), expected_len,
+            "conversion must preserve length — a variant silently collapsed"
+        );
+    }
+
+    /// The exported client ledger version must match the vendored ledger so the
+    /// host's coherence check compares the right string.
+    #[test]
+    fn ledger_version_is_exported() {
+        let ptr = kuira_ledger_version();
+        assert!(!ptr.is_null());
+        let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_owned();
+        unsafe { contract_free_string(ptr as *mut c_char) };
+        assert_eq!(s, "8.0.3");
     }
 }

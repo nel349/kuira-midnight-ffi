@@ -118,14 +118,8 @@ pub extern "C" fn derive_shielded_keys(
     // Derive keys using Midnight's implementation
     let secret_keys = SecretKeys::from(seed);
 
-    // Debug: Print coin secret key
-    eprintln!("DEBUG coin_secret_key bytes: {:?}", &secret_keys.coin_secret_key.0.0[..]);
-
     let coin_pk = secret_keys.coin_public_key();
     let enc_pk = secret_keys.enc_public_key();
-
-    // Debug: Print raw coin public key bytes
-    eprintln!("DEBUG coin_pk HashOutput bytes: {:?}", &coin_pk.0.0[..]);
 
     // Serialize both public keys using Serializable trait
     // This matches what the WASM wrapper does via to_value_hex_ser

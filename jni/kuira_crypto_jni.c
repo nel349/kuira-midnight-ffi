@@ -156,6 +156,7 @@ extern void contract_free_string(char* ptr);
 extern const char* contract_assemble_call_tx(const char* params_json);
 extern const char* contract_assemble_deploy_tx(const char* params_json);
 extern int64_t ledger_params_global_ttl_secs(const char* params_hex);
+extern const char* kuira_ledger_version(void);
 extern uint64_t contract_state_clone(uint64_t handle);
 
 /* Transaction signing (Phase 2D-FFI) */
@@ -3271,6 +3272,24 @@ Java_com_midnight_kuira_core_compact_ContractRuntime_nativeGlobalTtlSecs(
     jlong secs = (jlong)ledger_params_global_ttl_secs(hex_c);
     (*env)->ReleaseStringUTFChars(env, paramsHex, hex_c);
     return secs;
+}
+
+/*
+ * The client's bundled midnight-ledger version (e.g. "8.0.3"). The host runs a
+ * coherence check against the node's reported version so a client built behind
+ * the chain warns loudly instead of mis-decoding ops (the "Custom error: N" class).
+ * The Rust side returns a heap CString (into_raw), so free it after copying.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeLedgerVersion(
+    JNIEnv* env, jclass clazz) {
+
+    const char* result = kuira_ledger_version();
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    contract_free_string((char*)result);
+    return jresult;
 }
 
 /**
