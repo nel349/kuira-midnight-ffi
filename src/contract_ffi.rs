@@ -532,6 +532,39 @@ mod tests {
     use std::ffi::CStr;
 
     #[test]
+    fn empty_map_state_value_deserializes_from_shim_format() {
+        // The JS runtime shim (StateValue.newMap) emits an empty Map/Set ledger field
+        // as {"tag":"map","content":{}} — the adjacently-tagged StateValue form where a
+        // Map's content is its HashMap serialized via serde `collect_map` (a JSON
+        // object; empty → {}). Deploying ANY contract with Map/Set ledger state (e.g.
+        // the Vault multisig) pushes this through queryLedgerState at construction, so
+        // it MUST deserialize to Map(empty). Guards the shim↔native format contract.
+        let sv: midnight_onchain_state::state::StateValue<InMemoryDB> =
+            serde_json::from_str(r#"{"tag":"map","content":{}}"#)
+                .expect("empty-map shim JSON must deserialize to StateValue::Map");
+        match sv {
+            midnight_onchain_state::state::StateValue::Map(ref m) => {
+                assert_eq!(m.size(), 0, "expected an empty map");
+            }
+            other => panic!("expected Map, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn empty_map_state_value_round_trips_through_tag_first() {
+        // Full JS→native→JS contract: deserialize the shim form, re-serialize, run the
+        // same tag-first normalization the transcript path uses, and confirm it
+        // survives without drifting off Map(empty).
+        use midnight_onchain_state::state::StateValue;
+        let sv: StateValue<InMemoryDB> =
+            serde_json::from_str(r#"{"tag":"map","content":{}}"#).unwrap();
+        let reserialized = serde_json::to_value(&sv).unwrap();
+        let tag_first = to_tag_first_json(&reserialized);
+        let back: StateValue<InMemoryDB> = serde_json::from_str(&tag_first).unwrap();
+        assert!(matches!(back, StateValue::Map(ref m) if m.size() == 0));
+    }
+
+    #[test]
     fn test_persistent_hash() {
         // Hash of empty input
         let input = CString::new("").unwrap();
