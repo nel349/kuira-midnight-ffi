@@ -1222,6 +1222,161 @@ fn build_gas_query_context(
     })
 }
 
+/// Build the unsigned guaranteed unshielded offer that funds the value a contract
+/// receives via `receiveUnshielded`, plus one NIGHT signing key per input for the
+/// caller's `Intent::sign`.
+///
+/// The offer's inputs (wallet UTXOs) sum to `amount + change`; its only output is the
+/// change back to the wallet (omitted when zero). The contract action absorbs `amount`,
+/// so the unshielded segment balances: `Σinputs − Σoutputs == amount`.
+///
+/// `funding` JSON shape:
+/// ```json
+/// { "amount": "5000000",
+///   "change_owner": "<UserAddress hex, 32 bytes>",
+///   "night_private_key": "<hex, 32 bytes>",
+///   "inputs": [ { "value": "10000000", "owner": "<VerifyingKey hex, 32 bytes>",
+///                 "type": "<token hex, 32 bytes>", "intent_hash": "<hex, 32 bytes>",
+///                 "output_no": 0 } ] }
+/// ```
+///
+/// Regression note: reached ONLY when the caller supplies `unshielded_funding`; a plain
+/// contract call never constructs an offer, so its transaction is unchanged.
+fn build_funding_offer(
+    funding: &serde_json::Value,
+) -> Result<
+    (
+        midnight_ledger::structure::UnshieldedOffer<midnight_base_crypto::signatures::Signature, InMemoryDB>,
+        Vec<midnight_base_crypto::signatures::SigningKey>,
+    ),
+    String,
+> {
+    use midnight_ledger::structure::{UnshieldedOffer, UtxoSpend, UtxoOutput, IntentHash};
+    use midnight_coin_structure::coin::{UnshieldedTokenType, UserAddress};
+    use midnight_base_crypto::signatures::{Signature, VerifyingKey, SigningKey};
+    use midnight_base_crypto::hash::HashOutput;
+    use midnight_serialize::Deserializable;
+
+    let amount: u128 = funding["amount"]
+        .as_str()
+        .ok_or("unshielded_funding.amount missing")?
+        .parse()
+        .map_err(|e| format!("unshielded_funding.amount: {}", e))?;
+
+    let inputs_json = funding["inputs"]
+        .as_array()
+        .ok_or("unshielded_funding.inputs missing")?;
+    if inputs_json.is_empty() {
+        return Err("unshielded_funding.inputs is empty".into());
+    }
+
+    let mut inputs: Vec<UtxoSpend> = Vec::with_capacity(inputs_json.len());
+    let mut total: u128 = 0;
+    let mut token_type_hex: Option<String> = None;
+
+    for (i, jin) in inputs_json.iter().enumerate() {
+        let value: u128 = jin["value"]
+            .as_str()
+            .ok_or_else(|| format!("input[{}].value missing", i))?
+            .parse()
+            .map_err(|e| format!("input[{}].value: {}", i, e))?;
+
+        let owner_bytes = hex::decode(
+            jin["owner"].as_str().ok_or_else(|| format!("input[{}].owner missing", i))?,
+        )
+        .map_err(|e| format!("input[{}].owner hex: {}", i, e))?;
+        if owner_bytes.len() != 32 {
+            return Err(format!("input[{}].owner must be 32 bytes", i));
+        }
+        // Android deserialize workaround (see serialize.rs:445): use Cursor.
+        let mut cursor = std::io::Cursor::new(owner_bytes);
+        let owner = <VerifyingKey as Deserializable>::deserialize(&mut cursor, 32)
+            .map_err(|e| format!("input[{}].owner verifying key: {:?}", i, e))?;
+
+        let tt_hex = jin["type"].as_str().ok_or_else(|| format!("input[{}].type missing", i))?;
+        match &token_type_hex {
+            None => token_type_hex = Some(tt_hex.to_string()),
+            Some(first) if first != tt_hex => {
+                return Err("all funding inputs must share one token type".into());
+            }
+            _ => {}
+        }
+        let tt_bytes = hex::decode(tt_hex).map_err(|e| format!("input[{}].type hex: {}", i, e))?;
+        if tt_bytes.len() != 32 {
+            return Err(format!("input[{}].type must be 32 bytes", i));
+        }
+        let mut tt_arr = [0u8; 32];
+        tt_arr.copy_from_slice(&tt_bytes);
+        let type_ = UnshieldedTokenType(HashOutput(tt_arr));
+
+        let ih_bytes = hex::decode(
+            jin["intent_hash"].as_str().ok_or_else(|| format!("input[{}].intent_hash missing", i))?,
+        )
+        .map_err(|e| format!("input[{}].intent_hash hex: {}", i, e))?;
+        let intent_hash = IntentHash::deserialize(&mut &ih_bytes[..], 32)
+            .map_err(|e| format!("input[{}].intent_hash: {:?}", i, e))?;
+
+        let output_no = jin["output_no"]
+            .as_u64()
+            .ok_or_else(|| format!("input[{}].output_no missing", i))? as u32;
+
+        total = total.checked_add(value).ok_or("funding input value overflow")?;
+        inputs.push(UtxoSpend { value, owner, type_, intent_hash, output_no });
+    }
+
+    if total < amount {
+        return Err(format!("funding inputs total {} < amount {}", total, amount));
+    }
+    let change = total - amount;
+    let token_type_hex = token_type_hex.expect("non-empty inputs guarantee a token type");
+
+    let mut outputs: Vec<UtxoOutput> = Vec::new();
+    if change > 0 {
+        let change_owner_bytes = hex::decode(
+            funding["change_owner"].as_str().ok_or("unshielded_funding.change_owner missing")?,
+        )
+        .map_err(|e| format!("change_owner hex: {}", e))?;
+        let change_owner = <UserAddress as Deserializable>::deserialize(&mut &change_owner_bytes[..], 32)
+            .map_err(|e| format!("change_owner: {:?}", e))?;
+        let tt_bytes = hex::decode(&token_type_hex).map_err(|e| format!("token type hex: {}", e))?;
+        let mut tt_arr = [0u8; 32];
+        tt_arr.copy_from_slice(&tt_bytes);
+        outputs.push(UtxoOutput {
+            value: change,
+            owner: change_owner,
+            type_: UnshieldedTokenType(HashOutput(tt_arr)),
+        });
+    }
+
+    // Canonical sorted order (ledger verify.rs:435-442). All signing keys are the same
+    // NIGHT key, so sort order never disturbs the key<->input pairing in Intent::sign.
+    inputs.sort();
+    outputs.sort();
+    let input_count = inputs.len();
+
+    let night_key_bytes = hex::decode(
+        funding["night_private_key"].as_str().ok_or("unshielded_funding.night_private_key missing")?,
+    )
+    .map_err(|e| format!("night_private_key hex: {}", e))?;
+    if night_key_bytes.len() != 32 {
+        return Err("night_private_key must be 32 bytes".into());
+    }
+    let mut nk = [0u8; 32];
+    nk.copy_from_slice(&night_key_bytes);
+    // One key per input (all the wallet's NIGHT key). Re-derive rather than Clone so we
+    // don't assume SigningKey: Clone. Intent::sign verifies each input's owner matches.
+    let keys: Vec<SigningKey> = (0..input_count)
+        .map(|_| SigningKey::from_bytes(&nk).map_err(|e| format!("night signing key: {:?}", e)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let offer = UnshieldedOffer::<Signature, InMemoryDB> {
+        inputs: inputs.into_iter().collect(),
+        outputs: outputs.into_iter().collect(),
+        signatures: Vec::<Signature>::new().into_iter().collect(),
+    };
+    Ok((offer, keys))
+}
+
 fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     use midnight_onchain_vm::result_mode::ResultModeVerify;
     
@@ -1397,6 +1552,24 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     let intent = Intent::<Signature, ProofPreimageMarker, _, InMemoryDB>::empty(
         &mut OsRng, ttl,
     ).add_call::<ProofPreimage>(prototype);
+
+    // 8b. Fund the unshielded value the contract receives via receiveUnshielded, if the
+    //     caller declared it. Plain contract calls (no `unshielded_funding`) skip this
+    //     entirely — their transaction is byte-identical to before. The offer + call are
+    //     signed together at segment 1 (matches the intents-map key below); Intent::sign
+    //     erases proofs first, so the signature survives proving and the balancer's later
+    //     dust merge.
+    let intent = match params.get("unshielded_funding") {
+        Some(funding) if !funding.is_null() => {
+            let (offer, signing_keys) = build_funding_offer(funding)?;
+            let mut intent = intent;
+            intent.guaranteed_unshielded_offer = Some(midnight_storage::arena::Sp::new(offer));
+            intent
+                .sign(&mut OsRng, 1, &signing_keys, &[], &[])
+                .map_err(|e| format!("sign contract-call unshielded offer: {:?}", e))?
+        }
+        _ => intent,
+    };
 
     // 9. Build Transaction from intents
     let mut intents_map = midnight_storage::storage::HashMap::<u16, _, InMemoryDB>::default();
@@ -2644,5 +2817,91 @@ mod hardening_tests {
         let s = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap().to_owned();
         unsafe { contract_free_string(ptr as *mut c_char) };
         assert_eq!(s, "8.0.3");
+    }
+}
+
+#[cfg(test)]
+mod funding_offer_tests {
+    use super::*;
+    use midnight_base_crypto::signatures::SigningKey;
+    use midnight_serialize::Serializable;
+    use serde_json::json;
+
+    // A deterministic NIGHT key and the hex of its verifying key (the input owner).
+    fn night_key_and_vk_hex() -> ([u8; 32], String) {
+        let nk = [7u8; 32];
+        let sk = SigningKey::from_bytes(&nk).expect("signing key from bytes");
+        let vk = sk.verifying_key();
+        let mut buf = Vec::new();
+        Serializable::serialize(&vk, &mut buf).expect("serialize verifying key");
+        (nk, hex::encode(&buf))
+    }
+
+    // The core fix for node error 138: the funding offer must contribute EXACTLY the
+    // received `amount` to the unshielded segment (Σinputs − Σoutputs == amount), so it
+    // cancels the contract's receiveUnshielded(−amount) and the segment balances.
+    #[test]
+    fn funding_offer_provides_exactly_the_received_amount() {
+        let (nk, vk_hex) = night_key_and_vk_hex();
+        let native = "00".repeat(32);
+        let ih = "11".repeat(32);
+        // inputs 6M + 4M = 10M; contract claims 7M; change 3M.
+        let funding = json!({
+            "amount": "7000000",
+            "change_owner": "22".repeat(32),
+            "night_private_key": hex::encode(nk),
+            "inputs": [
+                {"value":"6000000","owner":vk_hex,"type":native,"intent_hash":ih,"output_no":0},
+                {"value":"4000000","owner":vk_hex,"type":native,"intent_hash":ih,"output_no":1}
+            ]
+        });
+        let (offer, keys) = build_funding_offer(&funding).expect("build offer");
+        let in_sum: u128 = offer.inputs.iter().map(|s| s.value).sum();
+        let out_sum: u128 = offer.outputs.iter().map(|o| o.value).sum();
+        assert_eq!(in_sum, 10_000_000, "inputs sum");
+        assert_eq!(out_sum, 3_000_000, "change output value");
+        assert_eq!(in_sum - out_sum, 7_000_000, "offer must fund exactly the received amount");
+        assert_eq!(keys.len(), 2, "one signing key per input");
+        assert_eq!(offer.outputs.iter().count(), 1, "exactly one change output");
+    }
+
+    // When inputs sum exactly to the amount, there is no change → zero outputs
+    // (UtxoOutput requires value > 0). The segment still balances (Σinputs == amount).
+    #[test]
+    fn funding_offer_zero_change_emits_no_output() {
+        let (nk, vk_hex) = night_key_and_vk_hex();
+        let native = "00".repeat(32);
+        let ih = "11".repeat(32);
+        let funding = json!({
+            "amount": "5000000",
+            "change_owner": "22".repeat(32),
+            "night_private_key": hex::encode(nk),
+            "inputs": [
+                {"value":"5000000","owner":vk_hex,"type":native,"intent_hash":ih,"output_no":0}
+            ]
+        });
+        let (offer, keys) = build_funding_offer(&funding).expect("build offer");
+        assert_eq!(offer.outputs.iter().count(), 0, "no change output when change is zero");
+        let in_sum: u128 = offer.inputs.iter().map(|s| s.value).sum();
+        assert_eq!(in_sum, 5_000_000);
+        assert_eq!(keys.len(), 1);
+    }
+
+    // Inputs that don't cover the amount are rejected up front, not left to underflow.
+    #[test]
+    fn funding_offer_rejects_insufficient_inputs() {
+        let (nk, vk_hex) = night_key_and_vk_hex();
+        let native = "00".repeat(32);
+        let ih = "11".repeat(32);
+        let funding = json!({
+            "amount": "9000000",
+            "change_owner": "22".repeat(32),
+            "night_private_key": hex::encode(nk),
+            "inputs": [
+                {"value":"5000000","owner":vk_hex,"type":native,"intent_hash":ih,"output_no":0}
+            ]
+        });
+        let err = build_funding_offer(&funding).unwrap_err();
+        assert!(err.contains("< amount"), "expected insufficient-inputs error, got: {}", err);
     }
 }
