@@ -154,6 +154,7 @@ extern const char* contract_big_int_to_value(const char* bigint_str);
 extern const char* contract_value_to_big_int(const char* value_json);
 extern void contract_free_string(char* ptr);
 extern const char* contract_assemble_call_tx(const char* params_json);
+extern const char* contract_sign_proven_offer(const char* params_json);
 extern const char* contract_assemble_deploy_tx(const char* params_json);
 extern int64_t ledger_params_global_ttl_secs(const char* params_hex);
 extern const char* kuira_ledger_version(void);
@@ -3224,6 +3225,29 @@ Java_com_midnight_kuira_core_compact_ContractRuntime_nativeAssembleContractCallT
     if (params_c == NULL) return NULL;
 
     const char* result = contract_assemble_call_tx(params_c);
+    (*env)->ReleaseStringUTFChars(env, paramsJson, params_c);
+
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    contract_free_string((char*)result);
+    return jresult;
+}
+
+/*
+ * Sign the fallible unshielded offer on a PROVEN contract-call transaction.
+ * Takes JSON {proven_tx_hex, night_private_key}, returns the signed tx hex.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeSignProvenOffer(
+    JNIEnv* env, jclass clazz, jstring paramsJson) {
+
+    if (paramsJson == NULL) return NULL;
+
+    const char* params_c = (*env)->GetStringUTFChars(env, paramsJson, NULL);
+    if (params_c == NULL) return NULL;
+
+    const char* result = contract_sign_proven_offer(params_c);
     (*env)->ReleaseStringUTFChars(env, paramsJson, params_c);
 
     if (result == NULL) return NULL;

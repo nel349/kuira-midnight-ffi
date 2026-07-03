@@ -992,6 +992,101 @@ pub extern "C" fn contract_assemble_call_tx(
     }
 }
 
+/// Sign the fallible unshielded offer on a PROVEN contract-call transaction.
+///
+/// The offer that funds a `receiveUnshielded` is attached unsigned by
+/// `assemble_call_tx_impl` and signed here, AFTER proving — proving rewrites the
+/// contract call's erased serialization, so signing before it yields a signature the
+/// node rejects (error 175). At this point `data_to_sign(1)` matches what the node
+/// verifies. Sealing (done later by the balancer) preserves the signature because
+/// `data_to_sign` uses the downgraded binding.
+///
+/// Input JSON: `{ "proven_tx_hex": "<hex>", "night_private_key": "<hex, 32 bytes>" }`
+/// Output: hex of the signed proven transaction, or `{"error": "..."}`.
+fn sign_proven_offer_impl(json_str: &str) -> Result<String, String> {
+    use midnight_ledger::structure::{Transaction, ProofMarker};
+    use midnight_base_crypto::signatures::{Signature, SigningKey};
+    use midnight_transient_crypto::commitment::PedersenRandomness;
+    use midnight_storage::DefaultDB;
+    use midnight_storage::storage::HashMap as StorageHashMap;
+    use rand::rngs::OsRng;
+
+    type ProvenTx = Transaction<Signature, ProofMarker, PedersenRandomness, DefaultDB>;
+
+    let params: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| format!("JSON parse: {}", e))?;
+    let proven_hex = params["proven_tx_hex"].as_str().ok_or("missing proven_tx_hex")?;
+    let night_key_hex = params["night_private_key"].as_str().ok_or("missing night_private_key")?;
+
+    let night_key_bytes = hex::decode(night_key_hex).map_err(|e| format!("night key hex: {}", e))?;
+    if night_key_bytes.len() != 32 {
+        return Err("night_private_key must be 32 bytes".into());
+    }
+    let mut nk = [0u8; 32];
+    nk.copy_from_slice(&night_key_bytes);
+
+    let proven_bytes = hex::decode(proven_hex).map_err(|e| format!("proven_tx_hex: {}", e))?;
+    let proven_tx: ProvenTx = midnight_serialize::tagged_deserialize(&proven_bytes[..])
+        .map_err(|e| format!("deserialize proven tx: {:?}", e))?;
+
+    let stx = match proven_tx {
+        Transaction::Standard(stx) => stx,
+        _ => return Err("expected a Standard transaction".into()),
+    };
+
+    // Re-sign every intent that carries an unsigned fallible offer (the funding offer). Its
+    // segment is the intents-map key; sign at segment 1 (where assemble placed the call intent).
+    let mut new_intents = StorageHashMap::<u16, _, DefaultDB>::default();
+    let mut signed_any = false;
+    for entry in stx.intents.iter() {
+        let (seg_sp, intent_sp) = &*entry;
+        let seg = **seg_sp;
+        let intent = (**intent_sp).clone();
+        let intent = match intent.fallible_unshielded_offer.as_ref() {
+            Some(offer) if offer.signatures.iter().next().is_none() => {
+                let input_count = offer.inputs.iter().count();
+                let keys: Vec<SigningKey> = (0..input_count)
+                    .map(|_| SigningKey::from_bytes(&nk).map_err(|e| format!("night key: {:?}", e)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                signed_any = true;
+                intent
+                    .sign(&mut OsRng, 1, &[], &keys, &[])
+                    .map_err(|e| format!("sign proven offer: {:?}", e))?
+            }
+            _ => intent,
+        };
+        new_intents = new_intents.insert(seg, intent);
+    }
+    if !signed_any {
+        return Err("no unsigned fallible offer found in the proven tx".into());
+    }
+
+    let mut stx = stx;
+    stx.intents = new_intents;
+    let signed_tx = Transaction::Standard(stx);
+
+    let mut bytes = Vec::new();
+    midnight_serialize::tagged_serialize(&signed_tx, &mut bytes)
+        .map_err(|e| format!("serialize signed tx: {:?}", e))?;
+    Ok(hex::encode(&bytes))
+}
+
+/// FFI: sign the fallible unshielded offer on a proven contract-call tx. See
+/// [`sign_proven_offer_impl`]. Returns the signed tx hex or `{"error": "..."}`.
+#[no_mangle]
+pub extern "C" fn contract_sign_proven_offer(
+    params_json: *const c_char,
+) -> *const c_char {
+    let json_str = match unsafe { c_str_to_str(params_json) } {
+        Some(s) => s,
+        None => return std::ptr::null(),
+    };
+    match sign_proven_offer_impl(json_str) {
+        Ok(hex) => to_c_string(&hex),
+        Err(e) => to_c_string(&format!("{{\"error\":\"{}\"}}", e.replace('"', "\\\""))),
+    }
+}
+
 /// Parse an AlignedValue from JSON, constructing the Rust type directly.
 ///
 /// We bypass AlignedValue's serde `try_from` validation because it rejects
@@ -1555,18 +1650,25 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
 
     // 8b. Fund the unshielded value the contract receives via receiveUnshielded, if the
     //     caller declared it. Plain contract calls (no `unshielded_funding`) skip this
-    //     entirely — their transaction is byte-identical to before. The offer + call are
-    //     signed together at segment 1 (matches the intents-map key below); Intent::sign
-    //     erases proofs first, so the signature survives proving and the balancer's later
-    //     dust merge.
+    //     entirely — their transaction is byte-identical to before.
+    //
+    //     The offer is FALLIBLE, not guaranteed: a receiveUnshielded op lands in the fallible
+    //     transcript, so its `unshielded_inputs` effect is attributed to the intent's segment
+    //     (verify.rs — fallible transcript → *segment; guaranteed → 0). The balance is checked
+    //     per (token, segment), so the funding offer must sit in the SAME segment as the effect
+    //     or that segment underflows → node error 138 (BalanceCheckOverspend).
+    //
+    //     The offer is added UNSIGNED here. It is signed LATER, after proving, via
+    //     contract_sign_proven_offer: proving changes the contract call's erased serialization
+    //     (verified on-device: data_to_sign 779→789 bytes), so a signature made now would not
+    //     verify against the proven transcript the node checks (error 175). The send path can
+    //     sign at build time only because its `actions` are empty.
     let intent = match params.get("unshielded_funding") {
         Some(funding) if !funding.is_null() => {
-            let (offer, signing_keys) = build_funding_offer(funding)?;
+            let (offer, _keys) = build_funding_offer(funding)?;
             let mut intent = intent;
-            intent.guaranteed_unshielded_offer = Some(midnight_storage::arena::Sp::new(offer));
+            intent.fallible_unshielded_offer = Some(midnight_storage::arena::Sp::new(offer));
             intent
-                .sign(&mut OsRng, 1, &signing_keys, &[], &[])
-                .map_err(|e| format!("sign contract-call unshielded offer: {:?}", e))?
         }
         _ => intent,
     };
