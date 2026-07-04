@@ -1472,6 +1472,63 @@ fn build_funding_offer(
     Ok((offer, keys))
 }
 
+/// Build the guaranteed... no — the FALLIBLE unshielded offer that receives the value a contract
+/// SENDS via `sendUnshielded` (a withdrawal / `Treasury__send`). The mirror of
+/// [`build_funding_offer`]: the contract provides the value (its `unshielded_outputs` effect adds
+/// to the fallible segment), so the offer has ONE OUTPUT — the recipient UTXO — and NO inputs and
+/// NO signatures (no wallet UTXO is spent). The output's owner MUST match the contract's claimed
+/// spend recipient (verify.rs: `claimed_unshielded_spends[(color, recipient)] ⊆ offer.outputs`).
+///
+/// `withdrawal` JSON shape:
+/// ```json
+/// { "recipient": "<UserAddress hex, 32 bytes>", "color": "<token hex, 32 bytes>", "amount": "5000000" }
+/// ```
+///
+/// Regression note: reached ONLY when the caller supplies `unshielded_withdrawal`.
+fn build_withdrawal_offer(
+    withdrawal: &serde_json::Value,
+) -> Result<
+    midnight_ledger::structure::UnshieldedOffer<midnight_base_crypto::signatures::Signature, InMemoryDB>,
+    String,
+> {
+    use midnight_ledger::structure::{UnshieldedOffer, UtxoOutput};
+    use midnight_coin_structure::coin::{UnshieldedTokenType, UserAddress};
+    use midnight_base_crypto::signatures::Signature;
+    use midnight_base_crypto::hash::HashOutput;
+    use midnight_serialize::Deserializable;
+
+    let amount: u128 = withdrawal["amount"]
+        .as_str()
+        .ok_or("unshielded_withdrawal.amount missing")?
+        .parse()
+        .map_err(|e| format!("unshielded_withdrawal.amount: {}", e))?;
+
+    let recipient_bytes = hex::decode(
+        withdrawal["recipient"].as_str().ok_or("unshielded_withdrawal.recipient missing")?,
+    )
+    .map_err(|e| format!("recipient hex: {}", e))?;
+    let recipient = <UserAddress as Deserializable>::deserialize(&mut &recipient_bytes[..], 32)
+        .map_err(|e| format!("recipient UserAddress: {:?}", e))?;
+
+    let color_bytes = hex::decode(
+        withdrawal["color"].as_str().ok_or("unshielded_withdrawal.color missing")?,
+    )
+    .map_err(|e| format!("color hex: {}", e))?;
+    if color_bytes.len() != 32 {
+        return Err("unshielded_withdrawal.color must be 32 bytes".into());
+    }
+    let mut color_arr = [0u8; 32];
+    color_arr.copy_from_slice(&color_bytes);
+    let type_ = UnshieldedTokenType(HashOutput(color_arr));
+
+    let outputs = vec![UtxoOutput { value: amount, owner: recipient, type_ }];
+    Ok(UnshieldedOffer::<Signature, InMemoryDB> {
+        inputs: Vec::new().into_iter().collect(),
+        outputs: outputs.into_iter().collect(),
+        signatures: Vec::<Signature>::new().into_iter().collect(),
+    })
+}
+
 fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     use midnight_onchain_vm::result_mode::ResultModeVerify;
     
@@ -1663,14 +1720,20 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     //     (verified on-device: data_to_sign 779→789 bytes), so a signature made now would not
     //     verify against the proven transcript the node checks (error 175). The send path can
     //     sign at build time only because its `actions` are empty.
-    let intent = match params.get("unshielded_funding") {
-        Some(funding) if !funding.is_null() => {
-            let (offer, _keys) = build_funding_offer(funding)?;
-            let mut intent = intent;
-            intent.fallible_unshielded_offer = Some(midnight_storage::arena::Sp::new(offer));
-            intent
-        }
-        _ => intent,
+    let intent = if let Some(funding) = params.get("unshielded_funding").filter(|f| !f.is_null()) {
+        let (offer, _keys) = build_funding_offer(funding)?;
+        let mut intent = intent;
+        intent.fallible_unshielded_offer = Some(midnight_storage::arena::Sp::new(offer));
+        intent
+    } else if let Some(withdrawal) = params.get("unshielded_withdrawal").filter(|w| !w.is_null()) {
+        // Withdrawal (contract SENDS value out): a fallible offer with only the recipient OUTPUT,
+        // no inputs → no signing needed (Treasury__send / sendUnshielded provides the value).
+        let offer = build_withdrawal_offer(withdrawal)?;
+        let mut intent = intent;
+        intent.fallible_unshielded_offer = Some(midnight_storage::arena::Sp::new(offer));
+        intent
+    } else {
+        intent
     };
 
     // 9. Build Transaction from intents
@@ -2987,6 +3050,25 @@ mod funding_offer_tests {
         let in_sum: u128 = offer.inputs.iter().map(|s| s.value).sum();
         assert_eq!(in_sum, 5_000_000);
         assert_eq!(keys.len(), 1);
+    }
+
+    // A withdrawal offer is output-only (recipient UTXO), no inputs, no signatures — the mirror
+    // of the deposit. The contract's sendUnshielded provides the value; the offer just names the
+    // recipient UTXO so the fallible segment balances.
+    #[test]
+    fn withdrawal_offer_is_output_only_no_signatures() {
+        let native = "00".repeat(32);
+        let withdrawal = json!({
+            "recipient": "33".repeat(32),
+            "color": native,
+            "amount": "2000000",
+        });
+        let offer = build_withdrawal_offer(&withdrawal).expect("build withdrawal offer");
+        assert_eq!(offer.inputs.iter().count(), 0, "withdrawal has no UTXO inputs");
+        assert_eq!(offer.signatures.iter().count(), 0, "withdrawal is unsigned (nothing spent)");
+        let outs: Vec<_> = offer.outputs.iter().collect();
+        assert_eq!(outs.len(), 1, "exactly one recipient output");
+        assert_eq!(outs[0].value, 2_000_000, "output funds exactly the withdrawal amount");
     }
 
     // Inputs that don't cover the amount are rejected up front, not left to underflow.
