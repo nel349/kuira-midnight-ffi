@@ -145,6 +145,7 @@ extern uint64_t contract_state_create_with_nulls(const char* structure_json);
 extern void contract_state_set_operation(uint64_t handle, const char* name);
 extern const char* contract_state_serialize(uint64_t handle);
 extern void contract_state_free(uint64_t handle);
+extern uint64_t contract_state_pool_len(void);
 extern const char* contract_state_read_fields(uint64_t handle);
 extern const char* contract_query(uint64_t handle, const char* opcodes_json);
 extern const char* contract_persistent_hash(const char* input_hex);
@@ -3063,6 +3064,15 @@ JNIEXPORT void JNICALL
 Java_com_midnight_kuira_core_compact_ContractRuntime_nativeStateFree(
     JNIEnv* env, jclass clazz, jlong handle) {
     contract_state_free((uint64_t)handle);
+}
+
+/*
+ * Live entries in the contract state pool (test/debug introspection for leak assertions).
+ */
+JNIEXPORT jlong JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeStatePoolLen(
+    JNIEnv* env, jclass clazz) {
+    return (jlong)contract_state_pool_len();
 }
 
 /*

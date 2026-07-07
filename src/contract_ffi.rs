@@ -234,6 +234,14 @@ pub extern "C" fn contract_state_free(handle: u64) {
     }
 }
 
+/// Number of live entries in the contract state pool. Test/debug introspection so callers can
+/// assert handle-leak freedom (the pool is process-global and survives QuickJS teardown, so a
+/// path that creates handles without freeing them grows it unboundedly).
+#[no_mangle]
+pub extern "C" fn contract_state_pool_len() -> u64 {
+    lock_state_pool().map(|pool| pool.len() as u64).unwrap_or(0)
+}
+
 // ── ContractState.query() ──
 
 /// Execute opcodes against a contract state (by handle) and return events + gas.
@@ -865,6 +873,25 @@ pub extern "C" fn contract_state_set_operation(
 mod state_tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn state_pool_len_reflects_create_and_free() {
+        let json = CString::new("4").unwrap();
+        let handle = contract_state_create_with_nulls(json.as_ptr());
+        assert!(handle > 0);
+        // Cargo runs tests concurrently against the process-global pool, so assert presence
+        // semantics rather than an exact count (the instrumented Android leak test owns the
+        // exact-baseline assertion in a single-process run).
+        assert!(contract_state_pool_len() >= 1);
+        // A live handle clones; a freed one is gone — proves free removes the pool entry.
+        let cloned = contract_state_clone(handle);
+        assert!(cloned > 0);
+        contract_state_free(cloned);
+        contract_state_free(handle);
+        assert_eq!(contract_state_clone(handle), 0, "freed handle must be gone from the pool");
+        // Double-free is a safe no-op.
+        contract_state_free(handle);
+    }
 
     #[test]
     fn test_create_state_with_nulls() {
