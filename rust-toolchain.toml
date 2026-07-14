@@ -1,0 +1,9 @@
+# Pins the Rust toolchain so local dev and the publish workflow build the FFI
+# with the same compiler and cross-compile targets. Without this the workflow's
+# `dtolnay/rust-toolchain@stable` floats to whatever stable is current, which can
+# diverge from a developer's local toolchain. rustup reads this for every cargo
+# invocation in the FFI workspace and installs the toolchain + targets on demand.
+[toolchain]
+channel = "1.97.0"
+targets = ["aarch64-linux-android", "x86_64-linux-android"]
+profile = "minimal"
