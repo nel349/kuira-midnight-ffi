@@ -539,6 +539,33 @@ mod tests {
     use super::*;
     use std::ffi::CStr;
 
+    // Funding-resolution precedence for the unshielded money path (kuira-sdk-android#4).
+    #[test]
+    fn unshielded_offer_precedence() {
+        let night = || "00".repeat(32);
+        let recv = |a: u128| Some((night(), a));
+
+        // Plain call (no unshielded movement) → no offer required.
+        assert!(check_unshielded_offer_present(None, None, false, false, "post").is_ok());
+
+        // Explicit/custom offer always wins, even when the circuit moves value (sponsoring lane).
+        assert!(check_unshielded_offer_present(recv(1000), None, true, false, "deposit").is_ok());
+        assert!(check_unshielded_offer_present(None, recv(1000), false, true, "withdraw").is_ok());
+        // Any supplied offer opts out of the check, even if both effects are present.
+        assert!(check_unshielded_offer_present(recv(1000), recv(1000), true, false, "swap").is_ok());
+
+        // Receives with no funding → signal carries kind/token/amount + names the funding builder.
+        let e = check_unshielded_offer_present(recv(1000), None, false, false, "deposit").unwrap_err();
+        assert!(e.starts_with(&format!("UNSHIELDED_VALUE_UNFUNDED:funding:{}:1000|", night())), "signal: {e}");
+        assert!(e.contains("deposit"), "names the circuit: {e}");
+        assert!(e.contains("buildUnshieldedFundingJson"), "names the funding builder: {e}");
+
+        // Sends with no withdrawal offer → withdrawal signal naming the withdrawal builder.
+        let e = check_unshielded_offer_present(None, recv(500), false, false, "withdraw").unwrap_err();
+        assert!(e.starts_with(&format!("UNSHIELDED_VALUE_UNFUNDED:withdrawal:{}:500|", night())), "signal: {e}");
+        assert!(e.contains("buildUnshieldedWithdrawalJson"), "names the withdrawal builder: {e}");
+    }
+
     #[test]
     fn empty_map_state_value_deserializes_from_shim_format() {
         // The JS runtime shim (StateValue.newMap) emits an empty Map/Set ledger field
@@ -1344,6 +1371,51 @@ fn build_gas_query_context(
     })
 }
 
+/// Enforce the funding-resolution precedence for a contract call that moves unshielded value
+/// (kuira-sdk-android#4). Custom/explicit offers always win — when the caller supplied an
+/// `unshielded_funding` / `unshielded_withdrawal` offer we honor it verbatim and return `Ok`
+/// (this is the sponsoring / custom-selection lane). Otherwise, if the circuit moves unshielded
+/// value but no offer was supplied, return a clear, actionable error instead of letting the node
+/// reject the built transaction with an opaque `Invalid Transaction`.
+///
+/// The signal is `UNSHIELDED_VALUE_UNFUNDED:<kind>:<token_hex>:<amount>|<human message>` where
+/// `<kind>` is `funding` (receiveUnshielded) or `withdrawal` (sendUnshielded). The `<token,amount>`
+/// let the Kotlin layer auto-fund a deposit (Layer 2); the `|`-delimited human message is what a
+/// surfaced `ContractCallException.UnshieldedValueUnfunded` carries (Layer 1). The `receives`/`sends`
+/// arguments are `Some((token_hex, amount))` when the circuit moves unshielded value in/out.
+///
+/// A withdrawal can never be auto-funded (its recipient is a circuit argument the SDK can't
+/// identify), so it always requires an explicit offer. A deposit's auto-fund (Layer 2, when enabled)
+/// is driven by the Kotlin layer off the `funding` signal.
+fn check_unshielded_offer_present(
+    receives: Option<(String, u128)>,
+    sends: Option<(String, u128)>,
+    has_funding: bool,
+    has_withdrawal: bool,
+    circuit: &str,
+) -> Result<(), String> {
+    if has_funding || has_withdrawal {
+        // Explicit/custom offer supplied — honored verbatim, never overridden.
+        return Ok(());
+    }
+    if let Some((token, amount)) = receives {
+        return Err(format!(
+            "UNSHIELDED_VALUE_UNFUNDED:funding:{token}:{amount}|circuit '{circuit}' receives \
+             unshielded value (receiveUnshielded) but no funding was provided. Pass \
+             unshieldedFundingJson = sdk.buildUnshieldedFundingJson(amount) into MidnightContract.call(...)."
+        ));
+    }
+    if let Some((token, amount)) = sends {
+        return Err(format!(
+            "UNSHIELDED_VALUE_UNFUNDED:withdrawal:{token}:{amount}|circuit '{circuit}' sends \
+             unshielded value (sendUnshielded) but no withdrawal offer was provided. Pass \
+             unshieldedWithdrawalJson = sdk.buildUnshieldedWithdrawalJson(recipient, amount) into \
+             MidnightContract.call(...)."
+        ));
+    }
+    Ok(())
+}
+
 /// Build the unsigned guaranteed unshielded offer that funds the value a contract
 /// receives via `receiveUnshielded`, plus one NIGHT signing key per input for the
 /// caller's `Intent::sign`.
@@ -1700,6 +1772,34 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
         transcripts.swap_remove(0)
     };
 
+    // Detect whether this circuit moves unshielded value (#4) and capture the (token, amount):
+    // receiveUnshielded emits an `unshielded_inputs` effect, sendUnshielded an `unshielded_outputs`
+    // effect. Those ops partition to the fallible transcript, but scan both segments. The token +
+    // amount let the SDK auto-fund a deposit (Layer 2); absent auto-fund they drive the Layer 1
+    // clear error. Computed here, before the transcripts move into the prototype below.
+    let mut receives_unshielded: Option<(String, u128)> = None;
+    let mut sends_unshielded: Option<(String, u128)> = None;
+    for t in [&guaranteed_transcript, &fallible_transcript] {
+        if let Some(tr) = t {
+            if receives_unshielded.is_none() {
+                for (tt, val) in tr.effects.unshielded_inputs.clone() {
+                    if let midnight_coin_structure::coin::TokenType::Unshielded(ut) = tt {
+                        receives_unshielded = Some((hex::encode(ut.0.0), val));
+                        break;
+                    }
+                }
+            }
+            if sends_unshielded.is_none() {
+                for (tt, val) in tr.effects.unshielded_outputs.clone() {
+                    if let midnight_coin_structure::coin::TokenType::Unshielded(ut) = tt {
+                        sends_unshielded = Some((hex::encode(ut.0.0), val));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // 7. ContractOperation (verifier key loaded separately during proving)
     let op = ContractOperation::new(None);
 
@@ -1747,6 +1847,19 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     //     (verified on-device: data_to_sign 779→789 bytes), so a signature made now would not
     //     verify against the proven transcript the node checks (error 175). The send path can
     //     sign at build time only because its `actions` are empty.
+    // Funding-resolution precedence (#4): an explicit offer is honored below; if the circuit moves
+    // unshielded value and none was supplied, fail fast with a clear error rather than build a tx
+    // the node rejects as "Invalid Transaction". (Layer 2 deposit auto-fund would slot in here.)
+    let has_funding = params.get("unshielded_funding").is_some_and(|f| !f.is_null());
+    let has_withdrawal = params.get("unshielded_withdrawal").is_some_and(|w| !w.is_null());
+    check_unshielded_offer_present(
+        receives_unshielded,
+        sends_unshielded,
+        has_funding,
+        has_withdrawal,
+        entry_point,
+    )?;
+
     let intent = if let Some(funding) = params.get("unshielded_funding").filter(|f| !f.is_null()) {
         let (offer, _keys) = build_funding_offer(funding)?;
         let mut intent = intent;
