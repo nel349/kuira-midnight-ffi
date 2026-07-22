@@ -539,7 +539,7 @@ mod tests {
     use super::*;
     use std::ffi::CStr;
 
-    // Funding-resolution precedence for the unshielded money path (kuira-sdk-android#4).
+    // Funding-resolution precedence for the unshielded money path.
     #[test]
     fn unshielded_offer_precedence() {
         let night = || "00".repeat(32);
@@ -1372,7 +1372,7 @@ fn build_gas_query_context(
 }
 
 /// Enforce the funding-resolution precedence for a contract call that moves unshielded value
-/// (kuira-sdk-android#4). Custom/explicit offers always win — when the caller supplied an
+/// Custom/explicit offers always win — when the caller supplied an
 /// `unshielded_funding` / `unshielded_withdrawal` offer we honor it verbatim and return `Ok`
 /// (this is the sponsoring / custom-selection lane). Otherwise, if the circuit moves unshielded
 /// value but no offer was supplied, return a clear, actionable error instead of letting the node
@@ -1772,7 +1772,7 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
         transcripts.swap_remove(0)
     };
 
-    // Detect whether this circuit moves unshielded value (#4) and capture the (token, amount):
+    // Detect whether this circuit moves unshielded value and capture the (token, amount):
     // receiveUnshielded emits an `unshielded_inputs` effect, sendUnshielded an `unshielded_outputs`
     // effect. Those ops partition to the fallible transcript, but scan both segments. The token +
     // amount let the SDK auto-fund a deposit (Layer 2); absent auto-fund they drive the Layer 1
@@ -1847,7 +1847,7 @@ fn assemble_call_tx_impl(json_str: &str) -> Result<String, String> {
     //     (verified on-device: data_to_sign 779→789 bytes), so a signature made now would not
     //     verify against the proven transcript the node checks (error 175). The send path can
     //     sign at build time only because its `actions` are empty.
-    // Funding-resolution precedence (#4): an explicit offer is honored below; if the circuit moves
+    // Funding-resolution precedence: an explicit offer is honored below; if the circuit moves
     // unshielded value and none was supplied, fail fast with a clear error rather than build a tx
     // the node rejects as "Invalid Transaction". (Layer 2 deposit auto-fund would slot in here.)
     let has_funding = params.get("unshielded_funding").is_some_and(|f| !f.is_null());
