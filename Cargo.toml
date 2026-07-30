@@ -37,7 +37,9 @@ once_cell = "1.19"
 # For hex encoding
 hex = "0.4"
 
-# For randomness in signing (nonce generation)
+# Supplies BIP-340's aux_rand during signing. NOT the nonce itself — the nonce is
+# derived from the private key and the message. See the NONCE SAFETY note in
+# src/transaction_ffi.rs before changing how randomness is used here.
 rand = "0.8"
 
 # For secure memory zeroization

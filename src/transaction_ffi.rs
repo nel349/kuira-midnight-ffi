@@ -252,8 +252,33 @@ pub extern "C" fn free_verifying_key(ptr: *mut u8) {
 ///
 /// **SIGNATURE FORMAT:**
 /// - Returns 64-byte Schnorr signature (R || s format per BIP-340)
-/// - Uses random nonce (not deterministic) for each signature
-/// - Same data signed twice produces different signatures (different nonce)
+/// - Same data signed twice produces different signatures
+///
+/// **NONCE SAFETY — DO NOT "FIX" THIS TO USE A RANDOM NONCE:**
+///
+/// BIP-340 derives the nonce as:
+///
+/// ```text
+/// k = H_nonce( H_aux(aux_rand) XOR d , P.x , m )
+/// ```
+///
+/// where `d` is the raw secret key, `P.x` the public key x-coordinate and `m` the
+/// message. Verified against `k256::schnorr::SigningKey::sign_raw`, which is what
+/// this path reaches through `midnight_base_crypto`.
+///
+/// The nonce is therefore bound to the **private key and the message**. The RNG
+/// supplied below only contributes `aux_rand`, which is defence in depth: a broken
+/// or absent random source degrades the signature's blinding but **cannot** leak
+/// the key, because the nonce still depends on secrets the attacker does not have.
+///
+/// This distinction is not academic. Recovering a private key from signatures is
+/// what a nonce that depends only on public data or on a weak RNG makes possible,
+/// and it has taken real projects offline. Any change that makes the nonce depend
+/// solely on randomness — or reuses it across messages — is a key-recovery
+/// vulnerability, not an optimisation.
+///
+/// Signatures differ between calls because `aux_rand` differs. That is a
+/// *consequence* of the construction, not the source of its security.
 ///
 /// **EMPTY MESSAGES:**
 /// - Empty messages (data_len=0, data_ptr=NULL) are allowed
@@ -310,7 +335,9 @@ pub extern "C" fn sign_data(
         unsafe { std::slice::from_raw_parts(data_ptr, data_len) }
     };
 
-    // Sign with Schnorr (uses OsRng for nonce)
+    // OsRng supplies BIP-340's `aux_rand` only. The nonce itself is derived from
+    // the private key and the message — see the NONCE SAFETY note above before
+    // changing anything here.
     let mut rng = OsRng;
     let signature: Signature = signing_key.sign(&mut rng, data);
 
@@ -646,10 +673,11 @@ mod tests {
         assert_eq!(sig2.len, 64);
         assert_eq!(sig3.len, 64);
 
-        // Signatures should be different (random nonce)
+        // Differ because aux_rand differs per call — see the NONCE SAFETY note on
+        // sign_data. The nonce is derived from the private key and the message.
         let sig1_slice = unsafe { std::slice::from_raw_parts(sig1.data, sig1.len) };
         let sig2_slice = unsafe { std::slice::from_raw_parts(sig2.data, sig2.len) };
-        assert_ne!(sig1_slice, sig2_slice, "Signatures should differ due to random nonce");
+        assert_ne!(sig1_slice, sig2_slice, "Signatures should differ due to per-call aux_rand");
 
         // Free all signatures
         free_signature(sig1.data, sig1.len);
@@ -1052,7 +1080,8 @@ mod tests {
 
     #[test]
     fn test_signature_determinism_with_same_key() {
-        // Note: Schnorr uses random nonce, so signatures will differ
+        // Note: BIP-340 mixes per-call aux_rand into a key-and-message-derived
+        // nonce, so signatures over identical input still differ.
         // This test verifies that DIFFERENT signatures are still VALID
 
         let valid_key = hex::decode(
@@ -1069,13 +1098,14 @@ mod tests {
         let sig2 = sign_data(key_ptr, data.as_ptr(), data.len());
         let sig3 = sign_data(key_ptr, data.as_ptr(), data.len());
 
-        // Signatures should be different (random nonce)
+        // Differ because aux_rand differs per call — see the NONCE SAFETY note on
+        // sign_data. The nonce is derived from the private key and the message.
         let sig1_bytes = unsafe { std::slice::from_raw_parts(sig1.data, sig1.len) };
         let sig2_bytes = unsafe { std::slice::from_raw_parts(sig2.data, sig2.len) };
         let sig3_bytes = unsafe { std::slice::from_raw_parts(sig3.data, sig3.len) };
 
-        assert_ne!(sig1_bytes, sig2_bytes, "Signatures should differ due to random nonce");
-        assert_ne!(sig2_bytes, sig3_bytes, "Signatures should differ due to random nonce");
+        assert_ne!(sig1_bytes, sig2_bytes, "Signatures should differ due to per-call aux_rand");
+        assert_ne!(sig2_bytes, sig3_bytes, "Signatures should differ due to per-call aux_rand");
 
         // But ALL signatures should be valid
         let pub_key_ptr = get_verifying_key(key_ptr);
