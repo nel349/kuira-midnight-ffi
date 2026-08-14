@@ -30,7 +30,7 @@ use midnight_transient_crypto::encryption;
 use midnight_transient_crypto::proofs::ProofPreimage;
 use midnight_transient_crypto::commitment::PedersenRandomness;
 use midnight_transient_crypto::proofs::ProvingKeyMaterial;
-use midnight_ledger::structure::{Intent, Transaction, StandardTransaction, ProofPreimageMarker};
+use midnight_ledger::structure::{Intent, Transaction, StandardTransaction, ProofPreimageMarker, LedgerParameters};
 use midnight_base_crypto::signatures::Signature;
 use midnight_base_crypto::time::Timestamp;
 use midnight_storage::storage::HashMap as StorageHashMap;
@@ -1395,6 +1395,7 @@ pub extern "C" fn zswap_build_shielded_transaction_with_dust(
     dust_utxos_json: *const c_char,
     current_time_ms: u64,
     ttl_ms: u64,
+    ledger_params_hex: *const c_char,
 ) -> *const c_char {
     if offer_hex.is_null() || network_id.is_null() {
         android_log!(ANDROID_LOG_ERROR, TAG, "Null offer_hex or network_id");
@@ -1422,15 +1423,22 @@ pub extern "C" fn zswap_build_shielded_transaction_with_dust(
 
         // Build transaction with guaranteed_coins only (no empty intent)
         // Intents will be added by dust merge if dust params provided
-        let mut transaction = Transaction::Standard(StandardTransaction::new(
+        let base_tx = Transaction::Standard(StandardTransaction::new(
             network_str,
             StorageHashMap::default(), // no intents — dust adds its own
             Some(offer),
             StorageHashMap::default(),
         ));
 
-        // Build and merge dust if dust params provided
-        if !dust_state_ptr.is_null() && !dust_seed_ptr.is_null() && !dust_utxos_json.is_null() && dust_seed_len == 32 {
+        // Build + merge dust, paying the CORRECT fee. The fee is computed from the live ledger
+        // params via `fees_with_margin` on the (unproven) merged tx — not hardcoded — then the dust
+        // spend is rebuilt to pay exactly that fee. This mirrors what the midnight-rs core does for
+        // iOS and the unshielded fee path; a hardcoded/under-fee is rejected as node error 138
+        // (BalanceCheckOverspend). `fees_with_margin` is generic over the proof kind, so it prices
+        // the pre-proof transaction directly.
+        let transaction = if !dust_state_ptr.is_null() && !dust_seed_ptr.is_null()
+            && !dust_utxos_json.is_null() && dust_seed_len == 32 && !ledger_params_hex.is_null()
+        {
             use midnight_ledger::dust::{DustActions, DustLocalState as DustState, DustSecretKey};
             use midnight_storage::storage::Array as StorageArray;
 
@@ -1443,15 +1451,13 @@ pub extern "C" fn zswap_build_shielded_transaction_with_dust(
             let dust_secret_key = DustSecretKey::derive_secret_key(&dust_seed_array);
             dust_seed_array.fill(0);
 
-            // Parse dust UTXOs JSON
+            // Dust UTXO SELECTION (indices only — the fee is computed here, not read from the JSON).
             let utxos_str = match c_str_to_rust(dust_utxos_json, "dust_utxos") {
                 Some(s) => s,
                 None => return ptr::null(),
             };
-
             #[derive(serde::Deserialize)]
-            struct DustUtxoSel { utxo_index: usize, v_fee: String }
-
+            struct DustUtxoSel { utxo_index: usize }
             let utxo_selections: Vec<DustUtxoSel> = match serde_json::from_str(utxos_str) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1460,58 +1466,57 @@ pub extern "C" fn zswap_build_shielded_transaction_with_dust(
                 }
             };
 
-            // Build dust spends (same pattern as dust_ffi.rs:656)
-            let ctime = Timestamp::from_secs(current_time_ms / 1000);
-            let all_utxos: Vec<_> = dust_state.utxos().collect();
-            let mut dust_spends = Vec::new();
-
-            for sel in &utxo_selections {
-                let v_fee: u128 = match sel.v_fee.parse() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        android_log!(ANDROID_LOG_ERROR, TAG, "Invalid v_fee: {}", e);
-                        return ptr::null();
-                    }
-                };
-
-                if sel.utxo_index >= all_utxos.len() {
-                    android_log!(ANDROID_LOG_ERROR, TAG, "Dust UTXO index {} out of bounds ({})", sel.utxo_index, all_utxos.len());
+            // Ledger params for fee pricing (strip the tag prefix, like fee_ffi).
+            let params_bytes = match c_hex_to_bytes(ledger_params_hex, "ledger_params") {
+                Some(b) => crate::fee_ffi::strip_tag_prefix(b),
+                None => return ptr::null(),
+            };
+            let params: LedgerParameters = match Deserializable::deserialize(&mut &params_bytes[..], 0) {
+                Ok(p) => p,
+                Err(e) => {
+                    android_log!(ANDROID_LOG_ERROR, TAG, "Error deserializing ledger params: {}", e);
                     return ptr::null();
                 }
+            };
 
-                let utxo = all_utxos[sel.utxo_index];
-                match dust_state.spend(&dust_secret_key, &utxo, v_fee, ctime) {
-                    Ok((_new_state, spend)) => {
-                        android_log!(ANDROID_LOG_INFO, TAG, "Created dust spend from UTXO {}", sel.utxo_index);
-                        dust_spends.push(spend);
+            let ctime = Timestamp::from_secs(current_time_ms / 1000);
+            let dust_ttl = Timestamp::from_secs(ttl_ms / 1000);
+            let all_utxos: Vec<_> = dust_state.utxos().collect();
+
+            // Build the offer+dust transaction with the FIRST selected dust UTXO paying `first_fee`
+            // Specks (the rest pay 0). Called twice: once to size + price, once with the real fee.
+            let build_merged = |first_fee: u128| -> Option<Transaction<Signature, ProofPreimageMarker, PedersenRandomness, InMemoryDB>> {
+                let mut dust_spends = Vec::new();
+                for (i, sel) in utxo_selections.iter().enumerate() {
+                    if sel.utxo_index >= all_utxos.len() {
+                        android_log!(ANDROID_LOG_ERROR, TAG, "Dust UTXO index {} out of bounds ({})", sel.utxo_index, all_utxos.len());
+                        return None;
                     }
-                    Err(e) => {
-                        android_log!(ANDROID_LOG_ERROR, TAG, "Dust spend failed for UTXO {}: {:?}", sel.utxo_index, e);
-                        return ptr::null();
+                    let v_fee: u128 = if i == 0 { first_fee } else { 0 };
+                    let utxo = all_utxos[sel.utxo_index];
+                    match dust_state.spend(&dust_secret_key, &utxo, v_fee, ctime) {
+                        Ok((_new_state, spend)) => dust_spends.push(spend),
+                        Err(e) => {
+                            android_log!(ANDROID_LOG_ERROR, TAG, "Dust spend failed for UTXO {}: {:?}", sel.utxo_index, e);
+                            return None;
+                        }
                     }
                 }
-            }
-
-            if !dust_spends.is_empty() {
+                if dust_spends.is_empty() {
+                    return None;
+                }
                 let spends_array: StorageArray<_, InMemoryDB> = dust_spends.into_iter().collect();
                 let registrations_array: StorageArray<midnight_ledger::dust::DustRegistration<Signature, InMemoryDB>, InMemoryDB> = std::iter::empty().collect();
-
-                let dust_actions = DustActions {
-                    spends: spends_array,
-                    registrations: registrations_array,
-                    ctime,
-                };
-
+                let dust_actions = DustActions { spends: spends_array, registrations: registrations_array, ctime };
                 let dust_segment_id: u16 = OsRng.gen_range(2..u16::MAX);
                 let dust_intent = Intent::<Signature, ProofPreimageMarker, PedersenRandomness, InMemoryDB> {
                     guaranteed_unshielded_offer: None,
                     fallible_unshielded_offer: None,
                     actions: std::iter::empty().collect(),
                     dust_actions: Some(midnight_storage::arena::Sp::new(dust_actions)),
-                    ttl: Timestamp::from_secs(ttl_ms / 1000),
+                    ttl: dust_ttl,
                     binding_commitment: PedersenRandomness::from(0),
                 };
-
                 let dust_intents_map = StorageHashMap::default().insert(dust_segment_id, dust_intent);
                 let dust_transaction = Transaction::Standard(StandardTransaction::new(
                     network_str,
@@ -1519,18 +1524,34 @@ pub extern "C" fn zswap_build_shielded_transaction_with_dust(
                     None,
                     StorageHashMap::default(),
                 ));
+                base_tx.merge(&dust_transaction).ok()
+            };
 
-                transaction = match transaction.merge(&dust_transaction) {
-                    Ok(merged) => merged,
-                    Err(e) => {
-                        android_log!(ANDROID_LOG_ERROR, TAG, "Failed to merge dust: {:?}", e);
-                        return ptr::null();
-                    }
-                };
+            // Draft with a nominal 1-Speck fee to SIZE the tx, price it, then rebuild paying the real fee.
+            let draft = match build_merged(1) {
+                Some(t) => t,
+                None => return ptr::null(),
+            };
+            let base_fee = match draft.fees_with_margin(&params, 5) {
+                Ok(f) => f,
+                Err(e) => {
+                    android_log!(ANDROID_LOG_ERROR, TAG, "fees_with_margin failed: {:?}", e);
+                    return ptr::null();
+                }
+            };
+            let fee = base_fee + base_fee / 100; // 1% safety overhead (matches fee_ffi)
+            android_log!(ANDROID_LOG_INFO, TAG, "Computed shielded dust fee: {} Specks (base {})", fee, base_fee);
 
-                android_log!(ANDROID_LOG_INFO, TAG, "Merged dust into shielded transaction");
+            match build_merged(fee) {
+                Some(t) => {
+                    android_log!(ANDROID_LOG_INFO, TAG, "Merged dust into shielded transaction (fee {} Specks)", fee);
+                    t
+                }
+                None => return ptr::null(),
             }
-        }
+        } else {
+            base_tx
+        };
 
         let proof_data = std::collections::HashMap::<String, ProvingKeyMaterial>::new();
 

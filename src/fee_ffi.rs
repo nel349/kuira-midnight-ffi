@@ -66,7 +66,7 @@ const DEFAULT_FEE_BLOCKS_MARGIN: usize = 5;
 ///
 /// If the bytes start with ASCII "midnight:", finds the tag-data separator ':'
 /// and returns everything after it. Otherwise returns the bytes unchanged.
-fn strip_tag_prefix(bytes: Vec<u8>) -> Vec<u8> {
+pub(crate) fn strip_tag_prefix(bytes: Vec<u8>) -> Vec<u8> {
     // Check if bytes start with "midnight:" (ASCII tag)
     if bytes.len() < 9 {
         return bytes;

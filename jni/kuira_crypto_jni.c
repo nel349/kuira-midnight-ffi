@@ -133,7 +133,7 @@ extern const char* zswap_build_offer(const char* inputs_hex_json, const char* ou
 extern const char* zswap_merge_offers(const char* offer1_hex, const char* offer2_hex);
 extern const char* zswap_serialize_offer(const char* offer_hex);
 extern const char* zswap_build_shielded_transaction(const char* offer_hex, const char* network_id, const char* dust_tx_hex, size_t reserved1, const char* reserved2, uint64_t reserved3, uint64_t ttl_ms);
-extern const char* zswap_build_shielded_transaction_with_dust(const char* offer_hex, const char* network_id, const void* dust_state_ptr, const uint8_t* dust_seed_ptr, size_t dust_seed_len, const char* dust_utxos_json, uint64_t current_time_ms, uint64_t ttl_ms);
+extern const char* zswap_build_shielded_transaction_with_dust(const char* offer_hex, const char* network_id, const void* dust_state_ptr, const uint8_t* dust_seed_ptr, size_t dust_seed_len, const char* dust_utxos_json, uint64_t current_time_ms, uint64_t ttl_ms, const char* ledger_params_hex);
 
 /* Local ZK proving (Phase 4C) */
 extern const char* zkir_prove_transaction_local(const char* unproven_tx_hex, const char* keys_dir);
@@ -2897,7 +2897,7 @@ JNIEXPORT jstring JNICALL
 Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeBuildShieldedTransactionWithDust(
     JNIEnv* env, jclass clazz, jstring offerHex, jstring networkId,
     jlong dustStatePtr, jbyteArray dustSeed, jstring dustUtxosJson,
-    jlong currentTimeMs, jlong ttlMs) {
+    jlong currentTimeMs, jlong ttlMs, jstring ledgerParamsHex) {
 
     if (offerHex == NULL || networkId == NULL) {
         LOGE("nativeBuildShieldedTransactionWithDust: null required parameter");
@@ -2916,11 +2916,15 @@ Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeBuildShi
     jbyte* dust_seed_buf = NULL;
     jsize dust_seed_len = 0;
     const char* dust_utxos_c = NULL;
+    const char* ledger_params_c = NULL;
 
     if (dustSeed != NULL && dustStatePtr != 0 && dustUtxosJson != NULL) {
         dust_seed_len = (*env)->GetArrayLength(env, dustSeed);
         dust_seed_buf = (*env)->GetByteArrayElements(env, dustSeed, NULL);
         dust_utxos_c = (*env)->GetStringUTFChars(env, dustUtxosJson, NULL);
+    }
+    if (ledgerParamsHex != NULL) {
+        ledger_params_c = (*env)->GetStringUTFChars(env, ledgerParamsHex, NULL);
     }
 
     const char* result = zswap_build_shielded_transaction_with_dust(
@@ -2930,7 +2934,8 @@ Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeBuildShi
         (size_t)dust_seed_len,
         dust_utxos_c,
         (uint64_t)currentTimeMs,
-        (uint64_t)ttlMs
+        (uint64_t)ttlMs,
+        ledger_params_c
     );
 
     (*env)->ReleaseStringUTFChars(env, offerHex, offer_c);
@@ -2940,6 +2945,7 @@ Java_com_midnight_kuira_core_crypto_shielded_ZswapTransferBuilder_nativeBuildShi
         (*env)->ReleaseByteArrayElements(env, dustSeed, dust_seed_buf, JNI_ABORT);
     }
     if (dust_utxos_c) (*env)->ReleaseStringUTFChars(env, dustUtxosJson, dust_utxos_c);
+    if (ledger_params_c) (*env)->ReleaseStringUTFChars(env, ledgerParamsHex, ledger_params_c);
 
     if (result == NULL) return NULL;
     jstring jresult = (*env)->NewStringUTF(env, result);
