@@ -150,6 +150,7 @@ extern const char* contract_state_read_fields(uint64_t handle);
 extern const char* contract_query(uint64_t handle, const char* opcodes_json);
 extern const char* contract_persistent_hash(const char* input_hex);
 extern const char* contract_persistent_hash_aligned(const char* aligned_value_json);
+extern const char* contract_transient_hash_aligned(const char* aligned_value_json);
 extern const char* contract_persistent_commit_aligned(const char* input_json);
 extern const char* contract_big_int_to_value(const char* bigint_str);
 extern const char* contract_value_to_big_int(const char* value_json);
@@ -3150,6 +3151,26 @@ Java_com_midnight_kuira_core_compact_ContractRuntime_nativePersistentHashAligned
     if (json_c == NULL) return NULL;
 
     const char* result = contract_persistent_hash_aligned(json_c);
+    (*env)->ReleaseStringUTFChars(env, alignedValueJson, json_c);
+    if (result == NULL) return NULL;
+
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    contract_free_string((char*)result);
+    return jresult;
+}
+
+/*
+ * Transient (Poseidon) hash over the value's field atoms.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_midnight_kuira_core_compact_ContractRuntime_nativeTransientHashAligned(
+    JNIEnv* env, jclass clazz, jstring alignedValueJson) {
+
+    if (alignedValueJson == NULL) return NULL;
+    const char* json_c = (*env)->GetStringUTFChars(env, alignedValueJson, NULL);
+    if (json_c == NULL) return NULL;
+
+    const char* result = contract_transient_hash_aligned(json_c);
     (*env)->ReleaseStringUTFChars(env, alignedValueJson, json_c);
     if (result == NULL) return NULL;
 

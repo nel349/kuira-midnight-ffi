@@ -407,6 +407,65 @@ pub extern "C" fn contract_persistent_hash_aligned(
     }
 }
 
+// ── transientHash ──
+
+/// Compute the transient (Poseidon) hash of an AlignedValue's field atoms.
+///
+/// NOT a variant of persistentHash. `persistentHash` is SHA-256 over the
+/// `binary_repr` bytes; `transientHash` is Poseidon over field elements —
+/// `transientHash<Vector<N, Field>>([fields...]) -> Field`. Each atom of the
+/// incoming value is therefore decoded to an `Fr` rather than hashed as bytes.
+///
+/// Input: JSON { "alignment": [...], "value": [...] } (serde AlignedValue format)
+/// Output: JSON Value (the resulting field element), or {"error": "..."}
+#[no_mangle]
+pub extern "C" fn contract_transient_hash_aligned(
+    aligned_value_json: *const c_char,
+) -> *const c_char {
+    use midnight_transient_crypto::curve::Fr;
+    use midnight_transient_crypto::hash::transient_hash;
+
+    let json_str = match unsafe { c_str_to_str(aligned_value_json) } {
+        Some(s) => s,
+        None => return std::ptr::null(),
+    };
+
+    // Same manual parse as persistentHashAligned — serde's try_from validation
+    // rejects valid Bytes(N) values (see parse_aligned_value).
+    let json_val: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => return to_c_string(&format!("{{\"error\":\"JSON parse: {}\"}}", e)),
+    };
+    let aligned: AlignedValue = match parse_aligned_value(&json_val) {
+        Ok(v) => v,
+        Err(e) => return to_c_string(&format!("{{\"error\":\"deserialize: {}\"}}", e)),
+    };
+
+    // Each atom is one Field. A non-field atom is a caller error, not something
+    // to coerce — silently substituting a value here would produce a valid-looking
+    // hash over the wrong preimage.
+    let mut field_inputs: Vec<Fr> = Vec::with_capacity(aligned.value.0.len());
+    for (i, atom) in aligned.value.0.iter().enumerate() {
+        match Fr::try_from(atom) {
+            Ok(fr) => field_inputs.push(fr),
+            Err(_) => {
+                return to_c_string(&format!(
+                    "{{\"error\":\"transientHash: atom {} is not a Field\"}}",
+                    i
+                ))
+            }
+        }
+    }
+
+    let hash = transient_hash(&field_inputs);
+    let hash_value = AlignedValue::from(hash).value;
+
+    match serde_json::to_string(&hash_value) {
+        Ok(s) => to_c_string(&s),
+        Err(e) => to_c_string(&format!("{{\"error\":\"serialize: {}\"}}", e)),
+    }
+}
+
 /// Compute persistent commit: SHA-256(opening || binary_repr(value)).
 /// Same as persistentHash but with a 32-byte opening prepended.
 /// Input: JSON {"value": <aligned_value>, "opening": [32 bytes as array]}
@@ -629,6 +688,79 @@ mod tests {
     fn test_null_input() {
         let result = contract_persistent_hash(std::ptr::null());
         assert!(result.is_null());
+    }
+
+    /// An AlignedValue of `n` Field atoms — the shape the JS runtime sends for
+    /// `transientHash<Vector<N, Field>>`. Each atom is a 32-byte little-endian Fr.
+    fn field_aligned_json(vals: &[u8]) -> String {
+        let atoms: Vec<String> = vals
+            .iter()
+            .map(|v| {
+                let mut bytes = vec![0u8; 32];
+                bytes[0] = *v;
+                let nums: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
+                format!("[{}]", nums.join(","))
+            })
+            .collect();
+        let aligns: Vec<&str> = vals
+            .iter()
+            .map(|_| "{\"tag\":\"atom\",\"value\":{\"tag\":\"field\"}}")
+            .collect();
+        format!(
+            "{{\"value\":[{}],\"alignment\":[{}]}}",
+            atoms.join(","),
+            aligns.join(",")
+        )
+    }
+
+    fn call_transient_hash(json: &str) -> String {
+        let input = CString::new(json).unwrap();
+        let result = contract_transient_hash_aligned(input.as_ptr());
+        assert!(!result.is_null());
+        let s = unsafe { CStr::from_ptr(result).to_str().unwrap().to_string() };
+        unsafe {
+            contract_free_string(result as *mut c_char);
+        }
+        s
+    }
+
+    #[test]
+    fn transient_hash_depends_on_the_value() {
+        // REGRESSION (kuira-sdk-android#7 wiring): the JS `transientHash` wrapper
+        // took ONE parameter while `transientHash2` called it with
+        // (alignment, toValue(value)) — so the value was silently dropped. A
+        // binding carrying that bug hashes the alignment alone, and two different
+        // preimages with the same shape then produce the SAME digest.
+        let a = call_transient_hash(&field_aligned_json(&[1, 2]));
+        let b = call_transient_hash(&field_aligned_json(&[1, 2]));
+        let c = call_transient_hash(&field_aligned_json(&[3, 4]));
+
+        assert!(!a.contains("error"), "transient hash errored: {a}");
+        assert_eq!(a, b, "same preimage must produce the same digest");
+        assert_ne!(
+            a, c,
+            "different field values must not collide — the value is being ignored"
+        );
+    }
+
+    #[test]
+    fn transient_hash_is_poseidon_not_persistent_sha256() {
+        // transientHash is Poseidon over field elements; persistentHash is SHA-256
+        // over the binary_repr bytes. Same input, different primitive — so a
+        // digest match here would mean one is quietly delegating to the other.
+        let json = field_aligned_json(&[7]);
+        let transient = call_transient_hash(&json);
+
+        let input = CString::new(json).unwrap();
+        let p = contract_persistent_hash_aligned(input.as_ptr());
+        assert!(!p.is_null());
+        let persistent = unsafe { CStr::from_ptr(p).to_str().unwrap().to_string() };
+        unsafe {
+            contract_free_string(p as *mut c_char);
+        }
+
+        assert!(!transient.contains("error"), "transient errored: {transient}");
+        assert_ne!(transient, persistent);
     }
 
     #[test]
